@@ -10,42 +10,20 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
-use allins3::domain::{DriverContext, DriverError, ObjectKey};
+use allins3::domain::{ChecksumAlgorithm, DriverContext, DriverError, ObjectKey};
 use allins3::driver::{DriverFactory, Profile};
-use allins3::service::{ObjectService, PutParams, ReadConditions, ServiceError};
+use allins3::integrity::{base64, compute_checksum};
+use allins3::service::{ObjectService, PutParams, ReadConditions, ServiceError, TrailerChecksum};
 use allins3::testing::fault::{FaultDriverFactory, FaultPlan};
 use allins3::testing::fixture::{self, BucketSpec};
 use allins3::testing::reference::ReferenceDriverFactory;
-use allins3::testing::support::{one_shot_stream, read_to_end};
+use allins3::testing::support::{generated_stream, one_shot_stream, read_to_end};
 use bytes::Bytes;
 use futures_core::Stream;
 use tokio_util::sync::CancellationToken;
 
 const BUCKET: &str = "bucket-a";
 const DRIVER: &str = "inst-1";
-
-/// A generated body: `total` bytes delivered in `chunk`-sized pieces without
-/// ever materialising the whole object in the test.
-struct Generated {
-    total: u64,
-    chunk: usize,
-    produced: u64,
-}
-
-impl Stream for Generated {
-    type Item = Result<Bytes, DriverError>;
-
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if this.produced >= this.total {
-            return Poll::Ready(None);
-        }
-        let remaining = this.total - this.produced;
-        let size = (this.chunk as u64).min(remaining) as usize;
-        this.produced += size as u64;
-        Poll::Ready(Some(Ok(Bytes::from(vec![b'x'; size]))))
-    }
-}
 
 /// A body that cancels the request after its first chunk, modelling a client
 /// that disconnects mid-upload.
@@ -116,11 +94,7 @@ async fn an_object_over_the_single_write_limit_is_rejected_without_publishing() 
     let service = service_with_limits(fixture::default_limits()).await;
     let key = object_key("limits/too-big.bin");
 
-    let body = Generated {
-        total: 2 * 1024 * 1024,
-        chunk: 64 * 1024,
-        produced: 0,
-    };
+    let body = generated_stream(2 * 1024 * 1024, 64 * 1024);
     let err = service
         .put_object(
             &ctx(),
@@ -190,6 +164,91 @@ async fn a_body_shorter_or_longer_than_declared_is_a_bad_digest() {
 }
 
 #[tokio::test]
+async fn a_trailer_declared_checksum_is_verified_after_the_body() {
+    let service = service_with_limits(fixture::default_limits()).await;
+    let key = object_key("limits/trailer.bin");
+    let body = b"trailer verified body".to_vec();
+    let digest = compute_checksum(ChecksumAlgorithm::Crc32, &body);
+
+    // A trailer value is only readable once the body has been consumed, so the
+    // service asks for it at the end and treats it like a declared header.
+    let matching = base64(&digest);
+    let declared = matching.clone();
+    let meta = service
+        .put_object(
+            &ctx(),
+            BUCKET,
+            &key,
+            one_shot_stream(Bytes::from(body.clone())),
+            PutParams {
+                expected_length: Some(body.len() as u64),
+                checksum_algorithm: Some(ChecksumAlgorithm::Crc32),
+                trailer_checksum: Some(TrailerChecksum::new(ChecksumAlgorithm::Crc32, move || {
+                    Some(declared.clone())
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a matching trailer value publishes");
+    assert_eq!(
+        meta.checksums.first().map(|c| c.value().clone()),
+        Some(digest.clone()),
+        "the verified value is what gets stored"
+    );
+
+    // A trailer that disagrees with the bytes is a BadDigest, and the object is
+    // not replaced.
+    let err = service
+        .put_object(
+            &ctx(),
+            BUCKET,
+            &key,
+            one_shot_stream(Bytes::from(body.clone())),
+            PutParams {
+                expected_length: Some(body.len() as u64),
+                checksum_algorithm: Some(ChecksumAlgorithm::Crc32),
+                trailer_checksum: Some(TrailerChecksum::new(ChecksumAlgorithm::Crc32, || {
+                    Some("AAAAAA==".to_string())
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a mismatched trailer must fail");
+    assert!(matches!(err, ServiceError::BadDigest(_)), "{err:?}");
+
+    // A declaration whose value never arrives is a mismatch too.
+    let err = service
+        .put_object(
+            &ctx(),
+            BUCKET,
+            &key,
+            one_shot_stream(Bytes::from(body.clone())),
+            PutParams {
+                expected_length: Some(body.len() as u64),
+                checksum_algorithm: Some(ChecksumAlgorithm::Crc32),
+                trailer_checksum: Some(TrailerChecksum::new(ChecksumAlgorithm::Crc32, || None)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a declared trailer that never arrives must fail");
+    assert!(matches!(err, ServiceError::BadDigest(_)), "{err:?}");
+
+    // Neither rejection published: the first object is still the one stored.
+    assert_eq!(read_object(&service, &key).await, body);
+    let head = service
+        .head_object(&ctx(), BUCKET, &key, &ReadConditions::default(), None)
+        .await
+        .expect("head");
+    assert_eq!(
+        head.metadata.checksums.first().map(|c| c.value().clone()),
+        Some(digest)
+    );
+}
+
+#[tokio::test]
 async fn a_client_disconnect_mid_upload_publishes_nothing() {
     let service = service_with_limits(fixture::default_limits()).await;
     let key = object_key("limits/cancelled.bin");
@@ -239,11 +298,7 @@ async fn a_generated_multi_megabyte_body_streams_through_unchanged() {
 
     let key = object_key("limits/streamed.bin");
     let total = 12 * 1024 * 1024;
-    let body = Generated {
-        total,
-        chunk: 256 * 1024,
-        produced: 0,
-    };
+    let body = generated_stream(total, 256 * 1024);
     let meta = service
         .put_object(
             &ctx(),
@@ -290,29 +345,22 @@ async fn staging_quota_backpressure_keeps_earlier_parts() {
             Some("tester"),
             Default::default(),
             Default::default(),
+            None,
         )
         .expect("create upload")
         .upload_id
         .as_str()
         .to_string();
 
-    let part = Generated {
-        total: 3 * 1024 * 1024,
-        chunk: 256 * 1024,
-        produced: 0,
-    };
+    let part = generated_stream(3 * 1024 * 1024, 256 * 1024);
     service
-        .upload_part(&ctx(), BUCKET, &key, &upload_id, 1, Box::pin(part))
+        .upload_part(&ctx(), BUCKET, &key, &upload_id, 1, None, part)
         .await
         .expect("first part fits the quota");
 
-    let part = Generated {
-        total: 3 * 1024 * 1024,
-        chunk: 256 * 1024,
-        produced: 0,
-    };
+    let part = generated_stream(3 * 1024 * 1024, 256 * 1024);
     let err = service
-        .upload_part(&ctx(), BUCKET, &key, &upload_id, 2, Box::pin(part))
+        .upload_part(&ctx(), BUCKET, &key, &upload_id, 2, None, part)
         .await
         .expect_err("the staging quota must apply back-pressure");
     assert_eq!(err, ServiceError::SlowDown);

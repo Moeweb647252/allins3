@@ -1,0 +1,21 @@
+# Memory budget for the generated-stream resource check (implementation plan
+# P5-06, spec §8.3).
+#
+# The write pipeline holds one decoded chunk plus the hasher state per in-flight
+# request and never a whole object, so the incremental peak RSS of a stream must
+# not follow the object size. The budget is derived rather than guessed:
+#
+#   per_request_buffer_bytes * max_concurrency + slack_bytes
+#
+# `slack_bytes` covers the hasher state, the stream adapters, the metadata the
+# sink publishes and allocator behaviour; it is the only intentional margin.
+# The check streams each size below once at the fixed concurrency above, after
+# an idle baseline, and compares the peak RSS of the process.
+per_request_buffer_bytes = 266240 # 256 KiB chunk + encoder slack
+max_concurrency = 1
+slack_bytes = 33554432 # 32 MiB
+
+# The sizes the plan names, in MiB. The 1 GiB and 10 GiB runs are only executed
+# when `ALLINS3_BENCH_FULL=1` is set (they need a release build to finish in a
+# sane time); the default run executes the first size on every test invocation.
+sizes_mib = [100, 1024, 10240]

@@ -37,6 +37,20 @@ pub fn md5_digest(content: &[u8]) -> [u8; 16] {
     hasher.finalize().into()
 }
 
+/// Computes the raw composite digest for a multipart object.
+///
+/// A composite checksum is a digest of the ordered **raw part digests**, not a
+/// concatenation of their encoded forms (spec §6.3). The caller obtains each
+/// part digest with [`compute_checksum`] using the same algorithm, and is
+/// responsible for the `-<partcount>` suffix that identifies the wire form.
+pub fn composite_checksum(algorithm: ChecksumAlgorithm, part_digests: &[Bytes]) -> Bytes {
+    let mut hasher = StreamingDigest::new(algorithm);
+    for digest in part_digests {
+        hasher.update(digest);
+    }
+    hasher.finalize()
+}
+
 /// Computes the raw digest for a checksum algorithm over a whole object.
 pub fn compute_checksum(algorithm: ChecksumAlgorithm, content: &[u8]) -> Bytes {
     match algorithm {
@@ -248,6 +262,14 @@ pub fn base64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// Decodes the base64 form S3 uses for checksum values.
+pub fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +306,41 @@ mod tests {
     fn crc64nvme_matches_known_vector() {
         // CRC-64/NVME("123456789") = 0xAE8B14860A799888
         assert_eq!(crc64_nvme(b"123456789"), 0xAE8B_1486_0A79_9888);
+    }
+
+    #[test]
+    fn composite_checksum_hashes_the_ordered_part_digests() {
+        let parts: [&[u8]; 3] = [b"part-one", b"part-two", b"part-three"];
+        for algorithm in [
+            ChecksumAlgorithm::Crc32,
+            ChecksumAlgorithm::Crc32c,
+            ChecksumAlgorithm::Sha1,
+            ChecksumAlgorithm::Sha256,
+        ] {
+            let digests: Vec<Bytes> = parts
+                .iter()
+                .map(|part| compute_checksum(algorithm, part))
+                .collect();
+
+            // Independent expectation: the same algorithm over the concatenated
+            // raw part digests (no base64, no separators, no truncation).
+            let mut concatenated = Vec::new();
+            for digest in &digests {
+                concatenated.extend_from_slice(digest);
+            }
+            assert_eq!(
+                composite_checksum(algorithm, &digests),
+                compute_checksum(algorithm, &concatenated),
+                "{algorithm:?} composite mismatch"
+            );
+
+            // Order and membership must matter.
+            let reversed: Vec<Bytes> = digests.iter().rev().cloned().collect();
+            assert_ne!(
+                composite_checksum(algorithm, &digests),
+                composite_checksum(algorithm, &reversed)
+            );
+        }
     }
 
     #[test]

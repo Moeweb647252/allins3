@@ -7,6 +7,7 @@
 //! Enabled with the `testing` feature.
 
 pub mod contract;
+pub mod counting;
 pub mod fault;
 pub mod fixture;
 pub mod reference;

@@ -11,10 +11,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use allins3::domain::{
-    CommitState, ContentProperties, DriverContext, EntityTag, ObjectKey, Preconditions,
-    UserMetadata,
+    ChecksumAlgorithm, ChecksumType, CommitState, ContentProperties, DriverContext, EntityTag,
+    ObjectKey, Preconditions, UserMetadata,
 };
 use allins3::driver::{DriverFactory, Profile};
+use allins3::integrity::compute_checksum;
+use allins3::service::multipart::{
+    DeclaredCompletionChecksum, MIN_PART_SIZE, MultipartChecksum, PartSummary,
+};
 use allins3::service::{ObjectService, ReadConditions, ServiceError};
 use allins3::testing::fault::{FaultDriverFactory, FaultPlan};
 use allins3::testing::fixture::{self, BucketSpec};
@@ -55,6 +59,7 @@ async fn start_upload(service: &ObjectService, key: &ObjectKey) -> String {
             Some("tester"),
             ContentProperties::default(),
             UserMetadata::new(),
+            None,
         )
         .expect("create multipart upload")
         .upload_id
@@ -69,6 +74,21 @@ async fn upload_part(
     part_number: u16,
     data: &'static [u8],
 ) -> EntityTag {
+    upload_part_bytes(service, key, upload_id, part_number, data.to_vec(), None)
+        .await
+        .expect("upload part")
+        .etag
+}
+
+/// Uploads a part of arbitrary length, optionally declaring its checksum.
+async fn upload_part_bytes(
+    service: &ObjectService,
+    key: &ObjectKey,
+    upload_id: &str,
+    part_number: u16,
+    data: Vec<u8>,
+    declared: Option<(ChecksumAlgorithm, Vec<u8>)>,
+) -> Result<PartSummary, ServiceError> {
     service
         .upload_part(
             &ctx(),
@@ -76,11 +96,37 @@ async fn upload_part(
             key,
             upload_id,
             part_number,
-            one_shot_stream(bytes::Bytes::from_static(data)),
+            declared,
+            one_shot_stream(bytes::Bytes::from(data)),
         )
         .await
-        .expect("upload part")
-        .etag
+}
+
+/// Starts an upload with an explicit checksum scheme.
+async fn start_upload_with_checksum(
+    service: &ObjectService,
+    key: &ObjectKey,
+    algorithm: ChecksumAlgorithm,
+    checksum_type: ChecksumType,
+) -> String {
+    service
+        .create_multipart(
+            BUCKET,
+            key,
+            Some("tester"),
+            ContentProperties::default(),
+            UserMetadata::new(),
+            Some(MultipartChecksum::new(algorithm, checksum_type).expect("supported scheme")),
+        )
+        .expect("create multipart upload")
+        .upload_id
+        .as_str()
+        .to_string()
+}
+
+/// The raw digest of `data` under `algorithm`, as a client would compute it.
+fn digest(algorithm: ChecksumAlgorithm, data: &[u8]) -> Vec<u8> {
+    compute_checksum(algorithm, data).to_vec()
 }
 
 async fn read_object(service: &ObjectService, key: &ObjectKey) -> Vec<u8> {
@@ -106,6 +152,7 @@ async fn completion_publishes_once_and_records_the_attempt() {
             &key,
             &upload_id,
             &manifest,
+            None,
             Preconditions::none(),
         )
         .await
@@ -133,6 +180,7 @@ async fn completion_publishes_once_and_records_the_attempt() {
                 &key,
                 &upload_id,
                 &manifest,
+                None,
                 Preconditions::none()
             )
             .await
@@ -161,6 +209,7 @@ async fn a_changed_manifest_is_rejected_and_the_retry_succeeds() {
             &key,
             &upload_id,
             &wrong,
+            None,
             Preconditions::none(),
         )
         .await
@@ -182,6 +231,7 @@ async fn a_changed_manifest_is_rejected_and_the_retry_succeeds() {
             &key,
             &upload_id,
             &right,
+            None,
             Preconditions::none(),
         )
         .await
@@ -220,6 +270,7 @@ async fn reuploading_a_part_replaces_it_without_touching_the_published_object() 
             &key,
             &upload_id,
             &manifest,
+            None,
             Preconditions::none(),
         )
         .await
@@ -246,6 +297,7 @@ async fn a_lost_acknowledgement_publishes_once_and_still_answers_success() {
             &key,
             &upload_id,
             &manifest,
+            None,
             Preconditions::none(),
         )
         .await
@@ -267,6 +319,7 @@ async fn a_lost_acknowledgement_publishes_once_and_still_answers_success() {
                 &key,
                 &upload_id,
                 &manifest,
+                None,
                 Preconditions::none()
             )
             .await
@@ -294,6 +347,7 @@ async fn a_fenced_attempt_resolves_to_final_non_commit_and_allows_one_retry() {
             &key,
             &upload_id,
             &manifest,
+            None,
             Preconditions::none(),
         )
         .await
@@ -321,6 +375,7 @@ async fn a_fenced_attempt_resolves_to_final_non_commit_and_allows_one_retry() {
             &key,
             &upload_id,
             &manifest,
+            None,
             Preconditions::none(),
         )
         .await
@@ -356,6 +411,7 @@ async fn an_unresolvable_commit_outcome_blocks_replay_and_is_never_swept() {
             &key,
             &upload_id,
             &manifest,
+            None,
             Preconditions::none(),
         )
         .await
@@ -374,6 +430,7 @@ async fn an_unresolvable_commit_outcome_blocks_replay_and_is_never_swept() {
             &key,
             &upload_id,
             &manifest,
+            None,
             Preconditions::none(),
         )
         .await
@@ -437,6 +494,7 @@ async fn concurrent_completion_and_abort_are_arbitrated() {
             &key,
             &upload_id,
             &manifest,
+            None,
             Preconditions::none()
         ),
         service.complete_multipart(
@@ -445,6 +503,7 @@ async fn concurrent_completion_and_abort_are_arbitrated() {
             &key,
             &upload_id,
             &manifest,
+            None,
             Preconditions::none()
         ),
     );
@@ -467,6 +526,7 @@ async fn concurrent_completion_and_abort_are_arbitrated() {
             &other,
             &upload_id,
             &manifest,
+            None,
             Preconditions::none()
         ),
         async { service.abort_multipart(BUCKET, &other, &upload_id) },
@@ -483,4 +543,369 @@ async fn concurrent_completion_and_abort_are_arbitrated() {
     } else {
         assert!(published.is_err(), "an aborted upload must not be visible");
     }
+}
+
+#[test]
+fn multipart_checksum_schemes_reject_illegal_combinations() {
+    // CRC64NVME has no composite form; the SHA family has no multipart
+    // full-object form (spec §6.3).
+    assert!(MultipartChecksum::new(ChecksumAlgorithm::Crc64Nvme, ChecksumType::Composite).is_err());
+    assert!(MultipartChecksum::new(ChecksumAlgorithm::Sha256, ChecksumType::FullObject).is_err());
+    assert!(MultipartChecksum::new(ChecksumAlgorithm::Crc32, ChecksumType::Composite).is_ok());
+
+    // A client that names only an algorithm gets that algorithm's default
+    // coverage: CRC family full-object, SHA family composite.
+    assert_eq!(
+        MultipartChecksum::from_algorithm(ChecksumAlgorithm::Crc64Nvme)
+            .expect("crc64nvme")
+            .checksum_type,
+        ChecksumType::FullObject
+    );
+    assert_eq!(
+        MultipartChecksum::from_algorithm(ChecksumAlgorithm::Sha256)
+            .expect("sha256")
+            .checksum_type,
+        ChecksumType::Composite
+    );
+}
+
+#[tokio::test]
+async fn multipart_full_object_checksum_covers_the_assembled_object() {
+    let service = service_with(Arc::new(ReferenceDriverFactory::new("reference"))).await;
+    let key = object_key("checksum/full-object.bin");
+    let upload_id = start_upload_with_checksum(
+        &service,
+        &key,
+        ChecksumAlgorithm::Crc32,
+        ChecksumType::FullObject,
+    )
+    .await;
+
+    let first = vec![b'a'; MIN_PART_SIZE as usize];
+    let second = b"the tail after a full part".to_vec();
+    let mut whole = first.clone();
+    whole.extend_from_slice(&second);
+    let expected = digest(ChecksumAlgorithm::Crc32, &whole);
+
+    // The client declares each part exactly as it computed it, then the
+    // full-object value over the assembled bytes.
+    let one = upload_part_bytes(
+        &service,
+        &key,
+        &upload_id,
+        1,
+        first.clone(),
+        Some((
+            ChecksumAlgorithm::Crc32,
+            digest(ChecksumAlgorithm::Crc32, &first),
+        )),
+    )
+    .await
+    .expect("part one");
+    let two = upload_part_bytes(
+        &service,
+        &key,
+        &upload_id,
+        2,
+        second.clone(),
+        Some((
+            ChecksumAlgorithm::Crc32,
+            digest(ChecksumAlgorithm::Crc32, &second),
+        )),
+    )
+    .await
+    .expect("part two");
+    assert_eq!(
+        one.checksum.as_ref().map(|c| c.value.clone()),
+        Some(digest(ChecksumAlgorithm::Crc32, &first).into()),
+        "the part digest must be the client's"
+    );
+
+    let manifest = [(1u16, Some(one.etag)), (2u16, Some(two.etag))];
+    let declared = DeclaredCompletionChecksum {
+        algorithm: ChecksumAlgorithm::Crc32,
+        value: expected.clone(),
+        checksum_type: Some(ChecksumType::FullObject),
+        part_count: None,
+    };
+    let meta = service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            Some(declared),
+            Preconditions::none(),
+        )
+        .await
+        .expect("complete");
+
+    let stored = meta.checksums.first().expect("a checksum is stored");
+    assert_eq!(stored.algorithm(), ChecksumAlgorithm::Crc32);
+    assert_eq!(stored.checksum_type(), ChecksumType::FullObject);
+    assert_eq!(stored.value().as_ref(), expected.as_slice());
+    assert_eq!(stored.part_count(), None);
+
+    // A full-object checksum is the digest of the whole object, so it also
+    // matches what a single PUT of the same bytes would store.
+    assert_eq!(read_object(&service, &key).await, whole);
+    let head = service
+        .head_object(&ctx(), BUCKET, &key, &ReadConditions::default(), None)
+        .await
+        .expect("head");
+    assert_eq!(
+        head.metadata.checksums.first().map(|c| c.value().clone()),
+        Some(expected.into())
+    );
+}
+
+#[tokio::test]
+async fn multipart_composite_checksum_digests_the_ordered_part_digests() {
+    let service = service_with(Arc::new(ReferenceDriverFactory::new("reference"))).await;
+    let key = object_key("checksum/composite.bin");
+    let upload_id = start_upload_with_checksum(
+        &service,
+        &key,
+        ChecksumAlgorithm::Sha256,
+        ChecksumType::Composite,
+    )
+    .await;
+
+    let first = vec![b'x'; MIN_PART_SIZE as usize];
+    let second = b"composite tail".to_vec();
+
+    let one = upload_part_bytes(&service, &key, &upload_id, 1, first.clone(), None)
+        .await
+        .expect("part one");
+    let two = upload_part_bytes(&service, &key, &upload_id, 2, second.clone(), None)
+        .await
+        .expect("part two");
+
+    // Independent expectation: SHA256 over the *concatenated raw part digests*,
+    // not over the concatenated parts and not over their base64 forms.
+    let mut concatenated = digest(ChecksumAlgorithm::Sha256, &first);
+    concatenated.extend_from_slice(&digest(ChecksumAlgorithm::Sha256, &second));
+    let expected = digest(ChecksumAlgorithm::Sha256, &concatenated);
+
+    let manifest = [(1u16, Some(one.etag)), (2u16, Some(two.etag))];
+    let declared = DeclaredCompletionChecksum {
+        algorithm: ChecksumAlgorithm::Sha256,
+        value: expected.clone(),
+        checksum_type: Some(ChecksumType::Composite),
+        part_count: Some(2),
+    };
+    let meta = service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            Some(declared),
+            Preconditions::none(),
+        )
+        .await
+        .expect("complete");
+
+    let stored = meta.checksums.first().expect("a checksum is stored");
+    assert_eq!(stored.checksum_type(), ChecksumType::Composite);
+    assert_eq!(stored.part_count(), Some(2));
+    assert_eq!(stored.value().as_ref(), expected.as_slice());
+
+    // The composite value is not the digest of the assembled object.
+    let mut whole = first.clone();
+    whole.extend_from_slice(&second);
+    assert_ne!(digest(ChecksumAlgorithm::Sha256, &whole), expected);
+}
+
+#[tokio::test]
+async fn a_mismatched_completion_checksum_never_publishes() {
+    let service = service_with(Arc::new(ReferenceDriverFactory::new("reference"))).await;
+    let key = object_key("checksum/mismatch.bin");
+    let upload_id = start_upload_with_checksum(
+        &service,
+        &key,
+        ChecksumAlgorithm::Crc32,
+        ChecksumType::FullObject,
+    )
+    .await;
+    let etag = upload_part(&service, &key, &upload_id, 1, b"checked body").await;
+    let manifest = [(1u16, Some(etag))];
+
+    let wrong = DeclaredCompletionChecksum {
+        algorithm: ChecksumAlgorithm::Crc32,
+        value: vec![0, 0, 0, 0],
+        checksum_type: None,
+        part_count: None,
+    };
+    let err = service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            Some(wrong),
+            Preconditions::none(),
+        )
+        .await
+        .expect_err("a wrong completion checksum must fail");
+    assert!(
+        matches!(err, ServiceError::BadDigest(_)),
+        "a checksum mismatch is BadDigest, got {err:?}"
+    );
+    assert!(
+        service
+            .get_object(&ctx(), BUCKET, &key, &ReadConditions::default(), None)
+            .await
+            .is_err(),
+        "a rejected completion must not publish anything"
+    );
+
+    // The upload survives the rejection, so the client can retry correctly.
+    let correct = DeclaredCompletionChecksum {
+        algorithm: ChecksumAlgorithm::Crc32,
+        value: digest(ChecksumAlgorithm::Crc32, b"checked body"),
+        checksum_type: Some(ChecksumType::FullObject),
+        part_count: None,
+    };
+    service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            Some(correct),
+            Preconditions::none(),
+        )
+        .await
+        .expect("a corrected retry publishes");
+    assert_eq!(read_object(&service, &key).await, b"checked body");
+}
+
+#[tokio::test]
+async fn part_checksums_are_verified_and_reported() {
+    let service = service_with(Arc::new(ReferenceDriverFactory::new("reference"))).await;
+    let key = object_key("checksum/parts.bin");
+    let body = b"part body".to_vec();
+    let upload_id = start_upload_with_checksum(
+        &service,
+        &key,
+        ChecksumAlgorithm::Crc32c,
+        ChecksumType::FullObject,
+    )
+    .await;
+
+    // A declared value that does not match the bytes is rejected and nothing is
+    // staged.
+    let err = upload_part_bytes(
+        &service,
+        &key,
+        &upload_id,
+        1,
+        body.clone(),
+        Some((ChecksumAlgorithm::Crc32c, vec![1, 2, 3, 4])),
+    )
+    .await
+    .expect_err("a wrong part checksum must fail");
+    assert!(matches!(err, ServiceError::BadDigest(_)), "got {err:?}");
+    assert!(
+        service
+            .list_parts(BUCKET, &key, &upload_id, None, 100)
+            .expect("list parts")
+            .parts
+            .is_empty(),
+        "a rejected part must not be staged"
+    );
+
+    // An algorithm that does not match the upload's scheme is rejected before
+    // the body is read.
+    let err = upload_part_bytes(
+        &service,
+        &key,
+        &upload_id,
+        1,
+        body.clone(),
+        Some((
+            ChecksumAlgorithm::Sha256,
+            digest(ChecksumAlgorithm::Sha256, &body),
+        )),
+    )
+    .await
+    .expect_err("a mismatched algorithm must fail");
+    assert!(
+        matches!(err, ServiceError::InvalidRequest(_)),
+        "got {err:?}"
+    );
+
+    // The correct declared value is accepted and stored with the part.
+    let expected = digest(ChecksumAlgorithm::Crc32c, &body);
+    let summary = upload_part_bytes(
+        &service,
+        &key,
+        &upload_id,
+        1,
+        body.clone(),
+        Some((ChecksumAlgorithm::Crc32c, expected.clone())),
+    )
+    .await
+    .expect("a matching part checksum is accepted");
+    assert_eq!(
+        summary.checksum.as_ref().map(|c| c.value.clone()),
+        Some(expected.clone().into())
+    );
+
+    let page = service
+        .list_parts(BUCKET, &key, &upload_id, None, 100)
+        .expect("list parts");
+    assert_eq!(
+        page.parts[0].checksum.as_ref().map(|c| c.value.clone()),
+        Some(expected.into()),
+        "ListParts reports the stored part checksum"
+    );
+}
+
+#[tokio::test]
+async fn a_part_that_names_an_algorithm_fixes_the_upload_scheme() {
+    let service = service_with(Arc::new(ReferenceDriverFactory::new("reference"))).await;
+    let key = object_key("checksum/deferred-scheme.bin");
+    let upload_id = start_upload(&service, &key).await;
+
+    let body = b"scheme from the part".to_vec();
+    let part_digest = digest(ChecksumAlgorithm::Crc32, &body);
+    let summary = upload_part_bytes(
+        &service,
+        &key,
+        &upload_id,
+        1,
+        body.clone(),
+        Some((ChecksumAlgorithm::Crc32, part_digest)),
+    )
+    .await
+    .expect("part fixes the scheme");
+
+    // Nothing is declared on completion, so the server publishes the checksum
+    // it computed under the scheme the part established.
+    let manifest = [(1u16, Some(summary.etag))];
+    let meta = service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            None,
+            Preconditions::none(),
+        )
+        .await
+        .expect("complete");
+    let stored = meta.checksums.first().expect("a checksum is stored");
+    assert_eq!(stored.algorithm(), ChecksumAlgorithm::Crc32);
+    assert_eq!(stored.checksum_type(), ChecksumType::FullObject);
+    assert_eq!(
+        stored.value().as_ref(),
+        digest(ChecksumAlgorithm::Crc32, &body).as_slice()
+    );
 }

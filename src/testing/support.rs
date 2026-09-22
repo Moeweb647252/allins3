@@ -30,6 +30,41 @@ pub fn one_shot_stream(bytes: Bytes) -> ObjectByteStream {
     Box::pin(OneShot { data: Some(bytes) })
 }
 
+/// A generated body: `total` bytes delivered in `chunk`-sized pieces, without
+/// ever materialising the whole object in the test process.
+struct Generated {
+    total: u64,
+    chunk: usize,
+    produced: u64,
+}
+
+impl Stream for Generated {
+    type Item = Result<Bytes, DriverError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.produced >= self.total {
+            return Poll::Ready(None);
+        }
+        let remaining = self.total - self.produced;
+        let size = (self.chunk as u64).min(remaining) as usize;
+        self.produced += size as u64;
+        Poll::Ready(Some(Ok(Bytes::from(vec![b'x'; size]))))
+    }
+}
+
+/// A body stream of `total` bytes delivered in `chunk`-sized pieces.
+///
+/// The bytes are generated on demand, so a multi-gigabyte body costs a chunk of
+/// memory rather than an object's worth. Used to check that the write pipeline's
+/// memory does not follow the object size (spec §8.3).
+pub fn generated_stream(total: u64, chunk: usize) -> ObjectByteStream {
+    Box::pin(Generated {
+        total,
+        chunk,
+        produced: 0,
+    })
+}
+
 /// A deterministic, non-cryptographic placeholder entity tag.
 ///
 /// The unified MD5-based ETag policy (spec §5.4) belongs to the service layer

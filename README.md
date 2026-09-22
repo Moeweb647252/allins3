@@ -18,8 +18,13 @@ ALLINS3_DEV_SECRET=devsecret cargo run --features testing -- check-config exampl
 # 2. 启动服务器（内存测试 driver 需要 development = true）
 ALLINS3_DEV_SECRET=devsecret cargo run --features testing -- examples/dev-config.toml
 
-# 3. 用真实 SDK 走一遍完整闭环
+# 3. 用真实客户端走一遍完整闭环（boto3 / AWS CLI / 手工 aws-chunked trailer 请求）
 ALLINS3_SECRET_KEY=devsecret python3 scripts/e2e_boto3.py     # 需要 boto3
+bash scripts/e2e_cli.sh                                       # 需要 .venv/bin/aws（pip install awscli）
+ALLINS3_SECRET_KEY=devsecret python3 scripts/e2e_streaming_trailer.py
+
+# 4. 内存预算基准（默认 100 MiB；ALLINS3_BENCH_FULL=1 跑 100 MiB/1 GiB/10 GiB）
+ALLINS3_BENCH_FULL=1 cargo test --release --all-features --test resource_budget -- --nocapture
 ```
 
 服务器端点：`/healthz`（liveness）、`/readyz`（readiness，排空时 `503`）、`/metrics`（计数器），以及 path-style 的 S3 API。示例配置见 [`examples/dev-config.toml`](examples/dev-config.toml)。
@@ -32,7 +37,7 @@ ALLINS3_SECRET_KEY=devsecret python3 scripts/e2e_boto3.py     # 需要 boto3
 - `src/service/`：GET/HEAD/PUT/DELETE/LIST/COPY、条件与 Range 的 `stat → 条件 → 区间 → 携带 revision 读取` 流程、原子发布、列举 token 的作用域绑定、通用 multipart 协调器（单次发布、竞争仲裁、完成记录、过期暂存回收）。
 - `src/protocol/s3/`：基于 `s3s` 的 path-style HTTP/S3 适配、SigV4（header 与预签名 query）、默认拒绝的授权、请求 ID、错误映射、每 principal 准入控制。
 - `src/server.rs`：启动顺序（配置 → driver → namespace 能力校验 → readiness）、优雅退出、健康与指标端点。
-- `src/testing/`（`testing` feature）：内存参考 driver、排序向量独立 driver、故障注入包装器、可复用契约 harness、服务级 fixture。
+- `src/testing/`（`testing` feature）：内存参考 driver、排序向量独立 driver、故障注入包装器、计数 sink（度量写入而不物化数据）、可复用契约 harness、服务级 fixture。
 
 ## 构建与检查
 
@@ -49,6 +54,7 @@ cd spikes/protocol-adapter && cargo test
 
 - 仅 path-style；`addressing = "virtual"` 在校验阶段明确失败（未实现）。
 - 不支持 Versioning、SSE、ACL、Object Lock、生命周期、通知、复制、网站托管、Select、SigV2/SigV4a；这些参数会明确报错而不是被忽略。
-- multipart 不合成 COMPOSITE/FULL_OBJECT checksum，只发布 `ETag = md5(parts)-N`。
-- `aws-chunked` 请求体与 checksum trailer 由 `s3s` 解码，但本仓库尚未用真实客户端构造该用例，因此不作为已验证能力。
+- multipart 支持 FULL_OBJECT 与 COMPOSITE checksum（线格式 `base64(digest)-<partcount>`）；`ETag` 始终按规范发布 `md5(parts)-N`。
+- `aws-chunked` 请求体与 checksum trailer 已由运行中的服务器验证（含 trailer 值不匹配的拒绝）；CLI 与 botocore 1.42 对 HTTP endpoint 不发出 trailer 形式，因此该路径只有手工构造请求的证据。
+- 主要兼容证据：boto3/botocore 1.42.97（`scripts/e2e_boto3.py` 63/63）、AWS CLI 1.44.87（`scripts/e2e_cli.sh` 29/29）、手工 `aws-chunked` trailer 请求（`scripts/e2e_streaming_trailer.py` 8/8）、内存预算基准（`tests/resource_budget.rs`）。
 - 内置 driver 均为内存实现，重启数据丢失；生产准入见 [driver 接入指南](docs/driver-guide.md)。

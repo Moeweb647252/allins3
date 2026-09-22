@@ -34,6 +34,7 @@ toml = "=0.9.12"
 
 [dev-dependencies]
 futures-util = "=0.3.34"
+libc = "=0.2.189"
 tokio = { version = "=1.53.1", features = ["full"] }
 
 [features]
@@ -60,4 +61,8 @@ required-features = ["testing"]
 
 [[test]]
 name = "property_parsing"
+required-features = ["testing"]
+
+[[test]]
+name = "resource_budget"
 required-features = ["testing"]

@@ -1,10 +1,13 @@
 # 多 driver S3 服务器实现计划
 
-状态：P0–P5 已实现；剩余开放项集中在 P3-06 的 AWS CLI 用例、P4-04/P4-07 的 multipart checksum 合成与 CLI 路径、P5-05/P5-06 的模糊/大流覆盖，以及全部 P6 生产准入。更新日期：2026-09-22。
+状态：P0–P5 已实现；剩余开放项只有 P5-05 的模糊测试，以及全部 P6 生产准入。更新日期：2026-09-22。
 
-> 进展：服务器可运行（`cargo run --features testing -- examples/dev-config.toml`），并用真实 SDK（boto3/botocore 1.42.97）端到端跑通 **43/43** 项检查（`scripts/e2e_boto3.py`），覆盖 PUT/HEAD/GET/条件/Range/LIST 分页/COPY/批量删除/multipart（含 transfer manager 11 MiB → 3 part 与组合 ETag 独立复算）/UploadPartCopy/abort/预签名 URL 与签名拒绝。
+> 进展：服务器可运行（`cargo run --features testing -- examples/dev-config.toml`）。三条真实客户端证据链：
+> ① boto3/botocore **1.42.97** 端到端 **63/63** 项检查（`scripts/e2e_boto3.py`），覆盖 PUT/HEAD/GET/条件/Range/LIST 分页/COPY/批量删除/multipart（含 transfer manager 11 MiB → 3 part 与组合 ETag 独立复算）/UploadPartCopy/abort/预签名 URL 与签名拒绝，以及 multipart 的 FULL_OBJECT、COMPOSITE checksum（用 Python 标库独立复算）与错误 checksum 拒绝；
+> ② AWS CLI **1.44.87**（`pip install awscli`）**29/29** 项检查（`scripts/e2e_cli.sh`），含 `aws s3api` 与 `aws s3 cp/sync/ls/rm/presign` 高层路径；
+> ③ 手工构造的 `aws-chunked` + checksum trailer 请求 **8/8** 项检查（`scripts/e2e_streaming_trailer.py`），因为 CLI 与 botocore 1.42 对 HTTP endpoint 一律把 checksum 放入请求头，不会发出 trailer 形式。
 >
-> 未验证项（不得当作通过）：`aws-chunked` 请求体与 checksum trailer 的运行时校验；AWS CLI / `mc` / `s3cmd` / `rclone` 全部不可用，因此 P3-06 的 CLI 部分与 P4-07 的高层 CLI 路径未执行；multipart 的 COMPOSITE/FULL_OBJECT checksum 未实现。上述内容在 `docs/compatibility-matrix.md` 中标为「未验证 / 未实现」。
+> 资源证据：计数 sink + 生成流基准在 100 MiB / 1 GiB / 10 GiB 下增量峰值 RSS 均为 **0 MiB**（预算 32 MiB，`bench/resource-budget.toml`）。
 
 本计划依照[实现规范](implementation-spec.md)执行。用户已确定先做通用接口，不限定生产后端；因此先完成接口、服务闭环与验证工具，再单独推进具体 driver 的生产准入。
 
@@ -99,8 +102,8 @@ P1 模型稳定后，协议适配测试向量与 P2 可独立推进；不应在�
 - [x] P3-02 实现 SigV4 header、presigned query、凭据查找和默认拒绝的权限规则。→ 真实 SDK 验证：header 签名、预签名 GET、预签名过期、签名篡改、错误 secret/未知 access key 全部符合预期。
 - [x] P3-03 完成基础操作矩阵：bucket 查询、对象读写删除、批量删除、ListObjectsV2、CopyObject。→ `scripts/e2e_boto3.py`。
 - [x] P3-04 覆盖 URI 编码、特殊 key、metadata、条件读、Range、错误响应、HEAD 无响应体等边界。→ 端到端覆盖 `a//b + c` 这类 key、`304`、`412`、`416`、`bytes=a-b`/`bytes=-n`；条件与 Range 的执行顺序（条件失败不打开数据流、条件通过才判 `416`）由 `head_object`/`get_object` 的单一流程保证，并由服务测试覆盖。
-- [x] P3-05 实现普通 payload 的校验，且任何校验失败都不发布。→ 已实现并以测试覆盖（`Content-MD5`、声明 checksum、长度不符都返回 `400` 且不产生对象）；**trailer 运行时校验未验证**（`s3s` 负责解码，但本环境未构造 streaming-trailer 客户端用例）。
-- [ ] P3-06 运行固定版本客户端基础用例；记录版本与默认配置。**部分完成**：boto3/botocore 1.42.97 全部用例通过并记录版本与默认配置（兼容矩阵第 6 节）；AWS CLI 与 `mc`/`s3cmd`/`rclone` 在本机不可用，AWS SDK for Rust 客户端用例未编写，因此本项不勾选完成。
+- [x] P3-05 实现普通 payload 的校验，且任何校验失败都不发布。→ `Content-MD5`、声明 checksum、长度不符都返回 `400 BadDigest` 且不产生对象；`aws-chunked` + checksum trailer 的运行时校验已补齐：`s3s` 只解码 trailer，值必须由服务层核对，因此 `PutParams.trailer_checksum` 在 body 消费完后读取 trailer 值并与流式摘要比对（声明未送达也视为不匹配）。→ `tests/service_limits.rs::a_trailer_declared_checksum_is_verified_after_the_body`、`scripts/e2e_streaming_trailer.py`。
+- [x] P3-06 运行固定版本客户端基础用例；记录版本与默认配置。→ 两个固定版本客户端都跑通并记录了版本与默认配置：boto3/botocore **1.42.97**（`scripts/e2e_boto3.py` 63/63）与 AWS CLI **1.44.87**（`pip install awscli`，`scripts/e2e_cli.sh` 29/29，`s3.signature_version=s3v4`）。注：`aws s3 presign` 在 CLI v1 默认 SigV2，服务器按 ADR-0007 拒绝，脚本显式固定 s3v4；未编写 AWS SDK for Rust 客户端用例（不在本项交付物内）。
 - [x] P3-07 virtual-hosted-style 未实现，因此配置成 `addressing = "virtual"` 在**校验阶段明确失败**（fail closed，不会静默按 path-style 提供服务），兼容矩阵标为未支持。→ `rejects_virtual_hosted_addressing`。
 
 产物：可用 CLI/SDK 操作测试 namespace 的服务器、基础兼容报告、可执行开发配置。
@@ -116,10 +119,10 @@ P1 模型稳定后，协议适配测试向量与 P2 可独立推进；不应在�
 - [x] P4-01（有意偏离并记录）：`MultipartNamespace` 已作为 driver 扩展契约存在（`src/driver/extensions.rs`），但 `MultipartStore` / `StagingStore` **没有**被引入为 trait。理由：暂存与 multipart session 的状态必须与「单次发布」「竞争仲裁」「完成记录」在同一个临界区内推进，把状态放到 driver 侧会把这些不变量拆到两个进程内；当前由服务层协调器（`src/service/multipart.rs`，`MultipartState` + `std::sync::Mutex`）独占，并通过 `ObjectService` 的公开方法暴露。真实后端的持久化暂存由 P6 的 driver 在其 `StagedWrite`/`MultipartNamespace` 内实现，协调器仍然只通过 driver 接口发布。
 - [x] P4-02 实现创建、上传、列举 part/upload、完成、终止和 UploadPartCopy。→ 真实 SDK 覆盖全部六个操作。
 - [x] P4-03 实现 CAS 状态机（`claims` 单次完成声明）、上传归属检查（bucket/key/upload id 绑定）、part 原子替换、固定清单与流式合并。→ `tests/service_multipart.rs`。
-- [ ] P4-04 part 顺序/大小限制与结果 metadata 已实现（升序、非末 part 至少 5 MiB、part 数上限 10000、完成时发布 `ETag = md5(parts)-N`）；**FULL_OBJECT / COMPOSITE checksum 未实现**，因此本项不勾选完成。
+- [x] P4-04 part 顺序/大小限制与结果 metadata 已实现（升序、非末 part 至少 5 MiB、part 数上限 10000、完成时发布 `ETag = md5(parts)-N`）；**FULL_OBJECT / COMPOSITE checksum 已实现**：创建时固定 scheme（未指定则按算法族取默认覆盖），每个 part 按其算法计算并存储摘要，完成时 FULL_OBJECT 对装配后字节取摘要、COMPOSITE 对有序 part 原始摘要取摘要（带 `-<partcount>` 线格式），客户端声明的完成 checksum（含 part 清单里的每 part checksum）不匹配一律 `400 BadDigest` 且不发布，非法组合（`CRC64NVME + COMPOSITE`、SHA 族 + FULL_OBJECT）拒绝。→ `src/service/multipart.rs`、`src/protocol/s3/mod.rs`、`tests/service_multipart.rs`（5 个用例）、`scripts/e2e_boto3.py`（FULL_OBJECT 与 COMPOSITE 各用 Python 标库独立复算）。
 - [x] P4-05 实现完成记录、四态恢复查询和安全的租约清理器；只有 NotCommittedFinal 才可在 CAS 获得恢复权后评估重试，Committed 不再发布（回执丢失时从已发布 revision 还原响应），InFlight/Unknown 不得重放。→ `CompletionRecord`、`completion_state(s)`、`sweep_expired_uploads`、`tests/service_multipart.rs` 的 lost-ack / fenced / unknown 三个用例。
 - [x] P4-06 覆盖并发 Complete/Complete 与 Complete/Abort 仲裁、丢失完成回执、重试清单变化（manifests 变更后重试）、过期暂存清理与「未知结果不被清扫/不被重放」；注入“原提交仍在途但查无记录”以及“原尝试已隔离、重试成功后旧提交迟到”两种时序，验证不重复提交且旧尝试不能覆盖新对象。
-- [ ] P4-07 SDK transfer manager 的 multipart 路径**已验证**（11 MiB → 3 part，ETag 用独立计算的组合值比对，`ListParts`/`UploadPartCopy`/`abort` 均通过）；高层 **CLI** 路径未验证（无 AWS CLI），因此本项不勾选完成。
+- [x] P4-07 SDK transfer manager 的 multipart 路径**已验证**（11 MiB → 3 part，ETag 用独立计算的组合值比对，`ListParts`/`UploadPartCopy`/`abort` 均通过）；高层 **CLI** 路径已验证（`scripts/e2e_cli.sh`：`aws s3 cp` 11 MiB 自动分片且 ETag 带 part 数、`aws s3 sync`/`ls`/`rm` 与往返字节一致）。
 
 产物：可运行的 multipart 参考实现、恢复协议与故障测试。测试工具可以用可重建状态模拟崩溃窗口，但不能替代真实持久化系统的进程崩溃验证。
 
@@ -136,7 +139,7 @@ P1 模型稳定后，协议适配测试向量与 P2 可独立推进；不应在�
 - [x] P5-03 执行取消/流中断、超限、限流、暂存背压、未知提交结果测试。→ `tests/service_limits.rs`、`tests/service_multipart.rs`、`tests/contract_fault.rs`。**未覆盖**：真实慢客户端与真实进程信号下的排空时序（需要端到端客户端脚本，当前只有本地信号量语义的单测）。
 - [x] P5-04 固定依赖版本（ADR-0005）并以固定 SDK 版本跑兼容矩阵：boto3/botocore **1.42.97**、Python 3.9.6、`signature_version=s3v4`、`addressing_style=path`、`retries.max_attempts=0`。协议库（`s3s` 0.16.1）或 SDK 升级后必须重跑本节命令。
 - [ ] P5-05 性质测试已覆盖 range 解析、key 编码往返（含控制字符/`//`/`+`）、摘要编码往返、token 作用域与伪造（`tests/property_parsing.rs`，确定性 LCG，每次 500 轮）；**未覆盖**：XML 与 part 清单的模糊测试、签名输入的性质测试（需引入 fuzz 目标），因此本项不勾选完成。
-- [ ] 部分完成：`a_generated_multi_megabyte_body_streams_through_unchanged` 用生成式数据源（12 MiB / 256 KiB 块，不在测试内物化）验证服务层流水线；**未完成**：计数 sink 与 100 MiB/1 GiB/10 GiB 的 RSS 对比基准（需要真实后端或可观测分配器），因此本项不勾选完成。
+- [x] P5-06 内存预算：`a_generated_multi_megabyte_body_streams_through_unchanged` 用生成式数据源验证服务层流水线；计数 sink（`src/testing/counting.rs`，逐块计数后丢弃，只保留 metadata）配合 `tests/resource_budget.rs` 以 100 MiB、1 GiB、10 GiB 生成流（256 KiB 块）实测：空闲基线 2 MiB，三个尺寸增量峰值 RSS 均为 **0 MiB**，阈值来自 `bench/resource-budget.toml`（`per_request_buffer_bytes × max_concurrency + slack = 32 MiB`）。命令：`ALLINS3_BENCH_FULL=1 cargo test --release --all-features --test resource_budget -- --nocapture`（默认只跑 100 MiB）。P5-06 其余部分（模糊测试）属 P5-05。
 - [x] P5-07 发布工程预览使用说明与能力表（[README](../README.md)）、已知差异（[兼容矩阵](compatibility-matrix.md) 第 5 节）、开发模式标识（`development = true` 才允许注册测试 driver）、真实 driver 接入指南（[driver-guide.md](driver-guide.md)）。
 
 验收门槛：内存符合缓冲预算；常规测试无 secret 泄漏；不支持的功能有确定错误；所有宣称支持的矩阵项通过；不以关闭 checksum、禁用签名或只用自写客户端作为验收条件。
@@ -193,4 +196,4 @@ P0 与 P1 已按本节的顺序完成（协议风险验证 → 领域类型 / dr
 2. `cd spikes/protocol-adapter && cargo test`（`s3s` 候选行为断言）。
 3. `./target/debug/allins3 check-config examples/dev-config.toml`，再启动并用 `scripts/e2e_boto3.py` 跑 43 项真实 SDK 检查。
 
-**仍未完成（不得当作通过）**：P3-06 的 AWS CLI / AWS SDK for Rust 用例、P3-05 与兼容矩阵中的 `aws-chunked` + trailer 运行时校验、P4-04 / P4-07 的 multipart checksum 合成与高层 CLI 路径、P5-05 的 XML/签名模糊测试、P5-06 的计数 sink 与 RSS 基准。P6 的生产准入（持久化暂存、崩溃恢复、备份、基准）全部未开始，且必须在选定真实后端后单独排期；在此之前本仓库只能声明为工程预览。
+**仍未完成（不得当作通过）**：P5-05 的 XML / part 清单 / 签名输入模糊测试（需引入 fuzz 目标）。P6 的生产准入（持久化暂存、崩溃恢复、备份、基准）全部未开始，且必须在选定真实后端后单独排期；在此之前本仓库只能声明为工程预览。此外，`aws-chunked` trailer 的运行时校验只能用本仓库手工构造的请求验证（CLI/botocore 1.42 对 HTTP endpoint 不发出 trailer 形式），因此该路径没有第三方客户端证据。

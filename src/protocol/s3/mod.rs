@@ -28,12 +28,30 @@ use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, StdError};
 
 use crate::auth::{AccessPolicy, Action, CredentialStore};
 use crate::domain::{
-    ContentProperties, DriverContext, DriverError, EntityTag, Preconditions, RangeSpec, RequestId,
-    UserMetadata,
+    ChecksumAlgorithm, ChecksumType, ContentProperties, DriverContext, DriverError, EntityTag,
+    Preconditions, RangeSpec, RequestId, UserMetadata,
 };
 use crate::driver::{MetadataDirective, ObjectByteStream};
 use crate::integrity::base64;
+use crate::service::multipart::{CompletionPart, DeclaredCompletionChecksum, MultipartChecksum};
 use crate::service::{CopyParams, ObjectService, ReadConditions, ServiceError};
+
+/// Sets the `x-amz-checksum-*` field of a part-level response DTO.
+macro_rules! set_part_checksum {
+    ($out:expr, $checksum:expr) => {
+        if let Some(checksum) = $checksum {
+            let value = base64(&checksum.value);
+            match checksum.algorithm {
+                ChecksumAlgorithm::Md5 => $out.checksum_md5 = Some(value),
+                ChecksumAlgorithm::Crc32 => $out.checksum_crc32 = Some(value),
+                ChecksumAlgorithm::Crc32c => $out.checksum_crc32c = Some(value),
+                ChecksumAlgorithm::Crc64Nvme => $out.checksum_crc64nvme = Some(value),
+                ChecksumAlgorithm::Sha1 => $out.checksum_sha1 = Some(value),
+                ChecksumAlgorithm::Sha256 => $out.checksum_sha256 = Some(value),
+            }
+        }
+    };
+}
 
 /// The S3 service implementation.
 #[derive(Clone)]
@@ -234,16 +252,47 @@ fn apply_metadata(meta: &crate::domain::ObjectMetadata, out: &mut CommonObjectOu
     out.content_disposition = meta.content.content_disposition.clone();
     out.cache_control = meta.content.cache_control.clone();
 
-    for checksum in &meta.checksums {
-        let value = base64(checksum.value());
-        match checksum.algorithm() {
-            crate::domain::ChecksumAlgorithm::Md5 => out.checksum_md5 = Some(value),
-            crate::domain::ChecksumAlgorithm::Crc32 => out.checksum_crc32 = Some(value),
-            crate::domain::ChecksumAlgorithm::Crc32c => out.checksum_crc32c = Some(value),
-            crate::domain::ChecksumAlgorithm::Crc64Nvme => out.checksum_crc64nvme = Some(value),
-            crate::domain::ChecksumAlgorithm::Sha1 => out.checksum_sha1 = Some(value),
-            crate::domain::ChecksumAlgorithm::Sha256 => out.checksum_sha256 = Some(value),
+    out.checksums = ChecksumHeaders::from_checksums(&meta.checksums);
+}
+
+/// The wire form of an object's checksums (spec §6.3).
+///
+/// A composite checksum is `base64(digest)-<partcount>`; a full-object one has
+/// no suffix. The coverage is published alongside so a client can tell them
+/// apart instead of guessing from the algorithm.
+#[derive(Default)]
+struct ChecksumHeaders {
+    md5: Option<String>,
+    crc32: Option<String>,
+    crc32c: Option<String>,
+    crc64nvme: Option<String>,
+    sha1: Option<String>,
+    sha256: Option<String>,
+    checksum_type: Option<s3s::dto::ChecksumType>,
+}
+
+impl ChecksumHeaders {
+    fn from_checksums(checksums: &[crate::domain::Checksum]) -> Self {
+        use crate::domain::ChecksumAlgorithm as Alg;
+        let mut headers = Self::default();
+        for checksum in checksums {
+            let mut value = base64(checksum.value());
+            if let Some(count) = checksum.part_count() {
+                value = format!("{value}-{count}");
+            }
+            match checksum.algorithm() {
+                Alg::Md5 => headers.md5 = Some(value),
+                Alg::Crc32 => headers.crc32 = Some(value),
+                Alg::Crc32c => headers.crc32c = Some(value),
+                Alg::Crc64Nvme => headers.crc64nvme = Some(value),
+                Alg::Sha1 => headers.sha1 = Some(value),
+                Alg::Sha256 => headers.sha256 = Some(value),
+            }
+            headers.checksum_type = Some(s3s::dto::ChecksumType::from_static(
+                checksum.checksum_type().as_str(),
+            ));
         }
+        headers
     }
 }
 
@@ -257,12 +306,7 @@ struct CommonObjectOutput {
     content_language: Option<String>,
     content_disposition: Option<String>,
     cache_control: Option<String>,
-    checksum_md5: Option<String>,
-    checksum_crc32: Option<String>,
-    checksum_crc32c: Option<String>,
-    checksum_crc64nvme: Option<String>,
-    checksum_sha1: Option<String>,
-    checksum_sha256: Option<String>,
+    checksums: ChecksumHeaders,
 }
 
 impl CommonObjectOutput {
@@ -277,12 +321,7 @@ impl CommonObjectOutput {
             content_language: None,
             content_disposition: None,
             cache_control: None,
-            checksum_md5: None,
-            checksum_crc32: None,
-            checksum_crc32c: None,
-            checksum_crc64nvme: None,
-            checksum_sha1: None,
-            checksum_sha256: None,
+            checksums: ChecksumHeaders::default(),
         }
     }
 }
@@ -647,12 +686,13 @@ impl S3 for S3Handler {
             content_language: common.content_language,
             content_disposition: common.content_disposition,
             cache_control: common.cache_control,
-            checksum_md5: common.checksum_md5,
-            checksum_crc32: common.checksum_crc32,
-            checksum_crc32c: common.checksum_crc32c,
-            checksum_crc64nvme: common.checksum_crc64nvme,
-            checksum_sha1: common.checksum_sha1,
-            checksum_sha256: common.checksum_sha256,
+            checksum_md5: common.checksums.md5,
+            checksum_crc32: common.checksums.crc32,
+            checksum_crc32c: common.checksums.crc32c,
+            checksum_crc64nvme: common.checksums.crc64nvme,
+            checksum_sha1: common.checksums.sha1,
+            checksum_sha256: common.checksums.sha256,
+            checksum_type: common.checksums.checksum_type,
             ..Default::default()
         };
         Ok(attach_request_id(
@@ -702,12 +742,7 @@ impl S3 for S3Handler {
             common.content_length = Some(range.len() as i64);
             // Whole-object checksums do not describe a byte range; publishing them
             // would make clients fail validation on a partial response.
-            common.checksum_md5 = None;
-            common.checksum_crc32 = None;
-            common.checksum_crc32c = None;
-            common.checksum_crc64nvme = None;
-            common.checksum_sha1 = None;
-            common.checksum_sha256 = None;
+            common.checksums = ChecksumHeaders::default();
         }
         let output = GetObjectOutput {
             accept_ranges: Some("bytes".to_string()),
@@ -722,12 +757,13 @@ impl S3 for S3Handler {
             content_language: common.content_language,
             content_disposition: common.content_disposition,
             cache_control: common.cache_control,
-            checksum_md5: common.checksum_md5,
-            checksum_crc32: common.checksum_crc32,
-            checksum_crc32c: common.checksum_crc32c,
-            checksum_crc64nvme: common.checksum_crc64nvme,
-            checksum_sha1: common.checksum_sha1,
-            checksum_sha256: common.checksum_sha256,
+            checksum_md5: common.checksums.md5,
+            checksum_crc32: common.checksums.crc32,
+            checksum_crc32c: common.checksums.crc32c,
+            checksum_crc64nvme: common.checksums.crc64nvme,
+            checksum_sha1: common.checksums.sha1,
+            checksum_sha256: common.checksums.sha256,
+            checksum_type: common.checksums.checksum_type,
             ..Default::default()
         };
         Ok(attach_request_id(
@@ -741,6 +777,7 @@ impl S3 for S3Handler {
         req: S3Request<s3s::dto::PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         let scope = self.scope(&req)?;
+        let trailer_checksum = request_trailer_checksum(&req, &scope.request_id)?;
         let input = req.input;
 
         // Explicitly unsupported parameters must fail, not be ignored.
@@ -786,6 +823,7 @@ impl S3 for S3Handler {
             content_md5,
             declared_checksum,
             checksum_algorithm,
+            trailer_checksum,
             content: content_props,
             user_metadata,
             preconditions,
@@ -807,12 +845,13 @@ impl S3 for S3Handler {
         apply_metadata(&meta, &mut common);
         let output = PutObjectOutput {
             e_tag: common.e_tag,
-            checksum_md5: common.checksum_md5,
-            checksum_crc32: common.checksum_crc32,
-            checksum_crc32c: common.checksum_crc32c,
-            checksum_crc64nvme: common.checksum_crc64nvme,
-            checksum_sha1: common.checksum_sha1,
-            checksum_sha256: common.checksum_sha256,
+            checksum_md5: common.checksums.md5,
+            checksum_crc32: common.checksums.crc32,
+            checksum_crc32c: common.checksums.crc32c,
+            checksum_crc64nvme: common.checksums.crc64nvme,
+            checksum_sha1: common.checksums.sha1,
+            checksum_sha256: common.checksums.sha256,
+            checksum_type: common.checksums.checksum_type,
             ..Default::default()
         };
         Ok(attach_request_id(
@@ -1113,6 +1152,11 @@ impl S3 for S3Handler {
             content_disposition: input.content_disposition.clone(),
             cache_control: input.cache_control.clone(),
         });
+        let checksum = checksum_scheme(
+            input.checksum_algorithm.as_ref(),
+            input.checksum_type.as_ref(),
+            &scope.request_id,
+        )?;
         let session = self
             .service
             .create_multipart(
@@ -1121,6 +1165,7 @@ impl S3 for S3Handler {
                 scope.principal.as_deref(),
                 content,
                 to_user_metadata(&input.metadata, &scope.request_id)?,
+                checksum,
             )
             .map_err(|e| map_error(e, &scope.request_id))?;
 
@@ -1128,6 +1173,11 @@ impl S3 for S3Handler {
             bucket: Some(input.bucket.clone()),
             key: Some(input.key.clone()),
             upload_id: Some(session.upload_id.as_str().to_string()),
+            checksum_algorithm: checksum.map(|scheme| {
+                s3s::dto::ChecksumAlgorithm::from_static(checksum_algorithm_wire(scheme.algorithm))
+            }),
+            checksum_type: checksum
+                .map(|scheme| s3s::dto::ChecksumType::from_static(scheme.checksum_type.as_str())),
             ..Default::default()
         };
         Ok(attach_request_id(
@@ -1144,6 +1194,24 @@ impl S3 for S3Handler {
         let input = req.input;
         let key = parse_key(&input.key, &scope.request_id)?;
         let part_number = part_number(&input.part_number, &scope.request_id)?;
+        let declared = declared_checksum_header(
+            &part_checksum_fields(
+                input.checksum_crc32.as_deref(),
+                input.checksum_crc32c.as_deref(),
+                input.checksum_crc64nvme.as_deref(),
+                input.checksum_sha1.as_deref(),
+                input.checksum_sha256.as_deref(),
+            ),
+            &[
+                input.checksum_sha512.as_deref(),
+                input.checksum_xxhash128.as_deref(),
+                input.checksum_xxhash3.as_deref(),
+                input.checksum_xxhash64.as_deref(),
+            ],
+            &scope.request_id,
+        )?
+        .map(|(algorithm, value)| decode_checksum(algorithm, value, &scope.request_id))
+        .transpose()?;
 
         let summary = self
             .service
@@ -1153,15 +1221,17 @@ impl S3 for S3Handler {
                 &key,
                 &input.upload_id,
                 part_number,
+                declared,
                 body_stream(input.body),
             )
             .await
             .map_err(|e| map_error(e, &scope.request_id))?;
 
-        let output = UploadPartOutput {
+        let mut output = UploadPartOutput {
             e_tag: Some(s3s::dto::ETag::Strong(summary.etag.as_str().to_string())),
             ..Default::default()
         };
+        set_part_checksum!(output, summary.checksum.as_ref());
         Ok(attach_request_id(
             S3Response::new(output),
             &scope.request_id,
@@ -1223,12 +1293,14 @@ impl S3 for S3Handler {
             .await
             .map_err(|e| map_error(e, &scope.request_id))?;
 
+        let mut part_result = CopyPartResult {
+            e_tag: Some(s3s::dto::ETag::Strong(summary.etag.as_str().to_string())),
+            last_modified: Some(to_timestamp(source_meta.last_modified)),
+            ..Default::default()
+        };
+        set_part_checksum!(part_result, summary.checksum.as_ref());
         let output = UploadPartCopyOutput {
-            copy_part_result: Some(CopyPartResult {
-                e_tag: Some(s3s::dto::ETag::Strong(summary.etag.as_str().to_string())),
-                last_modified: Some(to_timestamp(source_meta.last_modified)),
-                ..Default::default()
-            }),
+            copy_part_result: Some(part_result),
             ..Default::default()
         };
         Ok(attach_request_id(
@@ -1255,12 +1327,16 @@ impl S3 for S3Handler {
         let parts = page
             .parts
             .into_iter()
-            .map(|p| S3Part {
-                part_number: Some(p.number as i32),
-                size: Some(p.size as i64),
-                e_tag: Some(s3s::dto::ETag::Strong(p.etag.as_str().to_string())),
-                last_modified: Some(to_timestamp(p.last_modified)),
-                ..Default::default()
+            .map(|p| {
+                let mut part = S3Part {
+                    part_number: Some(p.number as i32),
+                    size: Some(p.size as i64),
+                    e_tag: Some(s3s::dto::ETag::Strong(p.etag.as_str().to_string())),
+                    last_modified: Some(to_timestamp(p.last_modified)),
+                    ..Default::default()
+                };
+                set_part_checksum!(part, p.checksum.as_ref());
+                part
             })
             .collect::<Vec<_>>();
 
@@ -1364,9 +1440,32 @@ impl S3 for S3Handler {
                 })?),
                 None => None,
             };
-            requested.push((number, etag));
+            let checksum = declared_checksum_header(
+                &part_checksum_fields(
+                    part.checksum_crc32.as_deref(),
+                    part.checksum_crc32c.as_deref(),
+                    part.checksum_crc64nvme.as_deref(),
+                    part.checksum_sha1.as_deref(),
+                    part.checksum_sha256.as_deref(),
+                ),
+                &[
+                    part.checksum_sha512.as_deref(),
+                    part.checksum_xxhash128.as_deref(),
+                    part.checksum_xxhash3.as_deref(),
+                    part.checksum_xxhash64.as_deref(),
+                ],
+                &scope.request_id,
+            )?
+            .map(|(algorithm, value)| decode_checksum(algorithm, value, &scope.request_id))
+            .transpose()?;
+            requested.push(CompletionPart {
+                number,
+                etag,
+                checksum,
+            });
         }
 
+        let declared = complete_checksum(&input, &scope.request_id)?;
         let preconditions = write_preconditions(&input.if_match, &input.if_none_match)
             .map_err(|e| map_error(e, &scope.request_id))?;
 
@@ -1378,11 +1477,13 @@ impl S3 for S3Handler {
                 &key,
                 &input.upload_id,
                 &requested,
+                declared,
                 preconditions,
             )
             .await
             .map_err(|e| map_error(e, &scope.request_id))?;
 
+        let headers = ChecksumHeaders::from_checksums(&meta.checksums);
         let output = CompleteMultipartUploadOutput {
             bucket: Some(input.bucket.clone()),
             key: Some(input.key.clone()),
@@ -1391,6 +1492,12 @@ impl S3 for S3Handler {
                 .etag
                 .as_ref()
                 .map(|t| s3s::dto::ETag::Strong(t.as_str().to_string())),
+            checksum_crc32: headers.crc32,
+            checksum_crc32c: headers.crc32c,
+            checksum_crc64nvme: headers.crc64nvme,
+            checksum_sha1: headers.sha1,
+            checksum_sha256: headers.sha256,
+            checksum_type: headers.checksum_type,
             ..Default::default()
         };
         Ok(attach_request_id(
@@ -1443,14 +1550,243 @@ fn parse_key(raw: &str, request_id: &str) -> Result<crate::domain::ObjectKey, S3
 }
 
 fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .map_err(|e| e.to_string())
+    crate::integrity::decode_base64(value)
+}
+
+/// The checksum a put request declares it will send in a trailer.
+///
+/// `s3s` parses `x-amz-trailer` and exposes the trailing headers, but leaves
+/// their verification to the handler, so the service is given a reader and
+/// re-checks the digest once the body has been consumed (spec §6.3).
+fn request_trailer_checksum(
+    request: &S3Request<s3s::dto::PutObjectInput>,
+    request_id: &str,
+) -> S3Result<Option<crate::service::TrailerChecksum>> {
+    let Some(handle) = request.trailing_headers.clone() else {
+        return Ok(None);
+    };
+    let Some(name) = declared_trailer_checksum(&request.headers) else {
+        return Ok(None);
+    };
+    let Some(algorithm) = checksum_algorithm_wire_name(&name) else {
+        return Err(map_error(
+            ServiceError::NotImplemented(format!("unsupported checksum trailer `{name}`")),
+            request_id,
+        ));
+    };
+    let header = match hyper::header::HeaderName::from_bytes(name.as_bytes()) {
+        Ok(header) => header,
+        Err(_) => {
+            return Err(map_error(
+                ServiceError::InvalidArgument(format!("invalid trailer name `{name}`")),
+                request_id,
+            ));
+        }
+    };
+    Ok(Some(crate::service::TrailerChecksum::new(
+        algorithm,
+        move || {
+            handle
+                .read(|headers| {
+                    headers
+                        .get(&header)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string)
+                })
+                .flatten()
+        },
+    )))
+}
+
+/// The `x-amz-checksum-*` name listed in `x-amz-trailer`, if any.
+fn declared_trailer_checksum(headers: &hyper::HeaderMap) -> Option<String> {
+    let value = headers.get("x-amz-trailer")?.to_str().ok()?;
+    value
+        .split(',')
+        .map(str::trim)
+        .find(|name| name.to_ascii_lowercase().starts_with("x-amz-checksum-"))
+        .map(|name| name.to_ascii_lowercase())
+}
+
+/// The algorithm a `x-amz-checksum-*` header name selects.
+fn checksum_algorithm_wire_name(name: &str) -> Option<ChecksumAlgorithm> {
+    match name.strip_prefix("x-amz-checksum-")? {
+        "crc32" => Some(ChecksumAlgorithm::Crc32),
+        "crc32c" => Some(ChecksumAlgorithm::Crc32c),
+        "crc64nvme" => Some(ChecksumAlgorithm::Crc64Nvme),
+        "sha1" => Some(ChecksumAlgorithm::Sha1),
+        "sha256" => Some(ChecksumAlgorithm::Sha256),
+        _ => None,
+    }
 }
 
 /// A checksum algorithm together with the raw value the client declared for it.
-type DeclaredChecksum = (crate::domain::ChecksumAlgorithm, Vec<u8>);
+type DeclaredChecksum = (ChecksumAlgorithm, Vec<u8>);
+
+/// The `x-amz-checksum-*` header fields shared by part-level requests, in the
+/// order they are checked.
+fn part_checksum_fields<'a>(
+    crc32: Option<&'a str>,
+    crc32c: Option<&'a str>,
+    crc64nvme: Option<&'a str>,
+    sha1: Option<&'a str>,
+    sha256: Option<&'a str>,
+) -> [(ChecksumAlgorithm, Option<&'a str>); 5] {
+    [
+        (ChecksumAlgorithm::Crc32, crc32),
+        (ChecksumAlgorithm::Crc32c, crc32c),
+        (ChecksumAlgorithm::Crc64Nvme, crc64nvme),
+        (ChecksumAlgorithm::Sha1, sha1),
+        (ChecksumAlgorithm::Sha256, sha256),
+    ]
+}
+
+/// Finds the one checksum the client declared, rejecting algorithms this server
+/// does not implement rather than silently ignoring them.
+fn declared_checksum_header<'a>(
+    declared: &[(ChecksumAlgorithm, Option<&'a str>)],
+    unsupported: &[Option<&'a str>],
+    request_id: &str,
+) -> S3Result<Option<(ChecksumAlgorithm, &'a str)>> {
+    if unsupported.iter().any(Option::is_some) {
+        return Err(map_error(
+            ServiceError::NotImplemented("unsupported checksum algorithm".into()),
+            request_id,
+        ));
+    }
+    Ok(declared
+        .iter()
+        .find_map(|(algorithm, value)| value.map(|value| (*algorithm, value))))
+}
+
+/// Decodes a declared checksum value (standard base64, no part-count suffix).
+fn decode_checksum(
+    algorithm: ChecksumAlgorithm,
+    value: &str,
+    request_id: &str,
+) -> S3Result<DeclaredChecksum> {
+    let bytes = decode_base64(value).map_err(|e| {
+        map_error(
+            ServiceError::InvalidArgument(format!("invalid checksum: {e}")),
+            request_id,
+        )
+    })?;
+    Ok((algorithm, bytes))
+}
+
+/// Builds the multipart checksum scheme a create request asked for.
+fn checksum_scheme(
+    algorithm: Option<&s3s::dto::ChecksumAlgorithm>,
+    checksum_type: Option<&s3s::dto::ChecksumType>,
+    request_id: &str,
+) -> S3Result<Option<MultipartChecksum>> {
+    let Some(algorithm) = algorithm else {
+        if checksum_type.is_some() {
+            return Err(map_error(
+                ServiceError::InvalidArgument(
+                    "a checksum type requires a checksum algorithm".into(),
+                ),
+                request_id,
+            ));
+        }
+        return Ok(None);
+    };
+    let algorithm = checksum_algorithm_from(algorithm.as_str(), request_id)?;
+    let checksum_type = match checksum_type {
+        Some(value) => checksum_type_from(value.as_str(), request_id)?,
+        None => algorithm.default_multipart_type(),
+    };
+    MultipartChecksum::new(algorithm, checksum_type)
+        .map(Some)
+        .map_err(|e| map_error(e, request_id))
+}
+
+/// The whole-object checksum a completion request declared.
+///
+/// A composite value arrives as `base64(digest)-<partcount>`, so the count is
+/// split off before the digest is decoded; the digest is what gets compared.
+fn complete_checksum(
+    input: &s3s::dto::CompleteMultipartUploadInput,
+    request_id: &str,
+) -> S3Result<Option<DeclaredCompletionChecksum>> {
+    let found = declared_checksum_header(
+        &part_checksum_fields(
+            input.checksum_crc32.as_deref(),
+            input.checksum_crc32c.as_deref(),
+            input.checksum_crc64nvme.as_deref(),
+            input.checksum_sha1.as_deref(),
+            input.checksum_sha256.as_deref(),
+        ),
+        &[
+            input.checksum_sha512.as_deref(),
+            input.checksum_xxhash128.as_deref(),
+            input.checksum_xxhash3.as_deref(),
+            input.checksum_xxhash64.as_deref(),
+        ],
+        request_id,
+    )?;
+    let (raw_algorithm, raw_value) = match found {
+        Some(found) => found,
+        None => {
+            if input.checksum_type.is_some() {
+                return Err(map_error(
+                    ServiceError::InvalidArgument(
+                        "a checksum type requires a declared checksum value".into(),
+                    ),
+                    request_id,
+                ));
+            }
+            return Ok(None);
+        }
+    };
+    let (value, part_count) = split_part_count(raw_value);
+    let (algorithm, value) = decode_checksum(raw_algorithm, value, request_id)?;
+    let checksum_type = input
+        .checksum_type
+        .as_ref()
+        .map(|value| checksum_type_from(value.as_str(), request_id))
+        .transpose()?;
+    Ok(Some(DeclaredCompletionChecksum {
+        algorithm,
+        value,
+        checksum_type,
+        part_count,
+    }))
+}
+
+/// Splits the `-<partcount>` suffix off a composite checksum value.
+fn split_part_count(value: &str) -> (&str, Option<u32>) {
+    match value.rsplit_once('-') {
+        Some((digest, count)) => match count.parse::<u32>() {
+            Ok(count) => (digest, Some(count)),
+            Err(_) => (value, None),
+        },
+        None => (value, None),
+    }
+}
+
+/// The wire name of a checksum algorithm.
+fn checksum_algorithm_wire(algorithm: ChecksumAlgorithm) -> &'static str {
+    match algorithm {
+        ChecksumAlgorithm::Md5 => "MD5",
+        ChecksumAlgorithm::Crc32 => "CRC32",
+        ChecksumAlgorithm::Crc32c => "CRC32C",
+        ChecksumAlgorithm::Crc64Nvme => "CRC64NVME",
+        ChecksumAlgorithm::Sha1 => "SHA1",
+        ChecksumAlgorithm::Sha256 => "SHA256",
+    }
+}
+
+fn checksum_type_from(value: &str, request_id: &str) -> S3Result<ChecksumType> {
+    match value {
+        "COMPOSITE" => Ok(ChecksumType::Composite),
+        "FULL_OBJECT" => Ok(ChecksumType::FullObject),
+        other => Err(map_error(
+            ServiceError::InvalidArgument(format!("unsupported checksum type `{other}`")),
+            request_id,
+        )),
+    }
+}
 
 /// Extracts a requested checksum algorithm and any client-declared value.
 fn parse_checksums(
@@ -1460,47 +1796,30 @@ fn parse_checksums(
     Option<crate::domain::ChecksumAlgorithm>,
     Option<DeclaredChecksum>,
 )> {
-    use crate::domain::ChecksumAlgorithm as Alg;
-
     let algorithm = input
         .checksum_algorithm
         .as_ref()
         .map(|a| checksum_algorithm_from(a.as_str(), request_id))
         .transpose()?;
 
-    if input.checksum_sha512.is_some()
-        || input.checksum_xxhash128.is_some()
-        || input.checksum_xxhash3.is_some()
-        || input.checksum_xxhash64.is_some()
-    {
-        return Err(map_error(
-            ServiceError::NotImplemented("unsupported checksum algorithm".into()),
-            request_id,
-        ));
-    }
-
-    let declared = [
-        (Alg::Crc32, input.checksum_crc32.as_ref()),
-        (Alg::Crc32c, input.checksum_crc32c.as_ref()),
-        (Alg::Crc64Nvme, input.checksum_crc64nvme.as_ref()),
-        (Alg::Sha1, input.checksum_sha1.as_ref()),
-        (Alg::Sha256, input.checksum_sha256.as_ref()),
-    ]
-    .into_iter()
-    .find_map(|(alg, value)| value.map(|v| (alg, v)));
-
-    let declared = match declared {
-        Some((alg, value)) => {
-            let bytes = decode_base64(value).map_err(|e| {
-                map_error(
-                    ServiceError::InvalidArgument(format!("invalid checksum: {e}")),
-                    request_id,
-                )
-            })?;
-            Some((alg, bytes))
-        }
-        None => None,
-    };
+    let declared = declared_checksum_header(
+        &part_checksum_fields(
+            input.checksum_crc32.as_deref(),
+            input.checksum_crc32c.as_deref(),
+            input.checksum_crc64nvme.as_deref(),
+            input.checksum_sha1.as_deref(),
+            input.checksum_sha256.as_deref(),
+        ),
+        &[
+            input.checksum_sha512.as_deref(),
+            input.checksum_xxhash128.as_deref(),
+            input.checksum_xxhash3.as_deref(),
+            input.checksum_xxhash64.as_deref(),
+        ],
+        request_id,
+    )?
+    .map(|(algorithm, value)| decode_checksum(algorithm, value, request_id))
+    .transpose()?;
 
     Ok((algorithm, declared))
 }

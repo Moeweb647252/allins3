@@ -8,6 +8,7 @@ Run against a live server:
 Exits non-zero and prints the first failure if any check fails.
 """
 
+import base64
 import hashlib
 import io
 import os
@@ -15,6 +16,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import zlib
 
 import boto3
 import botocore
@@ -36,6 +38,18 @@ def check(name, condition, detail=""):
     print(f"[{status}] {name}{'' if condition else ': ' + str(detail)}")
     if not condition:
         raise AssertionError(f"{name}: {detail}")
+
+
+def b64(raw):
+    return base64.b64encode(raw).decode()
+
+
+def crc32_b64(data):
+    return b64(zlib.crc32(data).to_bytes(4, "big"))
+
+
+def sha256_b64(data):
+    return b64(hashlib.sha256(data).digest())
 
 
 def client():
@@ -300,8 +314,183 @@ def main():
         CopySource={"Bucket": bucket, "Key": "docs/hello.txt"},
     )
     check("upload_part_copy etag form", len(copied["CopyPartResult"]["ETag"].strip('"')) == 32)
+    check(
+        "upload_part_copy reports the part checksum",
+        "ChecksumCRC32" not in copied["CopyPartResult"] or len(copied["CopyPartResult"]["ChecksumCRC32"]) > 0,
+        copied["CopyPartResult"],
+    )
     s3.abort_multipart_upload(Bucket=bucket, Key="tm/inspect.bin", UploadId=mpu["UploadId"])
     check("aborted inspection upload", not s3.list_multipart_uploads(Bucket=bucket).get("Uploads"))
+
+    # --- Multipart checksums: FULL_OBJECT and COMPOSITE ---------------------
+    #
+    # These two modes are checked against values this script computes itself
+    # with the standard library, so the server is not grading its own work.
+
+    part_one = b"a" * (5 * 1024 * 1024)
+    part_two = b"full-object tail"
+    whole = part_one + part_two
+
+    key = "ck/full-object.bin"
+    mpu = s3.create_multipart_upload(
+        Bucket=bucket, Key=key, ChecksumAlgorithm="CRC32", ChecksumType="FULL_OBJECT"
+    )
+    check(
+        "create_multipart echoes the checksum scheme",
+        mpu.get("ChecksumAlgorithm") == "CRC32" and mpu.get("ChecksumType") == "FULL_OBJECT",
+        mpu.get("ChecksumAlgorithm"),
+    )
+    one = s3.upload_part(
+        Bucket=bucket,
+        Key=key,
+        PartNumber=1,
+        UploadId=mpu["UploadId"],
+        Body=part_one,
+        ChecksumAlgorithm="CRC32",
+    )
+    check(
+        "upload_part returns the part checksum",
+        one.get("ChecksumCRC32") == crc32_b64(part_one),
+        one.get("ChecksumCRC32"),
+    )
+    two = s3.upload_part(
+        Bucket=bucket,
+        Key=key,
+        PartNumber=2,
+        UploadId=mpu["UploadId"],
+        Body=part_two,
+        ChecksumAlgorithm="CRC32",
+    )
+    parts = s3.list_parts(Bucket=bucket, Key=key, UploadId=mpu["UploadId"]).get("Parts", [])
+    check(
+        "list_parts reports the stored part checksum",
+        parts and parts[1].get("ChecksumCRC32") == crc32_b64(part_two),
+        parts,
+    )
+
+    done = s3.complete_multipart_upload(
+        Bucket=bucket,
+        Key=key,
+        UploadId=mpu["UploadId"],
+        MultipartUpload={
+            "Parts": [
+                {"PartNumber": 1, "ETag": one["ETag"], "ChecksumCRC32": one["ChecksumCRC32"]},
+                {"PartNumber": 2, "ETag": two["ETag"], "ChecksumCRC32": two["ChecksumCRC32"]},
+            ]
+        },
+        ChecksumCRC32=crc32_b64(whole),
+        ChecksumType="FULL_OBJECT",
+    )
+    check(
+        "complete returns the full-object checksum",
+        done.get("ChecksumCRC32") == crc32_b64(whole),
+        done.get("ChecksumCRC32"),
+    )
+    check("complete reports the checksum type", done.get("ChecksumType") == "FULL_OBJECT", done.get("ChecksumType"))
+    head = s3.head_object(Bucket=bucket, Key=key)
+    check(
+        "head reports the full-object checksum",
+        head.get("ChecksumCRC32") == crc32_b64(whole),
+        head.get("ChecksumCRC32"),
+    )
+    check("head reports the checksum type", head.get("ChecksumType") == "FULL_OBJECT", head.get("ChecksumType"))
+    check("full-object body matches", s3.get_object(Bucket=bucket, Key=key)["Body"].read() == whole)
+    # A full-object checksum describes the object a ranged response is part of,
+    # so a range must not advertise it.
+    ranged = s3.get_object(Bucket=bucket, Key=key, Range="bytes=0-9")
+    check("ranged response drops the whole-object checksum", "ChecksumCRC32" not in ranged, ranged.get("ChecksumCRC32"))
+
+    # COMPOSITE: a digest of the ordered raw part digests, printed as
+    # `base64(digest)-<partcount>`.
+    key = "ck/composite.bin"
+    mpu = s3.create_multipart_upload(Bucket=bucket, Key=key, ChecksumAlgorithm="SHA256")
+    check(
+        "a SHA256 upload defaults to COMPOSITE",
+        mpu.get("ChecksumAlgorithm") == "SHA256" and mpu.get("ChecksumType") == "COMPOSITE",
+        (mpu.get("ChecksumAlgorithm"), mpu.get("ChecksumType")),
+    )
+    one = s3.upload_part(
+        Bucket=bucket, Key=key, PartNumber=1, UploadId=mpu["UploadId"], Body=part_one, ChecksumAlgorithm="SHA256"
+    )
+    two = s3.upload_part(
+        Bucket=bucket, Key=key, PartNumber=2, UploadId=mpu["UploadId"], Body=part_two, ChecksumAlgorithm="SHA256"
+    )
+    check("upload_part returns the SHA256 part checksum", one.get("ChecksumSHA256") == sha256_b64(part_one), one.get("ChecksumSHA256"))
+
+    expected = sha256_b64(hashlib.sha256(part_one).digest() + hashlib.sha256(part_two).digest())
+    done = s3.complete_multipart_upload(
+        Bucket=bucket,
+        Key=key,
+        UploadId=mpu["UploadId"],
+        MultipartUpload={
+            "Parts": [
+                {"PartNumber": 1, "ETag": one["ETag"], "ChecksumSHA256": one["ChecksumSHA256"]},
+                {"PartNumber": 2, "ETag": two["ETag"], "ChecksumSHA256": two["ChecksumSHA256"]},
+            ]
+        },
+        ChecksumSHA256=f"{expected}-2",
+        ChecksumType="COMPOSITE",
+    )
+    check(
+        "complete returns the composite checksum with its part count",
+        done.get("ChecksumSHA256") == f"{expected}-2",
+        done.get("ChecksumSHA256"),
+    )
+    check("complete reports the composite type", done.get("ChecksumType") == "COMPOSITE", done.get("ChecksumType"))
+    head = s3.head_object(Bucket=bucket, Key=key)
+    check(
+        "head returns the composite checksum",
+        head.get("ChecksumSHA256") == f"{expected}-2",
+        head.get("ChecksumSHA256"),
+    )
+    check("head reports the composite type", head.get("ChecksumType") == "COMPOSITE", head.get("ChecksumType"))
+    check(
+        "the composite value is not the digest of the assembled object",
+        expected != sha256_b64(whole),
+        expected,
+    )
+
+    # A completion that declares the wrong whole-object checksum must be
+    # rejected with BadDigest and must publish nothing.
+    key = "ck/mismatch.bin"
+    mpu = s3.create_multipart_upload(Bucket=bucket, Key=key, ChecksumAlgorithm="CRC32")
+    one = s3.upload_part(
+        Bucket=bucket, Key=key, PartNumber=1, UploadId=mpu["UploadId"], Body=b"checked body", ChecksumAlgorithm="CRC32"
+    )
+    try:
+        s3.complete_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            UploadId=mpu["UploadId"],
+            MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": one["ETag"]}]},
+            ChecksumCRC32=crc32_b64(b"some other body entirely"),
+        )
+        check("a wrong completion checksum is rejected", False, "complete succeeded")
+    except ClientError as e:
+        check(
+            "a wrong completion checksum is rejected",
+            e.response["Error"]["Code"] == "BadDigest",
+            e.response["Error"]["Code"],
+        )
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        check("a rejected completion publishes nothing", False, "object appeared")
+    except ClientError as e:
+        check("a rejected completion publishes nothing", e.response["Error"]["Code"] == "404", e.response["Error"]["Code"])
+    s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=mpu["UploadId"])
+
+    # An unsupported combination must be refused, not silently downgraded.
+    try:
+        s3.create_multipart_upload(
+            Bucket=bucket, Key="ck/illegal.bin", ChecksumAlgorithm="CRC64NVME", ChecksumType="COMPOSITE"
+        )
+        check("CRC64NVME + COMPOSITE is refused", False, "accepted")
+    except ClientError as e:
+        check(
+            "CRC64NVME + COMPOSITE is refused",
+            e.response["Error"]["Code"] in ("InvalidArgument", "InvalidRequest"),
+            e.response["Error"]["Code"],
+        )
 
     failed = [c for c in CHECKS if not c[1]]
     print(f"\nSDK versions: boto3 {boto3.__version__} botocore {botocore.__version__} (signature s3v4)")

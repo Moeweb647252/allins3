@@ -10,8 +10,8 @@ pub mod multipart;
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
@@ -103,6 +103,49 @@ impl ReadConditions {
     }
 }
 
+/// The checksum a client declared in a request trailer.
+///
+/// A trailer value only exists once the body has been consumed, so the service
+/// asks for it after the stream ends and verifies it exactly like a checksum
+/// declared in a header. The protocol library parses trailers but deliberately
+/// leaves their verification to the server (spec §6.3).
+#[derive(Clone)]
+pub struct TrailerChecksum {
+    algorithm: ChecksumAlgorithm,
+    value: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for TrailerChecksum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrailerChecksum")
+            .field("algorithm", &self.algorithm)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TrailerChecksum {
+    /// Wraps the algorithm named by the request and a reader for its value.
+    pub fn new(
+        algorithm: ChecksumAlgorithm,
+        value: impl Fn() -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            algorithm,
+            value: Arc::new(value),
+        }
+    }
+
+    /// The algorithm the request's trailer declaration named.
+    pub fn algorithm(&self) -> ChecksumAlgorithm {
+        self.algorithm
+    }
+
+    /// The decoded trailer value; `None` if the client never sent it.
+    pub fn value(&self) -> Option<Vec<u8>> {
+        crate::integrity::decode_base64(&(self.value)()?).ok()
+    }
+}
+
 /// Parameters for a staged write.
 #[derive(Debug, Clone, Default)]
 pub struct PutParams {
@@ -114,6 +157,8 @@ pub struct PutParams {
     pub declared_checksum: Option<(ChecksumAlgorithm, Vec<u8>)>,
     /// A checksum algorithm the client asked the service to compute.
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    /// A checksum the client said it would send in a request trailer.
+    pub trailer_checksum: Option<TrailerChecksum>,
     /// HTTP content properties.
     pub content: ContentProperties,
     /// User metadata.
@@ -591,7 +636,8 @@ impl ObjectService {
         // without buffering the whole object.
         let stream_algorithm = params
             .checksum_algorithm
-            .or_else(|| params.declared_checksum.as_ref().map(|(alg, _)| *alg));
+            .or_else(|| params.declared_checksum.as_ref().map(|(alg, _)| *alg))
+            .or_else(|| params.trailer_checksum.as_ref().map(|t| t.algorithm()));
         let mut md5 = StreamingDigest::new(ChecksumAlgorithm::Md5);
         let mut extra = stream_algorithm.map(StreamingDigest::new);
         let mut length: u64 = 0;
@@ -662,9 +708,27 @@ impl ObjectService {
             ));
         }
 
+        // A checksum declared in a request trailer is only readable now that the
+        // body has been consumed. A declaration whose value never arrives is a
+        // mismatch too: the algorithm and the actual value must agree (spec
+        // §6.3), and nothing is published when they do not.
+        let trailer_declared = match &params.trailer_checksum {
+            None => None,
+            Some(trailer) => match trailer.value() {
+                Some(value) => Some((trailer.algorithm(), value)),
+                None => {
+                    let _ = staged.abort(ctx).await;
+                    return Err(ServiceError::BadDigest(
+                        "the checksum you declared in a trailer was not sent".into(),
+                    ));
+                }
+            },
+        };
+        let declared_checksum = params.declared_checksum.clone().or(trailer_declared);
+
         // Client-declared checksum verification.
         let mut checksums = Vec::new();
-        if let Some((algorithm, expected)) = &params.declared_checksum {
+        if let Some((algorithm, expected)) = &declared_checksum {
             let actual = if *algorithm == ChecksumAlgorithm::Md5 {
                 md5_digest.clone()
             } else if Some(*algorithm) == stream_algorithm {
@@ -981,6 +1045,7 @@ impl ObjectService {
             content_md5: None,
             declared_checksum: None,
             checksum_algorithm: source.metadata.checksums.first().map(|c| c.algorithm()),
+            trailer_checksum: None,
             content,
             user_metadata,
             preconditions: params.preconditions.clone(),

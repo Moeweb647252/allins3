@@ -22,12 +22,97 @@ use crate::domain::{
     ObjectMetadata, PartNumber, Preconditions, UserMetadata, WriteId,
 };
 use crate::driver::UploadId;
-use crate::integrity::{StreamingDigest, hex, md5_digest};
+use crate::integrity::{StreamingDigest, composite_checksum, hex, md5_digest};
 
 use super::{ObjectService, ServiceError, next_chunk};
 
 /// Minimum size of any part except the last.
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+
+/// The checksum scheme a multipart upload runs under.
+///
+/// The scheme is fixed for the lifetime of the upload, because part digests can
+/// only be combined by an algorithm and coverage chosen up front (spec §6.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultipartChecksum {
+    /// The algorithm every part and the finished object are hashed with.
+    pub algorithm: ChecksumAlgorithm,
+    /// Whether the object-level checksum digests the assembled bytes or the
+    /// ordered part digests.
+    pub checksum_type: ChecksumType,
+}
+
+impl MultipartChecksum {
+    /// Validates an algorithm/coverage pair against the multipart support
+    /// table, rejecting illegal combinations such as `CRC64NVME + COMPOSITE`.
+    pub fn new(
+        algorithm: ChecksumAlgorithm,
+        checksum_type: ChecksumType,
+    ) -> Result<Self, ServiceError> {
+        if !algorithm.supports_multipart(checksum_type) {
+            return Err(ServiceError::InvalidArgument(format!(
+                "`{}` does not support the `{}` checksum type for multipart uploads",
+                algorithm.as_str(),
+                checksum_type.as_str()
+            )));
+        }
+        Ok(Self {
+            algorithm,
+            checksum_type,
+        })
+    }
+
+    /// The scheme a client chose when it named only an algorithm.
+    pub fn from_algorithm(algorithm: ChecksumAlgorithm) -> Result<Self, ServiceError> {
+        Self::new(algorithm, algorithm.default_multipart_type())
+    }
+}
+
+/// The checksum computed for one part under the upload's scheme.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartChecksum {
+    /// The algorithm the value was computed with.
+    pub algorithm: ChecksumAlgorithm,
+    /// The raw digest bytes (never base64).
+    pub value: Bytes,
+}
+
+/// One entry of a completion manifest.
+#[derive(Debug, Clone)]
+pub struct CompletionPart {
+    /// The part number.
+    pub number: u16,
+    /// The ETag the client expects for this part, when it sent one.
+    pub etag: Option<EntityTag>,
+    /// The part checksum the client declared, when it sent one.
+    pub checksum: Option<(ChecksumAlgorithm, Vec<u8>)>,
+}
+
+impl From<(u16, Option<EntityTag>)> for CompletionPart {
+    fn from((number, etag): (u16, Option<EntityTag>)) -> Self {
+        Self {
+            number,
+            etag,
+            checksum: None,
+        }
+    }
+}
+
+/// A whole-object checksum the client declared on completion.
+///
+/// A composite value arrives in the wire form `base64(digest)-<partcount>`, so
+/// the declared digest and the declared part count are kept separately.
+#[derive(Debug, Clone)]
+pub struct DeclaredCompletionChecksum {
+    /// The algorithm of the declared value.
+    pub algorithm: ChecksumAlgorithm,
+    /// The raw declared digest.
+    pub value: Vec<u8>,
+    /// The declared coverage, when the client sent `x-amz-checksum-type`.
+    pub checksum_type: Option<ChecksumType>,
+    /// The declared part count, when the value carried a `-<count>` suffix.
+    pub part_count: Option<u32>,
+}
 
 /// One in-progress multipart upload.
 #[derive(Debug, Clone)]
@@ -46,6 +131,8 @@ pub struct UploadSession {
     pub content: ContentProperties,
     /// User metadata for the finished object.
     pub user_metadata: UserMetadata,
+    /// The checksum scheme the upload was created with, if any.
+    pub checksum: Option<MultipartChecksum>,
     /// Creation time.
     pub initiated: SystemTime,
 }
@@ -61,6 +148,8 @@ pub struct StoredPart {
     pub data: Bytes,
     /// MD5 of the part.
     pub md5: [u8; 16],
+    /// The part checksum under the upload's scheme, when it has one.
+    pub checksum: Option<PartChecksum>,
 }
 
 impl StoredPart {
@@ -155,6 +244,8 @@ pub struct PartSummary {
     pub size: u64,
     /// Part ETag.
     pub etag: EntityTag,
+    /// The part checksum under the upload's scheme, when it has one.
+    pub checksum: Option<PartChecksum>,
     /// Last modification time.
     pub last_modified: SystemTime,
 }
@@ -204,6 +295,7 @@ impl ObjectService {
         principal: Option<&str>,
         content: ContentProperties,
         user_metadata: UserMetadata,
+        checksum: Option<MultipartChecksum>,
     ) -> Result<UploadSession, ServiceError> {
         let binding = self.binding(bucket)?;
         self.require_writable(&binding)?;
@@ -216,6 +308,7 @@ impl ObjectService {
             generation: binding.generation,
             content,
             user_metadata,
+            checksum,
             initiated: SystemTime::now(),
         };
         let mut state = self.multipart();
@@ -248,6 +341,13 @@ impl ObjectService {
 
     /// Uploads one part, replacing any previous part with the same number only
     /// after the new part is fully received.
+    ///
+    /// When the upload has a checksum scheme (or the part declares an algorithm
+    /// that fixes one), every part is hashed with it and the digest is stored
+    /// with the part so completion can combine them without re-reading.
+    // Each argument is the part's address, its identity or a distinct input the
+    // caller already has; grouping them would only relabel them.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upload_part(
         &self,
         ctx: &DriverContext,
@@ -255,17 +355,40 @@ impl ObjectService {
         key: &ObjectKey,
         upload_id: &str,
         part_number: u16,
+        declared: Option<(ChecksumAlgorithm, Vec<u8>)>,
         mut body: crate::driver::ObjectByteStream,
     ) -> Result<PartSummary, ServiceError> {
         PartNumber::new(part_number).map_err(|e| ServiceError::InvalidArgument(e.to_string()))?;
 
-        {
+        // Resolving the scheme before the body is consumed means a mismatched
+        // algorithm is rejected without reading a single byte.
+        let scheme = {
             let state = self.multipart();
-            self.require_session(&state, bucket, key, upload_id)?;
-        }
+            let session = self.require_session(&state, bucket, key, upload_id)?;
+            match (session.checksum, &declared) {
+                (Some(scheme), Some((algorithm, _))) => {
+                    if scheme.algorithm != *algorithm {
+                        return Err(ServiceError::InvalidRequest(format!(
+                            "the part checksum algorithm `{}` does not match the upload's `{}`",
+                            algorithm.as_str(),
+                            scheme.algorithm.as_str()
+                        )));
+                    }
+                    Some(scheme)
+                }
+                (Some(scheme), None) => Some(scheme),
+                // A part that names an algorithm on an upload created without
+                // one fixes the scheme for the remaining parts.
+                (None, Some((algorithm, _))) => {
+                    Some(MultipartChecksum::from_algorithm(*algorithm)?)
+                }
+                (None, None) => None,
+            }
+        };
 
         let mut buffer: Vec<u8> = Vec::new();
         let mut md5 = StreamingDigest::new(ChecksumAlgorithm::Md5);
+        let mut digest = scheme.map(|scheme| StreamingDigest::new(scheme.algorithm));
         let limit = self.inner.limits.max_single_write_size;
         loop {
             // A cancelled or timed-out request must stop consuming the body and
@@ -284,6 +407,9 @@ impl ObjectService {
                         ));
                     }
                     md5.update(&chunk);
+                    if let Some(hasher) = digest.as_mut() {
+                        hasher.update(&chunk);
+                    }
                     buffer.extend_from_slice(&chunk);
                 }
                 Some(Err(e)) => return Err(ServiceError::from_driver(&e, true)),
@@ -293,11 +419,49 @@ impl ObjectService {
         let data = Bytes::from(buffer);
         let size = data.len() as u64;
         let md5_bytes = md5.finalize();
-        let mut digest = [0u8; 16];
-        digest.copy_from_slice(&md5_bytes);
+        let mut md5_digest = [0u8; 16];
+        md5_digest.copy_from_slice(&md5_bytes);
+
+        let checksum = match (digest, scheme) {
+            (Some(hasher), Some(scheme)) => {
+                let value = hasher.finalize();
+                // A declared part checksum must match the bytes received, and a
+                // part is never staged when it does not.
+                if let Some((_, expected)) = &declared
+                    && value.as_ref() != expected.as_slice()
+                {
+                    return Err(ServiceError::BadDigest(
+                        "the checksum you specified did not match what we received".into(),
+                    ));
+                }
+                Some(PartChecksum {
+                    algorithm: scheme.algorithm,
+                    value,
+                })
+            }
+            _ => None,
+        };
 
         let mut state = self.multipart();
-        self.require_session(&state, bucket, key, upload_id)?;
+        let session = self.require_session(&state, bucket, key, upload_id)?;
+
+        // A scheme an earlier part adopted fixes the upload, so a part whose
+        // digest was computed under a different one can no longer be staged.
+        match (session.checksum, scheme) {
+            (Some(existing), Some(ours)) if existing.algorithm != ours.algorithm => {
+                return Err(ServiceError::InvalidRequest(format!(
+                    "the part checksum algorithm `{}` does not match the upload's `{}`",
+                    ours.algorithm.as_str(),
+                    existing.algorithm.as_str()
+                )));
+            }
+            (None, Some(ours)) => {
+                if let Some(session) = state.uploads.get_mut(upload_id) {
+                    session.checksum = Some(ours);
+                }
+            }
+            _ => {}
+        }
 
         // The part count is bounded; replacing an existing part is always allowed.
         let staged = state.parts.get(upload_id);
@@ -333,14 +497,16 @@ impl ObjectService {
                     number: part_number,
                     size,
                     data,
-                    md5: digest,
+                    md5: md5_digest,
+                    checksum: checksum.clone(),
                 },
             );
 
         Ok(PartSummary {
             number: part_number,
             size,
-            etag: EntityTag::new(hex(&digest)).expect("hex"),
+            etag: EntityTag::new(hex(&md5_digest)).expect("hex"),
+            checksum,
             last_modified: SystemTime::now(),
         })
     }
@@ -370,6 +536,7 @@ impl ObjectService {
                 number: p.number,
                 size: p.size,
                 etag: p.etag(),
+                checksum: p.checksum.clone(),
                 last_modified: SystemTime::now(),
             })
             .collect::<Vec<_>>();
@@ -435,21 +602,35 @@ impl ObjectService {
 
     /// Completes an upload from an exact manifest, atomically publishing the
     /// assembled object.
-    pub async fn complete_multipart(
+    ///
+    /// The object-level checksum is computed from the manifest's parts according
+    /// to the upload's scheme: a `FULL_OBJECT` one digests the assembled bytes,
+    /// a `COMPOSITE` one digests the ordered part digests (spec §6.3). A
+    /// mismatch with a declared completion checksum aborts before anything is
+    /// written to the target.
+    // As in `upload_part`, the arguments are the upload's address plus the
+    // manifest, the declared checksum and the write conditions.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_multipart<M>(
         &self,
         ctx: &DriverContext,
         bucket: &str,
         key: &ObjectKey,
         upload_id: &str,
-        manifest: &[(u16, Option<EntityTag>)],
+        manifest: &[M],
+        declared: Option<DeclaredCompletionChecksum>,
         preconditions: Preconditions,
-    ) -> Result<ObjectMetadata, ServiceError> {
+    ) -> Result<ObjectMetadata, ServiceError>
+    where
+        M: Into<CompletionPart> + Clone,
+    {
         let binding = self.binding(bucket)?;
         self.require_writable(&binding)?;
+        let manifest: Vec<CompletionPart> = manifest.iter().cloned().map(Into::into).collect();
 
         // Snapshot and validate the manifest while holding the lock, then
         // release it before the (awaiting) publish.
-        let (session, ordered, etag, write_id) = {
+        let (session, ordered, etag, checksum, write_id) = {
             let mut state = self.multipart();
             let session = self.require_session(&state, bucket, key, upload_id)?;
             let empty = BTreeMap::new();
@@ -463,22 +644,32 @@ impl ObjectService {
 
             let mut ordered: Vec<StoredPart> = Vec::with_capacity(manifest.len());
             let mut seen = std::collections::HashSet::new();
-            for (number, expected_etag) in manifest {
-                if !seen.insert(*number) {
+            for entry in &manifest {
+                let number = entry.number;
+                if !seen.insert(number) {
                     return Err(ServiceError::MalformedXml(
                         "the completion manifest contains duplicate part numbers".into(),
                     ));
                 }
-                let part = parts.get(number).ok_or_else(|| {
+                let part = parts.get(&number).ok_or_else(|| {
                     ServiceError::InvalidArgument(format!(
                         "part {number} was not uploaded for this upload"
                     ))
                 })?;
-                if let Some(expected) = expected_etag
+                if let Some(expected) = &entry.etag
                     && part.etag() != *expected
                 {
                     return Err(ServiceError::InvalidArgument(format!(
                         "part {number} ETag does not match the uploaded part"
+                    )));
+                }
+                // A declared part checksum must match the received bytes; an
+                // unverified part is never assembled into the object.
+                if let Some((algorithm, expected)) = &entry.checksum
+                    && part_checksum(part, *algorithm).as_ref() != expected.as_slice()
+                {
+                    return Err(ServiceError::BadDigest(format!(
+                        "the checksum you specified for part {number} did not match what we received"
                     )));
                 }
                 ordered.push(part.clone());
@@ -503,6 +694,86 @@ impl ObjectService {
             let md5s: Vec<[u8; 16]> = ordered.iter().map(|p| p.md5).collect();
             let etag = crate::integrity::etag_for_multipart(&md5s);
 
+            // Resolve the checksum scheme: the upload's own, or one this
+            // completion request fixes for an upload created without one.
+            let scheme = match (session.checksum, &declared) {
+                (Some(scheme), Some(declared)) => {
+                    if scheme.algorithm != declared.algorithm {
+                        return Err(ServiceError::InvalidRequest(format!(
+                            "the completion checksum algorithm `{}` does not match the upload's `{}`",
+                            declared.algorithm.as_str(),
+                            scheme.algorithm.as_str()
+                        )));
+                    }
+                    if let Some(declared_type) = declared.checksum_type
+                        && declared_type != scheme.checksum_type
+                    {
+                        return Err(ServiceError::InvalidRequest(format!(
+                            "the completion checksum type `{}` does not match the upload's `{}`",
+                            declared_type.as_str(),
+                            scheme.checksum_type.as_str()
+                        )));
+                    }
+                    Some(scheme)
+                }
+                (Some(scheme), None) => Some(scheme),
+                (None, Some(declared)) => Some(MultipartChecksum::new(
+                    declared.algorithm,
+                    declared
+                        .checksum_type
+                        .unwrap_or_else(|| declared.algorithm.default_multipart_type()),
+                )?),
+                (None, None) => None,
+            };
+
+            let checksum = match scheme {
+                None => None,
+                Some(scheme) => {
+                    let value = match scheme.checksum_type {
+                        // The assembled object is the parts in manifest order, so
+                        // hashing them in order is hashing the object.
+                        ChecksumType::FullObject => {
+                            let mut hasher = StreamingDigest::new(scheme.algorithm);
+                            for part in &ordered {
+                                hasher.update(&part.data);
+                            }
+                            hasher.finalize()
+                        }
+                        ChecksumType::Composite => {
+                            let digests: Vec<Bytes> = ordered
+                                .iter()
+                                .map(|part| part_checksum(part, scheme.algorithm))
+                                .collect();
+                            composite_checksum(scheme.algorithm, &digests)
+                        }
+                    };
+                    if let Some(declared) = &declared {
+                        if declared.value.as_slice() != value.as_ref() {
+                            return Err(ServiceError::BadDigest(
+                                "the checksum you specified did not match what we received".into(),
+                            ));
+                        }
+                        if let Some(count) = declared.part_count
+                            && count != ordered.len() as u32
+                        {
+                            return Err(ServiceError::BadDigest(format!(
+                                "the checksum you specified covers {count} parts but the manifest has {}",
+                                ordered.len()
+                            )));
+                        }
+                    }
+                    let checksum = match scheme.checksum_type {
+                        ChecksumType::FullObject => {
+                            Checksum::new(scheme.algorithm, ChecksumType::FullObject, value)
+                        }
+                        ChecksumType::Composite => {
+                            Checksum::composite(scheme.algorithm, value, ordered.len() as u32)
+                        }
+                    };
+                    Some(checksum.map_err(|e| ServiceError::InvalidArgument(e.to_string()))?)
+                }
+            };
+
             // Claim the completion exactly once. A second concurrent (or
             // retried) completion of the same upload must not publish again and
             // overwrite whatever the first one produced.
@@ -513,7 +784,7 @@ impl ObjectService {
             }
             let write_id = WriteId::generate();
             state.claims.insert(upload_id.to_string(), write_id.clone());
-            (session, ordered, etag, write_id)
+            (session, ordered, etag, checksum, write_id)
         };
 
         let total: u64 = ordered.iter().map(|p| p.size).sum();
@@ -558,9 +829,9 @@ impl ObjectService {
             }
         }
 
-        // Composite checksum over ordered part digests is not implemented for
-        // every algorithm; the ETag is the multipart `hash-partcount` form.
-        let checksums: Vec<Checksum> = Vec::new();
+        // The object-level checksum was computed from the parts above; the ETag
+        // is the multipart `hash-partcount` form.
+        let checksums: Vec<Checksum> = checksum.into_iter().collect();
         let meta = match staged
             .commit(
                 ctx,
@@ -801,6 +1072,7 @@ impl ObjectService {
                 &copy.key,
                 &copy.upload_id,
                 copy.part_number,
+                None,
                 source.stream,
             )
             .await?;
@@ -821,5 +1093,15 @@ impl ObjectService {
     #[allow(dead_code)]
     fn _unused_helpers(_: DriverError, _: DriverErrorKind, _: NonZeroU32, _: ChecksumType) {
         let _ = md5_digest(&[]);
+    }
+}
+
+/// The checksum of one stored part for `algorithm`: the digest computed when
+/// the part was uploaded, or a freshly computed one for a part that predates the
+/// upload's scheme (or was replaced under a different one).
+fn part_checksum(part: &StoredPart, algorithm: ChecksumAlgorithm) -> Bytes {
+    match &part.checksum {
+        Some(checksum) if checksum.algorithm == algorithm => checksum.value.clone(),
+        _ => crate::integrity::compute_checksum(algorithm, &part.data),
     }
 }
