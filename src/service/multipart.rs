@@ -77,6 +77,22 @@ pub struct PartChecksum {
     pub value: Bytes,
 }
 
+/// The checksums a part upload declares for its bytes.
+///
+/// The algorithm may be named by `x-amz-sdk-checksum-algorithm`, by an
+/// `x-amz-checksum-*` value or by the name the request declared as a trailer.
+/// A trailer's *value* only exists once the body has been consumed, so it is
+/// verified after the stream ends rather than before.
+#[derive(Debug, Clone, Default)]
+pub struct PartChecksums {
+    /// The algorithm the request asked for, if it named one.
+    pub algorithm: Option<ChecksumAlgorithm>,
+    /// A value the client declared in an `x-amz-checksum-*` header.
+    pub declared: Option<(ChecksumAlgorithm, Vec<u8>)>,
+    /// A value the client declared in a request trailer.
+    pub trailer: Option<super::TrailerChecksum>,
+}
+
 /// One entry of a completion manifest.
 #[derive(Debug, Clone)]
 pub struct CompletionPart {
@@ -104,10 +120,11 @@ impl From<(u16, Option<EntityTag>)> for CompletionPart {
 /// the declared digest and the declared part count are kept separately.
 #[derive(Debug, Clone)]
 pub struct DeclaredCompletionChecksum {
-    /// The algorithm of the declared value.
-    pub algorithm: ChecksumAlgorithm,
-    /// The raw declared digest.
-    pub value: Vec<u8>,
+    /// The algorithm the declared value belongs to, when a value was sent.
+    pub algorithm: Option<ChecksumAlgorithm>,
+    /// The raw declared digest, when the client sent one. A request that sends
+    /// only a checksum type declares the coverage, not a value.
+    pub value: Option<Vec<u8>>,
     /// The declared coverage, when the client sent `x-amz-checksum-type`.
     pub checksum_type: Option<ChecksumType>,
     /// The declared part count, when the value carried a `-<count>` suffix.
@@ -355,33 +372,39 @@ impl ObjectService {
         key: &ObjectKey,
         upload_id: &str,
         part_number: u16,
-        declared: Option<(ChecksumAlgorithm, Vec<u8>)>,
+        checksums: PartChecksums,
         mut body: crate::driver::ObjectByteStream,
     ) -> Result<PartSummary, ServiceError> {
         PartNumber::new(part_number).map_err(|e| ServiceError::InvalidArgument(e.to_string()))?;
 
-        // Resolving the scheme before the body is consumed means a mismatched
-        // algorithm is rejected without reading a single byte.
+        // Every algorithm this request names - the requested one, the header
+        // value's or the trailer's - must agree with the upload's scheme.
+        // Resolving before the body is consumed rejects a mismatch without
+        // reading a single byte.
+        let part_algorithm = checksums
+            .algorithm
+            .or_else(|| checksums.declared.as_ref().map(|(algorithm, _)| *algorithm))
+            .or_else(|| {
+                checksums
+                    .trailer
+                    .as_ref()
+                    .map(|trailer| trailer.algorithm())
+            });
         let scheme = {
             let state = self.multipart();
             let session = self.require_session(&state, bucket, key, upload_id)?;
-            match (session.checksum, &declared) {
-                (Some(scheme), Some((algorithm, _))) => {
-                    if scheme.algorithm != *algorithm {
-                        return Err(ServiceError::InvalidRequest(format!(
-                            "the part checksum algorithm `{}` does not match the upload's `{}`",
-                            algorithm.as_str(),
-                            scheme.algorithm.as_str()
-                        )));
-                    }
-                    Some(scheme)
+            match (session.checksum, part_algorithm) {
+                (Some(scheme), Some(algorithm)) if scheme.algorithm != algorithm => {
+                    return Err(ServiceError::InvalidRequest(format!(
+                        "the part checksum algorithm `{}` does not match the upload's `{}`",
+                        algorithm.as_str(),
+                        scheme.algorithm.as_str()
+                    )));
                 }
-                (Some(scheme), None) => Some(scheme),
+                (Some(scheme), _) => Some(scheme),
                 // A part that names an algorithm on an upload created without
                 // one fixes the scheme for the remaining parts.
-                (None, Some((algorithm, _))) => {
-                    Some(MultipartChecksum::from_algorithm(*algorithm)?)
-                }
+                (None, Some(algorithm)) => Some(MultipartChecksum::from_algorithm(algorithm)?),
                 (None, None) => None,
             }
         };
@@ -425,8 +448,24 @@ impl ObjectService {
         let checksum = match (digest, scheme) {
             (Some(hasher), Some(scheme)) => {
                 let value = hasher.finalize();
-                // A declared part checksum must match the bytes received, and a
-                // part is never staged when it does not.
+                // A value declared in a header, or in a trailer that only became
+                // readable once the body was consumed, must match the bytes
+                // received; a part is never staged when it does not. A trailer
+                // the client declared but never sent is a mismatch too. When a
+                // request carries both, the trailer is the declaration that was
+                // verified: it is the one the body framing carries, and the
+                // header value only selected the algorithm.
+                let declared = match &checksums.trailer {
+                    None => checksums.declared.clone(),
+                    Some(trailer) => match trailer.value() {
+                        Some(value) => Some((scheme.algorithm, value)),
+                        None => {
+                            return Err(ServiceError::BadDigest(
+                                "the checksum you declared in a trailer was not sent".into(),
+                            ));
+                        }
+                    },
+                };
                 if let Some((_, expected)) = &declared
                     && value.as_ref() != expected.as_slice()
                 {
@@ -698,10 +737,14 @@ impl ObjectService {
             // completion request fixes for an upload created without one.
             let scheme = match (session.checksum, &declared) {
                 (Some(scheme), Some(declared)) => {
-                    if scheme.algorithm != declared.algorithm {
+                    // A declaration constrains the upload's scheme: the value's
+                    // algorithm and any coverage must agree with it.
+                    if let Some(algorithm) = declared.algorithm
+                        && algorithm != scheme.algorithm
+                    {
                         return Err(ServiceError::InvalidRequest(format!(
                             "the completion checksum algorithm `{}` does not match the upload's `{}`",
-                            declared.algorithm.as_str(),
+                            algorithm.as_str(),
                             scheme.algorithm.as_str()
                         )));
                     }
@@ -717,12 +760,21 @@ impl ObjectService {
                     Some(scheme)
                 }
                 (Some(scheme), None) => Some(scheme),
-                (None, Some(declared)) => Some(MultipartChecksum::new(
-                    declared.algorithm,
-                    declared
-                        .checksum_type
-                        .unwrap_or_else(|| declared.algorithm.default_multipart_type()),
-                )?),
+                // An upload created without a scheme needs an algorithm to
+                // compute one; a coverage alone cannot supply it.
+                (None, Some(declared)) => {
+                    let Some(algorithm) = declared.algorithm else {
+                        return Err(ServiceError::InvalidRequest(
+                            "a completion checksum type requires a checksum algorithm".into(),
+                        ));
+                    };
+                    Some(MultipartChecksum::new(
+                        algorithm,
+                        declared
+                            .checksum_type
+                            .unwrap_or_else(|| algorithm.default_multipart_type()),
+                    )?)
+                }
                 (None, None) => None,
             };
 
@@ -748,7 +800,9 @@ impl ObjectService {
                         }
                     };
                     if let Some(declared) = &declared {
-                        if declared.value.as_slice() != value.as_ref() {
+                        if let Some(expected) = &declared.value
+                            && expected.as_slice() != value.as_ref()
+                        {
                             return Err(ServiceError::BadDigest(
                                 "the checksum you specified did not match what we received".into(),
                             ));
@@ -1072,7 +1126,7 @@ impl ObjectService {
                 &copy.key,
                 &copy.upload_id,
                 copy.part_number,
-                None,
+                PartChecksums::default(),
                 source.stream,
             )
             .await?;

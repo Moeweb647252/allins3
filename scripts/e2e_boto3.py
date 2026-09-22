@@ -52,7 +52,10 @@ def sha256_b64(data):
     return b64(hashlib.sha256(data).digest())
 
 
-def client():
+def client(**overrides):
+    # botocore's default `request_checksum_calculation` makes it inject a CRC32
+    # on every `UploadPart`, which is what a real SDK client does; a check that
+    # needs an upload with no checksum scheme at all asks for `when_required`.
     return boto3.client(
         "s3",
         endpoint_url=ENDPOINT,
@@ -63,6 +66,7 @@ def client():
             signature_version="s3v4",
             s3={"addressing_style": "path"},
             retries={"max_attempts": 0},
+            **overrides,
         ),
     )
 
@@ -449,6 +453,81 @@ def main():
         expected != sha256_b64(whole),
         expected,
     )
+
+    # `x-amz-checksum-type` is an optional declaration of its own: a completion
+    # may constrain the coverage the server must produce without naming a value
+    # to compare against.
+    key = "ck/type-only.bin"
+    mpu = s3.create_multipart_upload(
+        Bucket=bucket, Key=key, ChecksumAlgorithm="SHA256", ChecksumType="COMPOSITE"
+    )
+    one = s3.upload_part(
+        Bucket=bucket, Key=key, PartNumber=1, UploadId=mpu["UploadId"], Body=b"typed body", ChecksumAlgorithm="SHA256"
+    )
+    # The composite of one part digests that part's raw digest.
+    typed = sha256_b64(hashlib.sha256(b"typed body").digest())
+    done = s3.complete_multipart_upload(
+        Bucket=bucket,
+        Key=key,
+        UploadId=mpu["UploadId"],
+        MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": one["ETag"]}]},
+        ChecksumType="COMPOSITE",
+    )
+    check(
+        "a type-only completion publishes the computed composite checksum",
+        done.get("ChecksumSHA256") == f"{typed}-1" and done.get("ChecksumType") == "COMPOSITE",
+        (done.get("ChecksumSHA256"), done.get("ChecksumType")),
+    )
+
+    # A coverage that contradicts the upload's scheme must be refused.
+    key = "ck/type-conflict.bin"
+    mpu = s3.create_multipart_upload(
+        Bucket=bucket, Key=key, ChecksumAlgorithm="CRC32", ChecksumType="FULL_OBJECT"
+    )
+    one = s3.upload_part(
+        Bucket=bucket, Key=key, PartNumber=1, UploadId=mpu["UploadId"], Body=b"conflict body", ChecksumAlgorithm="CRC32"
+    )
+    try:
+        s3.complete_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            UploadId=mpu["UploadId"],
+            MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": one["ETag"]}]},
+            ChecksumType="COMPOSITE",
+        )
+        check("a coverage that contradicts the upload scheme is refused", False, "complete succeeded")
+    except ClientError as e:
+        check(
+            "a coverage that contradicts the upload scheme is refused",
+            e.response["Error"]["Code"] in ("InvalidArgument", "InvalidRequest"),
+            e.response["Error"]["Code"],
+        )
+    s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=mpu["UploadId"])
+
+    # A completion cannot supply an algorithm the upload never had. botocore's
+    # default client injects a CRC32 on every part, which fixes a scheme, so this
+    # needs a client that sends no part checksum at all.
+    key = "ck/type-no-scheme.bin"
+    quiet = client(request_checksum_calculation="when_required")
+    mpu = quiet.create_multipart_upload(Bucket=bucket, Key=key)
+    one = quiet.upload_part(Bucket=bucket, Key=key, PartNumber=1, UploadId=mpu["UploadId"], Body=b"plain body")
+    check("a part with no declared checksum reports none", "ChecksumCRC32" not in one, one.get("ChecksumCRC32"))
+    try:
+        quiet.complete_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            UploadId=mpu["UploadId"],
+            MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": one["ETag"]}]},
+            ChecksumType="FULL_OBJECT",
+        )
+        check("a coverage without an algorithm is refused", False, "complete succeeded")
+    except ClientError as e:
+        check(
+            "a coverage without an algorithm is refused",
+            e.response["Error"]["Code"] in ("InvalidArgument", "InvalidRequest"),
+            e.response["Error"]["Code"],
+        )
+    quiet.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=mpu["UploadId"])
 
     # A completion that declares the wrong whole-object checksum must be
     # rejected with BadDigest and must publish nothing.

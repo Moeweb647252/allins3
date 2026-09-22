@@ -1191,9 +1191,15 @@ impl S3 for S3Handler {
         req: S3Request<s3s::dto::UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
         let scope = self.scope(&req)?;
+        let trailer = request_trailer_checksum(&req, &scope.request_id)?;
         let input = req.input;
         let key = parse_key(&input.key, &scope.request_id)?;
         let part_number = part_number(&input.part_number, &scope.request_id)?;
+        let algorithm = input
+            .checksum_algorithm
+            .as_ref()
+            .map(|value| checksum_algorithm_from(value.as_str(), &scope.request_id))
+            .transpose()?;
         let declared = declared_checksum_header(
             &part_checksum_fields(
                 input.checksum_crc32.as_deref(),
@@ -1221,7 +1227,11 @@ impl S3 for S3Handler {
                 &key,
                 &input.upload_id,
                 part_number,
-                declared,
+                crate::service::multipart::PartChecksums {
+                    algorithm,
+                    declared,
+                    trailer,
+                },
                 body_stream(input.body),
             )
             .await
@@ -1553,21 +1563,22 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
     crate::integrity::decode_base64(value)
 }
 
-/// The checksum a put request declares it will send in a trailer.
+/// The checksum a request declares it will send in a trailer.
 ///
 /// `s3s` parses `x-amz-trailer` and exposes the trailing headers, but leaves
 /// their verification to the handler, so the service is given a reader and
-/// re-checks the digest once the body has been consumed (spec §6.3).
-fn request_trailer_checksum(
-    request: &S3Request<s3s::dto::PutObjectInput>,
+/// re-checks the digest once the body has been consumed (spec §6.3). A request
+/// that declares a trailer must deliver it: a body that never produces one (no
+/// trailing-headers handle, or no value) is reported as an absent declaration,
+/// not skipped.
+fn request_trailer_checksum<T>(
+    request: &S3Request<T>,
     request_id: &str,
 ) -> S3Result<Option<crate::service::TrailerChecksum>> {
-    let Some(handle) = request.trailing_headers.clone() else {
-        return Ok(None);
-    };
     let Some(name) = declared_trailer_checksum(&request.headers) else {
         return Ok(None);
     };
+    let handle = request.trailing_headers.clone();
     let Some(algorithm) = checksum_algorithm_wire_name(&name) else {
         return Err(map_error(
             ServiceError::NotImplemented(format!("unsupported checksum trailer `{name}`")),
@@ -1586,14 +1597,12 @@ fn request_trailer_checksum(
     Ok(Some(crate::service::TrailerChecksum::new(
         algorithm,
         move || {
-            handle
-                .read(|headers| {
-                    headers
-                        .get(&header)
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_string)
-                })
-                .flatten()
+            handle.as_ref()?.read(|headers| {
+                headers
+                    .get(&header)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            })?
         },
     )))
 }
@@ -1725,30 +1734,31 @@ fn complete_checksum(
         ],
         request_id,
     )?;
-    let (raw_algorithm, raw_value) = match found {
-        Some(found) => found,
-        None => {
-            if input.checksum_type.is_some() {
-                return Err(map_error(
-                    ServiceError::InvalidArgument(
-                        "a checksum type requires a declared checksum value".into(),
-                    ),
-                    request_id,
-                ));
-            }
-            return Ok(None);
-        }
-    };
-    let (value, part_count) = split_part_count(raw_value);
-    let (algorithm, value) = decode_checksum(raw_algorithm, value, request_id)?;
     let checksum_type = input
         .checksum_type
         .as_ref()
         .map(|value| checksum_type_from(value.as_str(), request_id))
         .transpose()?;
+    // A request may declare only the coverage; that constrains the checksum the
+    // service must produce without naming a value to compare against.
+    let (raw_algorithm, raw_value) = match found {
+        Some(found) => found,
+        None => {
+            return Ok(
+                checksum_type.map(|checksum_type| DeclaredCompletionChecksum {
+                    algorithm: None,
+                    value: None,
+                    checksum_type: Some(checksum_type),
+                    part_count: None,
+                }),
+            );
+        }
+    };
+    let (value, part_count) = split_part_count(raw_value);
+    let (algorithm, value) = decode_checksum(raw_algorithm, value, request_id)?;
     Ok(Some(DeclaredCompletionChecksum {
-        algorithm,
-        value,
+        algorithm: Some(algorithm),
+        value: Some(value),
         checksum_type,
         part_count,
     }))

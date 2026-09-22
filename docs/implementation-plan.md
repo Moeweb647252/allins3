@@ -3,9 +3,9 @@
 状态：P0–P5 已实现；剩余开放项只有 P5-05 的模糊测试，以及全部 P6 生产准入。更新日期：2026-09-22。
 
 > 进展：服务器可运行（`cargo run --features testing -- examples/dev-config.toml`）。三条真实客户端证据链：
-> ① boto3/botocore **1.42.97** 端到端 **63/63** 项检查（`scripts/e2e_boto3.py`），覆盖 PUT/HEAD/GET/条件/Range/LIST 分页/COPY/批量删除/multipart（含 transfer manager 11 MiB → 3 part 与组合 ETag 独立复算）/UploadPartCopy/abort/预签名 URL 与签名拒绝，以及 multipart 的 FULL_OBJECT、COMPOSITE checksum（用 Python 标库独立复算）与错误 checksum 拒绝；
+> ① boto3/botocore **1.42.97** 端到端 **67/67** 项检查（`scripts/e2e_boto3.py`），覆盖 PUT/HEAD/GET/条件/Range/LIST 分页/COPY/批量删除/multipart（含 transfer manager 11 MiB → 3 part 与组合 ETag 独立复算）/UploadPartCopy/abort/预签名 URL 与签名拒绝，以及 multipart 的 FULL_OBJECT、COMPOSITE checksum（用 Python 标库独立复算）与错误 checksum 拒绝；
 > ② AWS CLI **1.44.87**（`pip install awscli`）**29/29** 项检查（`scripts/e2e_cli.sh`），含 `aws s3api` 与 `aws s3 cp/sync/ls/rm/presign` 高层路径；
-> ③ 手工构造的 `aws-chunked` + checksum trailer 请求 **8/8** 项检查（`scripts/e2e_streaming_trailer.py`），因为 CLI 与 botocore 1.42 对 HTTP endpoint 一律把 checksum 放入请求头，不会发出 trailer 形式。
+> ③ 手工构造的 `aws-chunked` + checksum trailer 请求 **21/21** 项检查（`scripts/e2e_streaming_trailer.py`），因为 CLI 与 botocore 1.42 对 HTTP endpoint 一律把 checksum 放入请求头，不会发出 trailer 形式。
 >
 > 资源证据：计数 sink + 生成流基准在 100 MiB / 1 GiB / 10 GiB 下增量峰值 RSS 均为 **0 MiB**（预算 32 MiB，`bench/resource-budget.toml`）。
 
@@ -102,8 +102,8 @@ P1 模型稳定后，协议适配测试向量与 P2 可独立推进；不应在�
 - [x] P3-02 实现 SigV4 header、presigned query、凭据查找和默认拒绝的权限规则。→ 真实 SDK 验证：header 签名、预签名 GET、预签名过期、签名篡改、错误 secret/未知 access key 全部符合预期。
 - [x] P3-03 完成基础操作矩阵：bucket 查询、对象读写删除、批量删除、ListObjectsV2、CopyObject。→ `scripts/e2e_boto3.py`。
 - [x] P3-04 覆盖 URI 编码、特殊 key、metadata、条件读、Range、错误响应、HEAD 无响应体等边界。→ 端到端覆盖 `a//b + c` 这类 key、`304`、`412`、`416`、`bytes=a-b`/`bytes=-n`；条件与 Range 的执行顺序（条件失败不打开数据流、条件通过才判 `416`）由 `head_object`/`get_object` 的单一流程保证，并由服务测试覆盖。
-- [x] P3-05 实现普通 payload 的校验，且任何校验失败都不发布。→ `Content-MD5`、声明 checksum、长度不符都返回 `400 BadDigest` 且不产生对象；`aws-chunked` + checksum trailer 的运行时校验已补齐：`s3s` 只解码 trailer，值必须由服务层核对，因此 `PutParams.trailer_checksum` 在 body 消费完后读取 trailer 值并与流式摘要比对（声明未送达也视为不匹配）。→ `tests/service_limits.rs::a_trailer_declared_checksum_is_verified_after_the_body`、`scripts/e2e_streaming_trailer.py`。
-- [x] P3-06 运行固定版本客户端基础用例；记录版本与默认配置。→ 两个固定版本客户端都跑通并记录了版本与默认配置：boto3/botocore **1.42.97**（`scripts/e2e_boto3.py` 63/63）与 AWS CLI **1.44.87**（`pip install awscli`，`scripts/e2e_cli.sh` 29/29，`s3.signature_version=s3v4`）。注：`aws s3 presign` 在 CLI v1 默认 SigV2，服务器按 ADR-0007 拒绝，脚本显式固定 s3v4；未编写 AWS SDK for Rust 客户端用例（不在本项交付物内）。
+- [x] P3-05 实现普通 payload 的校验，且任何校验失败都不发布。→ `Content-MD5`、声明 checksum、长度不符都返回 `400 BadDigest` 且不产生对象；`aws-chunked` + checksum trailer 的运行时校验已补齐：`s3s` 只解码 trailer，值必须由服务层核对，因此 `PutParams.trailer_checksum` 在 body 消费完后读取 trailer 值并与流式摘要比对（声明未送达也视为不匹配）；`UploadPart` 走同一规则，且 part 声明的算法若与 upload scheme 不同，在读 body 之前即拒绝。→ `tests/service_limits.rs::a_trailer_declared_checksum_is_verified_after_the_body`、`tests/service_multipart.rs::a_part_trailer_checksum_is_verified_after_the_body`、`scripts/e2e_streaming_trailer.py`（21/21）。
+- [x] P3-06 运行固定版本客户端基础用例；记录版本与默认配置。→ 两个固定版本客户端都跑通并记录了版本与默认配置：boto3/botocore **1.42.97**（`scripts/e2e_boto3.py` 67/67）与 AWS CLI **1.44.87**（`pip install awscli`，`scripts/e2e_cli.sh` 29/29，`s3.signature_version=s3v4`）。注：`aws s3 presign` 在 CLI v1 默认 SigV2，服务器按 ADR-0007 拒绝，脚本显式固定 s3v4；未编写 AWS SDK for Rust 客户端用例（不在本项交付物内）。
 - [x] P3-07 virtual-hosted-style 未实现，因此配置成 `addressing = "virtual"` 在**校验阶段明确失败**（fail closed，不会静默按 path-style 提供服务），兼容矩阵标为未支持。→ `rejects_virtual_hosted_addressing`。
 
 产物：可用 CLI/SDK 操作测试 namespace 的服务器、基础兼容报告、可执行开发配置。
@@ -119,7 +119,7 @@ P1 模型稳定后，协议适配测试向量与 P2 可独立推进；不应在�
 - [x] P4-01（有意偏离并记录）：`MultipartNamespace` 已作为 driver 扩展契约存在（`src/driver/extensions.rs`），但 `MultipartStore` / `StagingStore` **没有**被引入为 trait。理由：暂存与 multipart session 的状态必须与「单次发布」「竞争仲裁」「完成记录」在同一个临界区内推进，把状态放到 driver 侧会把这些不变量拆到两个进程内；当前由服务层协调器（`src/service/multipart.rs`，`MultipartState` + `std::sync::Mutex`）独占，并通过 `ObjectService` 的公开方法暴露。真实后端的持久化暂存由 P6 的 driver 在其 `StagedWrite`/`MultipartNamespace` 内实现，协调器仍然只通过 driver 接口发布。
 - [x] P4-02 实现创建、上传、列举 part/upload、完成、终止和 UploadPartCopy。→ 真实 SDK 覆盖全部六个操作。
 - [x] P4-03 实现 CAS 状态机（`claims` 单次完成声明）、上传归属检查（bucket/key/upload id 绑定）、part 原子替换、固定清单与流式合并。→ `tests/service_multipart.rs`。
-- [x] P4-04 part 顺序/大小限制与结果 metadata 已实现（升序、非末 part 至少 5 MiB、part 数上限 10000、完成时发布 `ETag = md5(parts)-N`）；**FULL_OBJECT / COMPOSITE checksum 已实现**：创建时固定 scheme（未指定则按算法族取默认覆盖），每个 part 按其算法计算并存储摘要，完成时 FULL_OBJECT 对装配后字节取摘要、COMPOSITE 对有序 part 原始摘要取摘要（带 `-<partcount>` 线格式），客户端声明的完成 checksum（含 part 清单里的每 part checksum）不匹配一律 `400 BadDigest` 且不发布，非法组合（`CRC64NVME + COMPOSITE`、SHA 族 + FULL_OBJECT）拒绝。→ `src/service/multipart.rs`、`src/protocol/s3/mod.rs`、`tests/service_multipart.rs`（5 个用例）、`scripts/e2e_boto3.py`（FULL_OBJECT 与 COMPOSITE 各用 Python 标库独立复算）。
+- [x] P4-04 part 顺序/大小限制与结果 metadata 已实现（升序、非末 part 至少 5 MiB、part 数上限 10000、完成时发布 `ETag = md5(parts)-N`）；**FULL_OBJECT / COMPOSITE checksum 已实现**：创建时固定 scheme（未指定则按算法族取默认覆盖），每个 part 按其算法计算并存储摘要，完成时 FULL_OBJECT 对装配后字节取摘要、COMPOSITE 对有序 part 原始摘要取摘要（带 `-<partcount>` 线格式），客户端声明的完成 checksum（含 part 清单里的每 part checksum）不匹配一律 `400 BadDigest` 且不发布，非法组合（`CRC64NVME + COMPOSITE`、SHA 族 + FULL_OBJECT）拒绝。→ `src/service/multipart.rs`、`src/protocol/s3/mod.rs`、`tests/service_multipart.rs`（6 个用例）、`scripts/e2e_boto3.py`（FULL_OBJECT 与 COMPOSITE 各用 Python 标库独立复算）。另：完成时只声明 `x-amz-checksum-type`（不带值）是合法请求，按 upload scheme 计算并返回；与 scheme 矛盾（或在无 scheme 的 upload 上单独声明）则 `400 InvalidRequest`，且被拒的完成不消耗 upload。
 - [x] P4-05 实现完成记录、四态恢复查询和安全的租约清理器；只有 NotCommittedFinal 才可在 CAS 获得恢复权后评估重试，Committed 不再发布（回执丢失时从已发布 revision 还原响应），InFlight/Unknown 不得重放。→ `CompletionRecord`、`completion_state(s)`、`sweep_expired_uploads`、`tests/service_multipart.rs` 的 lost-ack / fenced / unknown 三个用例。
 - [x] P4-06 覆盖并发 Complete/Complete 与 Complete/Abort 仲裁、丢失完成回执、重试清单变化（manifests 变更后重试）、过期暂存清理与「未知结果不被清扫/不被重放」；注入“原提交仍在途但查无记录”以及“原尝试已隔离、重试成功后旧提交迟到”两种时序，验证不重复提交且旧尝试不能覆盖新对象。
 - [x] P4-07 SDK transfer manager 的 multipart 路径**已验证**（11 MiB → 3 part，ETag 用独立计算的组合值比对，`ListParts`/`UploadPartCopy`/`abort` 均通过）；高层 **CLI** 路径已验证（`scripts/e2e_cli.sh`：`aws s3 cp` 11 MiB 自动分片且 ETag 带 part 数、`aws s3 sync`/`ls`/`rm` 与往返字节一致）。

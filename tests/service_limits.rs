@@ -13,6 +13,7 @@ use std::task::{Context as TaskContext, Poll};
 use allins3::domain::{ChecksumAlgorithm, DriverContext, DriverError, ObjectKey};
 use allins3::driver::{DriverFactory, Profile};
 use allins3::integrity::{base64, compute_checksum};
+use allins3::service::multipart::PartChecksums;
 use allins3::service::{ObjectService, PutParams, ReadConditions, ServiceError, TrailerChecksum};
 use allins3::testing::fault::{FaultDriverFactory, FaultPlan};
 use allins3::testing::fixture::{self, BucketSpec};
@@ -354,13 +355,29 @@ async fn staging_quota_backpressure_keeps_earlier_parts() {
 
     let part = generated_stream(3 * 1024 * 1024, 256 * 1024);
     service
-        .upload_part(&ctx(), BUCKET, &key, &upload_id, 1, None, part)
+        .upload_part(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            1,
+            PartChecksums::default(),
+            part,
+        )
         .await
         .expect("first part fits the quota");
 
     let part = generated_stream(3 * 1024 * 1024, 256 * 1024);
     let err = service
-        .upload_part(&ctx(), BUCKET, &key, &upload_id, 2, None, part)
+        .upload_part(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            2,
+            PartChecksums::default(),
+            part,
+        )
         .await
         .expect_err("the staging quota must apply back-pressure");
     assert_eq!(err, ServiceError::SlowDown);

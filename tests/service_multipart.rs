@@ -11,15 +11,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use allins3::domain::{
-    ChecksumAlgorithm, ChecksumType, CommitState, ContentProperties, DriverContext, EntityTag,
-    ObjectKey, Preconditions, UserMetadata,
+    Checksum, ChecksumAlgorithm, ChecksumType, CommitState, ContentProperties, DriverContext,
+    EntityTag, ObjectKey, Preconditions, UserMetadata,
 };
 use allins3::driver::{DriverFactory, Profile};
-use allins3::integrity::compute_checksum;
+use allins3::integrity::{base64, compute_checksum};
 use allins3::service::multipart::{
-    DeclaredCompletionChecksum, MIN_PART_SIZE, MultipartChecksum, PartSummary,
+    DeclaredCompletionChecksum, MIN_PART_SIZE, MultipartChecksum, PartChecksums, PartSummary,
 };
-use allins3::service::{ObjectService, ReadConditions, ServiceError};
+use allins3::service::{ObjectService, ReadConditions, ServiceError, TrailerChecksum};
 use allins3::testing::fault::{FaultDriverFactory, FaultPlan};
 use allins3::testing::fixture::{self, BucketSpec};
 use allins3::testing::reference::ReferenceDriverFactory;
@@ -96,7 +96,32 @@ async fn upload_part_bytes(
             key,
             upload_id,
             part_number,
-            declared,
+            PartChecksums {
+                declared,
+                ..Default::default()
+            },
+            one_shot_stream(bytes::Bytes::from(data)),
+        )
+        .await
+}
+
+/// Uploads a part for an arbitrary set of declared checksums.
+async fn upload_part_checksums(
+    service: &ObjectService,
+    key: &ObjectKey,
+    upload_id: &str,
+    part_number: u16,
+    checksums: PartChecksums,
+    data: Vec<u8>,
+) -> Result<PartSummary, ServiceError> {
+    service
+        .upload_part(
+            &ctx(),
+            BUCKET,
+            key,
+            upload_id,
+            part_number,
+            checksums,
             one_shot_stream(bytes::Bytes::from(data)),
         )
         .await
@@ -623,8 +648,8 @@ async fn multipart_full_object_checksum_covers_the_assembled_object() {
 
     let manifest = [(1u16, Some(one.etag)), (2u16, Some(two.etag))];
     let declared = DeclaredCompletionChecksum {
-        algorithm: ChecksumAlgorithm::Crc32,
-        value: expected.clone(),
+        algorithm: Some(ChecksumAlgorithm::Crc32),
+        value: Some(expected.clone()),
         checksum_type: Some(ChecksumType::FullObject),
         part_count: None,
     };
@@ -690,8 +715,8 @@ async fn multipart_composite_checksum_digests_the_ordered_part_digests() {
 
     let manifest = [(1u16, Some(one.etag)), (2u16, Some(two.etag))];
     let declared = DeclaredCompletionChecksum {
-        algorithm: ChecksumAlgorithm::Sha256,
-        value: expected.clone(),
+        algorithm: Some(ChecksumAlgorithm::Sha256),
+        value: Some(expected.clone()),
         checksum_type: Some(ChecksumType::Composite),
         part_count: Some(2),
     };
@@ -734,8 +759,8 @@ async fn a_mismatched_completion_checksum_never_publishes() {
     let manifest = [(1u16, Some(etag))];
 
     let wrong = DeclaredCompletionChecksum {
-        algorithm: ChecksumAlgorithm::Crc32,
-        value: vec![0, 0, 0, 0],
+        algorithm: Some(ChecksumAlgorithm::Crc32),
+        value: Some(vec![0, 0, 0, 0]),
         checksum_type: None,
         part_count: None,
     };
@@ -765,8 +790,8 @@ async fn a_mismatched_completion_checksum_never_publishes() {
 
     // The upload survives the rejection, so the client can retry correctly.
     let correct = DeclaredCompletionChecksum {
-        algorithm: ChecksumAlgorithm::Crc32,
-        value: digest(ChecksumAlgorithm::Crc32, b"checked body"),
+        algorithm: Some(ChecksumAlgorithm::Crc32),
+        value: Some(digest(ChecksumAlgorithm::Crc32, b"checked body")),
         checksum_type: Some(ChecksumType::FullObject),
         part_count: None,
     };
@@ -865,6 +890,214 @@ async fn part_checksums_are_verified_and_reported() {
         Some(expected.into()),
         "ListParts reports the stored part checksum"
     );
+}
+
+#[tokio::test]
+async fn a_part_trailer_checksum_is_verified_after_the_body() {
+    let service = service_with(Arc::new(ReferenceDriverFactory::new("reference"))).await;
+    let key = object_key("checksum/part-trailer.bin");
+    let upload_id = start_upload_with_checksum(
+        &service,
+        &key,
+        ChecksumAlgorithm::Crc32,
+        ChecksumType::FullObject,
+    )
+    .await;
+    let body = b"part with a trailer".to_vec();
+    let expected = digest(ChecksumAlgorithm::Crc32, &body);
+
+    // A trailer reader for one algorithm, as the protocol layer builds it.
+    let trailer = |algorithm: ChecksumAlgorithm, value: Option<Vec<u8>>| {
+        TrailerChecksum::new(algorithm, move || value.clone().map(|bytes| base64(&bytes)))
+    };
+    let stage = |checksums: PartChecksums, body: &[u8]| {
+        upload_part_checksums(&service, &key, &upload_id, 1, checksums, body.to_vec())
+    };
+
+    // A matching trailer value is verified and stored with the part.
+    let summary = stage(
+        PartChecksums {
+            trailer: Some(trailer(ChecksumAlgorithm::Crc32, Some(expected.clone()))),
+            ..Default::default()
+        },
+        &body,
+    )
+    .await
+    .expect("a matching trailer stages the part");
+    assert_eq!(
+        summary.checksum.as_ref().map(|c| c.value.clone()),
+        Some(expected.clone().into())
+    );
+
+    // A trailer that disagrees with the bytes is rejected and replaces nothing.
+    let err = stage(
+        PartChecksums {
+            trailer: Some(trailer(ChecksumAlgorithm::Crc32, Some(vec![0, 0, 0, 0]))),
+            ..Default::default()
+        },
+        &body,
+    )
+    .await
+    .expect_err("a mismatched trailer must fail");
+    assert!(matches!(err, ServiceError::BadDigest(_)), "{err:?}");
+
+    // A declared trailer that never arrives is a mismatch too.
+    let err = stage(
+        PartChecksums {
+            trailer: Some(trailer(ChecksumAlgorithm::Crc32, None)),
+            ..Default::default()
+        },
+        &body,
+    )
+    .await
+    .expect_err("an absent trailer must fail");
+    assert!(matches!(err, ServiceError::BadDigest(_)), "{err:?}");
+
+    // A trailer algorithm that disagrees with the upload's scheme is refused
+    // before any bytes are read.
+    let err = stage(
+        PartChecksums {
+            trailer: Some(trailer(
+                ChecksumAlgorithm::Sha256,
+                Some(digest(ChecksumAlgorithm::Sha256, &body)),
+            )),
+            ..Default::default()
+        },
+        &body,
+    )
+    .await
+    .expect_err("a mismatched trailer algorithm must fail");
+    assert!(matches!(err, ServiceError::InvalidRequest(_)), "{err:?}");
+
+    // Only the verified part is staged; the rejected attempts added nothing.
+    let page = service
+        .list_parts(BUCKET, &key, &upload_id, None, 100)
+        .expect("list parts");
+    assert_eq!(page.parts.len(), 1, "{page:?}");
+    assert_eq!(
+        page.parts[0].checksum.as_ref().map(|c| c.value.clone()),
+        Some(expected.into())
+    );
+}
+
+#[tokio::test]
+async fn a_completion_that_declares_only_a_type_is_validated_against_the_scheme() {
+    let service = service_with(Arc::new(ReferenceDriverFactory::new("reference"))).await;
+
+    // A coverage-only declaration is legal: it constrains the checksum the
+    // server must produce without naming a value to compare against.
+    let key = object_key("checksum/type-only.bin");
+    let upload_id = start_upload_with_checksum(
+        &service,
+        &key,
+        ChecksumAlgorithm::Sha256,
+        ChecksumType::Composite,
+    )
+    .await;
+    let etag = upload_part(&service, &key, &upload_id, 1, b"type only").await;
+    let manifest = [(1u16, Some(etag))];
+    let expected = digest(
+        ChecksumAlgorithm::Sha256,
+        &digest(ChecksumAlgorithm::Sha256, b"type only"),
+    );
+    let meta = service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            Some(DeclaredCompletionChecksum {
+                algorithm: None,
+                value: None,
+                checksum_type: Some(ChecksumType::Composite),
+                part_count: None,
+            }),
+            Preconditions::none(),
+        )
+        .await
+        .expect("a coverage-only declaration publishes");
+    let stored = meta.checksums.first().expect("a checksum is stored");
+    assert_eq!(stored.value().as_ref(), expected.as_slice());
+    assert_eq!(stored.checksum_type(), ChecksumType::Composite);
+
+    // A coverage that contradicts the upload's scheme is refused.
+    let key = object_key("checksum/type-conflict.bin");
+    let upload_id = start_upload_with_checksum(
+        &service,
+        &key,
+        ChecksumAlgorithm::Crc32,
+        ChecksumType::FullObject,
+    )
+    .await;
+    let etag = upload_part(&service, &key, &upload_id, 1, b"conflict").await;
+    let manifest = [(1u16, Some(etag))];
+    let err = service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            Some(DeclaredCompletionChecksum {
+                algorithm: None,
+                value: None,
+                checksum_type: Some(ChecksumType::Composite),
+                part_count: None,
+            }),
+            Preconditions::none(),
+        )
+        .await
+        .expect_err("a conflicting coverage must fail");
+    assert!(matches!(err, ServiceError::InvalidRequest(_)), "{err:?}");
+
+    // The refusal must not consume the upload: a corrected retry still works.
+    let meta = service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            Some(DeclaredCompletionChecksum {
+                algorithm: None,
+                value: None,
+                checksum_type: Some(ChecksumType::FullObject),
+                part_count: None,
+            }),
+            Preconditions::none(),
+        )
+        .await
+        .expect("a corrected declaration publishes");
+    assert_eq!(
+        meta.checksums.first().map(Checksum::checksum_type),
+        Some(ChecksumType::FullObject)
+    );
+
+    // An upload created without a scheme needs an algorithm; a coverage alone
+    // cannot supply one.
+    let key = object_key("checksum/type-no-scheme.bin");
+    let upload_id = start_upload(&service, &key).await;
+    let etag = upload_part(&service, &key, &upload_id, 1, b"no scheme").await;
+    let manifest = [(1u16, Some(etag))];
+    let err = service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            Some(DeclaredCompletionChecksum {
+                algorithm: None,
+                value: None,
+                checksum_type: Some(ChecksumType::FullObject),
+                part_count: None,
+            }),
+            Preconditions::none(),
+        )
+        .await
+        .expect_err("a coverage without a scheme must fail");
+    assert!(matches!(err, ServiceError::InvalidRequest(_)), "{err:?}");
 }
 
 #[tokio::test]

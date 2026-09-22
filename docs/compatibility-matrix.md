@@ -42,7 +42,7 @@
 | 错误 secret / 未知 access key | 已验证（SDK） | 已知 access key + 错误 secret → `403 SignatureDoesNotMatch`；未知 key → `403 InvalidAccessKeyId` |
 | 签名被篡改（预签名 `X-Amz-Signature` 或 key 被改） | 已验证（SDK） | `400/403`，不会命中其他对象 |
 | SigV2 / SigV4a | 未支持 | `enable_sig_v2 = false`；无 SigV4a（`s3s` 候选行为见 ADR-0007） |
-| `aws-chunked`（signed/unsigned）与 checksum trailer | 已验证（手工请求） | `s3s` 只解码 trailer，值必须由服务层核对：声明值与流式摘要不符（或声明未送达）返回 `400 BadDigest` 且不发布。CLI 与 botocore 1.42 对 HTTP endpoint 一律把 checksum 放入请求头（debug 显示 `'in': 'header'`，非可寻址 body 直接报 `io.UnsupportedOperation: seek`），因此该路径只能用 `scripts/e2e_streaming_trailer.py` 手工构造的 `STREAMING-UNSIGNED-PAYLOAD-TRAILER` 请求验证（8/8） |
+| `aws-chunked`（signed/unsigned）与 checksum trailer | 已验证（手工请求） | `s3s` 只解码 trailer，值必须由服务层核对：声明值与流式摘要不符（或声明未送达）返回 `400 BadDigest` 且不发布；`PutObject` 与 `UploadPart` 两条入口语义一致（part 的算法必须与 upload scheme 相同，否则读 body 之前即 `400 InvalidRequest`）。声明了 `x-amz-trailer` 却没有分块框架、或分块结束却没有 trailer 的请求同样被拒。CLI 与 botocore 1.42 对 HTTP endpoint 一律把 checksum 放入请求头（debug 显示 `'in': 'header'`，非可寻址 body 直接报 `io.UnsupportedOperation: seek`），因此该路径只能用 `scripts/e2e_streaming_trailer.py` 手工构造的 `STREAMING-UNSIGNED-PAYLOAD-TRAILER` 请求验证（21/21） |
 
 ## 3. Checksum 支持范围
 
@@ -55,7 +55,8 @@
 | Multipart COMPOSITE（CRC32/CRC32C/SHA1/SHA256） | 已验证（SDK）：对有序 part 原始摘要取摘要，线格式 `base64(digest)-<partcount>`，与 Python 标库独立复算一致（`ck/composite.bin`） |
 | 每个 part 的 checksum（`UploadPart` / `ListParts` / part 清单） | 已验证（SDK）：返回、存储、校验一致；不匹配 `400 BadDigest` 且该 part 不入暂存 |
 | 完成时声明的整体 checksum 不匹配 | 已验证（SDK）：`400 BadDigest`，目标对象不出现；修正后重试可发布 |
-| checksum trailer（`x-amz-trailer`） | 已验证（手工请求）：值与流式摘要不符返回 `400 BadDigest` 且不发布 |
+| checksum trailer（`x-amz-trailer`） | 已验证（手工请求）：值与流式摘要不符、声明未送达、或算法与 upload scheme 不符都返回 `400` 且不发布（`PutObject` 与 `UploadPart` 均已验证） |
+| 完成时只声明 checksum 类型（`x-amz-checksum-type`） | 已验证（SDK）：该声明是独立的可选参数，与 upload scheme 一致时按 scheme 计算并返回；矛盾（如 FULL_OBJECT 的 upload 声明 COMPOSITE）`400 InvalidRequest`，且被拒的完成不会消耗 upload——修正后重试可发布 |
 | 非法组合（如 `CRC64NVME + COMPOSITE`、SHA 族 + FULL_OBJECT） | 已验证（SDK）：`400 InvalidArgument`，创建 multipart 时即拒绝 |
 
 依据：[完整性保护](https://docs.aws.amazon.com/sdkref/latest/guide/feature-dataintegrity.html)。
@@ -101,8 +102,8 @@ cd spikes/protocol-adapter && cargo test
 # 真实 SDK 端到端（失败会在第一条断言处退出）
 cargo build --features testing
 ALLINS3_DEV_SECRET=devsecret ./target/debug/allins3 examples/dev-config.toml &   # 监听 127.0.0.1:9000
-ALLINS3_SECRET_KEY=devsecret .venv/bin/python scripts/e2e_boto3.py             # 63/63 checks passed
-ALLINS3_SECRET_KEY=devsecret .venv/bin/python scripts/e2e_streaming_trailer.py # 8/8 checks passed
+ALLINS3_SECRET_KEY=devsecret .venv/bin/python scripts/e2e_boto3.py             # 67/67 checks passed
+ALLINS3_SECRET_KEY=devsecret .venv/bin/python scripts/e2e_streaming_trailer.py # 21/21 checks passed
 bash scripts/e2e_cli.sh                                                        # 29/29 checks passed（自行启停服务器）
 ALLINS3_BENCH_FULL=1 cargo test --release --all-features --test resource_budget -- --nocapture
 curl -sS http://127.0.0.1:9000/healthz   # 200 ok

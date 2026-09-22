@@ -6,8 +6,9 @@
 //! the published metadata is retained.
 //!
 //! Because no bytes are kept, `read` refuses rather than serving an empty body
-//! that would look like a successful read. `stat` and `list` are real, so a
-//! caller can still inspect what a write published.
+//! that would look like a successful read. `stat`, `list` and `delete` are the
+//! reference driver's in-memory ones, so metadata, ordering and conditional
+//! rules behave identically to a real namespace.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,14 +20,15 @@ use bytes::Bytes;
 
 use crate::domain::{
     BeginWrite, CommitAttributes, DeleteRequest, DeleteResult, DriverContext, DriverError,
-    DriverErrorKind, DriverInstanceId, ListCursor, ListPage, ListRequest, NamespaceId, ObjectKey,
-    ObjectMetadata, ObjectRevision,
+    DriverInstanceId, ListPage, ListRequest, NamespaceId, ObjectKey, ObjectMetadata,
 };
 use crate::driver::{
     ConditionalSupport, Consistency, DriverDescriptor, DriverFactory, DriverHealth, DriverKind,
     DriverLimits, NamespaceCapabilities, NamespaceHandle, Persistence, RangeSupport, ReadNamespace,
     ReadRequest, ReadResult, SecretResolver, StagedWrite, StorageDriver, WriteNamespace,
 };
+
+use super::reference::{NamespaceState, StoredObject, check_ctx, delete_object, page_for};
 
 /// The counters a counting sink accumulates across writes.
 #[derive(Debug, Default)]
@@ -56,19 +58,6 @@ impl Sink {
     /// The number of staged writes that were aborted.
     pub fn aborts(&self) -> u64 {
         self.aborts.load(Ordering::SeqCst)
-    }
-}
-
-#[derive(Default)]
-struct SinkState {
-    objects: BTreeMap<String, ObjectMetadata>,
-    next_revision: u64,
-}
-
-impl SinkState {
-    fn next_revision(&mut self) -> ObjectRevision {
-        self.next_revision += 1;
-        ObjectRevision::new(format!("sink-{}", self.next_revision))
     }
 }
 
@@ -133,11 +122,11 @@ impl DriverFactory for CountingDriverFactory {
 pub struct CountingDriver {
     descriptor: DriverDescriptor,
     sink: Arc<Sink>,
-    namespaces: Mutex<BTreeMap<NamespaceId, Arc<Mutex<SinkState>>>>,
+    namespaces: Mutex<BTreeMap<NamespaceId, Arc<Mutex<NamespaceState>>>>,
 }
 
 impl CountingDriver {
-    fn state(&self, namespace: &NamespaceId) -> Arc<Mutex<SinkState>> {
+    fn state(&self, namespace: &NamespaceId) -> Arc<Mutex<NamespaceState>> {
         let mut map = self.namespaces.lock().expect("namespace map poisoned");
         map.entry(namespace.clone()).or_default().clone()
     }
@@ -166,8 +155,6 @@ impl StorageDriver for CountingDriver {
         let handle = NamespaceHandle {
             capabilities: NamespaceCapabilities {
                 read: true,
-                // Listing is metadata-only here, but it is real: callers can
-                // still page over what the sink measured.
                 list: true,
                 write: true,
                 multipart: false,
@@ -206,24 +193,8 @@ impl StorageDriver for CountingDriver {
     }
 }
 
-fn poisoned<T>(_e: std::sync::PoisonError<T>) -> DriverError {
-    DriverError::internal("sink state lock poisoned")
-}
-
-fn check_ctx(ctx: &DriverContext) -> Result<(), DriverError> {
-    if ctx.is_done() {
-        let kind = if ctx.is_cancelled() {
-            DriverErrorKind::Cancelled
-        } else {
-            DriverErrorKind::TemporarilyUnavailable
-        };
-        return Err(DriverError::new(kind, "request cancelled or past deadline"));
-    }
-    Ok(())
-}
-
 struct SinkRead {
-    state: Arc<Mutex<SinkState>>,
+    state: Arc<Mutex<NamespaceState>>,
 }
 
 #[async_trait]
@@ -234,11 +205,11 @@ impl ReadNamespace for SinkRead {
         key: &ObjectKey,
     ) -> Result<ObjectMetadata, DriverError> {
         check_ctx(ctx)?;
-        let state = self.state.lock().map_err(poisoned)?;
+        let state = self.state.lock().map_err(super::reference::poisoned)?;
         state
             .objects
             .get(key.as_str())
-            .cloned()
+            .map(|stored| stored.metadata.clone())
             .ok_or_else(|| DriverError::not_found(format!("no object at {}", key.as_str())))
     }
 
@@ -256,56 +227,13 @@ impl ReadNamespace for SinkRead {
 
     async fn list(&self, ctx: &DriverContext, req: ListRequest) -> Result<ListPage, DriverError> {
         check_ctx(ctx)?;
-        let state = self.state.lock().map_err(poisoned)?;
-
-        let prefix = req.prefix().unwrap_or("");
-        let delimiter = req.delimiter();
-        let mut objects = Vec::new();
-        let mut common_prefixes = Vec::new();
-        let mut last_prefix: Option<String> = None;
-
-        for (key, metadata) in state.objects.iter() {
-            let Some(remainder) = key.strip_prefix(prefix) else {
-                continue;
-            };
-            match delimiter.and_then(|d| remainder.find(d)) {
-                Some(idx) => {
-                    let folded = format!("{prefix}{}", &remainder[..=idx]);
-                    if last_prefix.as_deref() != Some(folded.as_str()) {
-                        common_prefixes.push(folded.clone());
-                        last_prefix = Some(folded);
-                    }
-                }
-                None => {
-                    last_prefix = None;
-                    let after_cursor = req.cursor().is_none_or(|c| key.as_str() > c.as_str());
-                    let after_marker = req.start_after().is_none_or(|m| key.as_str() > m.as_str());
-                    if after_cursor && after_marker {
-                        objects.push(metadata.clone());
-                    }
-                }
-            }
-        }
-
-        let limit = req.limit().get() as usize;
-        let truncated = objects.len() > limit;
-        objects.truncate(limit);
-        common_prefixes.truncate(limit);
-        let next_cursor = truncated
-            .then(|| objects.last().map(|m| ListCursor::new(m.key.to_string())))
-            .flatten();
-
-        Ok(ListPage {
-            objects,
-            common_prefixes,
-            next_cursor,
-            is_truncated: truncated,
-        })
+        let state = self.state.lock().map_err(super::reference::poisoned)?;
+        Ok(page_for(&state, &req))
     }
 }
 
 struct SinkWrite {
-    state: Arc<Mutex<SinkState>>,
+    state: Arc<Mutex<NamespaceState>>,
     sink: Arc<Sink>,
 }
 
@@ -330,33 +258,12 @@ impl WriteNamespace for SinkWrite {
         ctx: &DriverContext,
         req: DeleteRequest,
     ) -> Result<DeleteResult, DriverError> {
-        check_ctx(ctx)?;
-        let mut state = self.state.lock().map_err(poisoned)?;
-        let existing = state.objects.get(req.key.as_str()).cloned();
-
-        if let Some(tag) = &req.preconditions.if_match
-            && existing.as_ref().and_then(|m| m.etag.as_ref()) != Some(tag)
-        {
-            return Err(DriverError::precondition_failed(
-                "If-Match did not match the current object",
-            ));
-        }
-        if req.preconditions.if_none_match && existing.is_some() {
-            return Err(DriverError::precondition_failed(
-                "If-None-Match: * but the object exists",
-            ));
-        }
-
-        let removed = state.objects.remove(req.key.as_str());
-        Ok(DeleteResult {
-            deleted: removed.is_some(),
-            removed_revision: removed.map(|m| m.revision),
-        })
+        delete_object(&self.state, ctx, req).await
     }
 }
 
 struct SinkStaged {
-    state: Arc<Mutex<SinkState>>,
+    state: Arc<Mutex<NamespaceState>>,
     sink: Arc<Sink>,
     req: BeginWrite,
     received: u64,
@@ -398,11 +305,11 @@ impl StagedWrite for SinkStaged {
             ));
         }
 
-        let mut state = self.state.lock().map_err(poisoned)?;
+        let mut state = self.state.lock().map_err(super::reference::poisoned)?;
         let existing_etag = state
             .objects
             .get(self.req.key.as_str())
-            .and_then(|m| m.etag.clone());
+            .and_then(|stored| stored.metadata.etag.clone());
         if let Some(tag) = &self.req.preconditions.if_match
             && existing_etag.as_ref() != Some(tag)
         {
@@ -426,9 +333,14 @@ impl StagedWrite for SinkStaged {
             checksums: attrs.checksums,
             revision: state.next_revision(),
         };
-        state
-            .objects
-            .insert(self.req.key.as_str().to_string(), metadata.clone());
+        state.objects.insert(
+            self.req.key.as_str().to_string(),
+            StoredObject {
+                metadata: metadata.clone(),
+                // No bytes are kept; `read` refuses rather than serving this.
+                content: Bytes::new(),
+            },
+        );
         self.sink.commits.fetch_add(1, Ordering::SeqCst);
         Ok(metadata)
     }

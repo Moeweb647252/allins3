@@ -55,6 +55,6 @@ cd spikes/protocol-adapter && cargo test
 - 仅 path-style；`addressing = "virtual"` 在校验阶段明确失败（未实现）。
 - 不支持 Versioning、SSE、ACL、Object Lock、生命周期、通知、复制、网站托管、Select、SigV2/SigV4a；这些参数会明确报错而不是被忽略。
 - multipart 支持 FULL_OBJECT 与 COMPOSITE checksum（线格式 `base64(digest)-<partcount>`）；`ETag` 始终按规范发布 `md5(parts)-N`。
-- `aws-chunked` 请求体与 checksum trailer 已由运行中的服务器验证（含 trailer 值不匹配的拒绝）；CLI 与 botocore 1.42 对 HTTP endpoint 不发出 trailer 形式，因此该路径只有手工构造请求的证据。
-- 主要兼容证据：boto3/botocore 1.42.97（`scripts/e2e_boto3.py` 63/63）、AWS CLI 1.44.87（`scripts/e2e_cli.sh` 29/29）、手工 `aws-chunked` trailer 请求（`scripts/e2e_streaming_trailer.py` 8/8）、内存预算基准（`tests/resource_budget.rs`）。
+- `aws-chunked` 请求体与 checksum trailer 已由运行中的服务器验证（含 trailer 值不匹配、声明未送达、算法与 upload scheme 不符的拒绝，`PutObject` 与 `UploadPart` 两条入口）；CLI 与 botocore 1.42 对 HTTP endpoint 不发出 trailer 形式，因此该路径只有手工构造请求的证据。
+- 主要兼容证据：boto3/botocore 1.42.97（`scripts/e2e_boto3.py` 67/67）、AWS CLI 1.44.87（`scripts/e2e_cli.sh` 29/29）、手工 `aws-chunked` trailer 请求（`scripts/e2e_streaming_trailer.py` 21/21）、内存预算基准（`tests/resource_budget.rs`）。
 - 内置 driver 均为内存实现，重启数据丢失；生产准入见 [driver 接入指南](docs/driver-guide.md)。

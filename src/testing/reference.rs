@@ -237,11 +237,11 @@ impl ReadNamespace for RefRead {
     }
 }
 
-fn poisoned<T>(_e: std::sync::PoisonError<T>) -> DriverError {
+pub(crate) fn poisoned<T>(_e: std::sync::PoisonError<T>) -> DriverError {
     DriverError::internal("namespace state lock poisoned")
 }
 
-fn check_ctx(ctx: &DriverContext) -> Result<(), DriverError> {
+pub(crate) fn check_ctx(ctx: &DriverContext) -> Result<(), DriverError> {
     if ctx.is_done() {
         let kind = if ctx.is_cancelled() {
             DriverErrorKind::Cancelled
@@ -286,7 +286,7 @@ impl Entry {
 /// across pages. Under concurrent mutation the index may shift; the driver does
 /// not promise a global snapshot across pages (spec §4.3), and the service
 /// layer re-authenticates and rebinds the token on every page.
-fn page_for(state: &NamespaceState, req: &ListRequest) -> ListPage {
+pub(crate) fn page_for(state: &NamespaceState, req: &ListRequest) -> ListPage {
     let prefix = req.prefix().unwrap_or("");
     let delimiter = req.delimiter();
 
@@ -379,29 +379,41 @@ impl WriteNamespace for RefWrite {
         ctx: &DriverContext,
         req: DeleteRequest,
     ) -> Result<DeleteResult, DriverError> {
-        check_ctx(ctx)?;
-        let mut state = self.state.lock().map_err(poisoned)?;
-        let existing = state.objects.get(req.key.as_str()).cloned();
-
-        if let Some(tag) = &req.preconditions.if_match
-            && existing.as_ref().and_then(|o| o.metadata.etag.as_ref()) != Some(tag)
-        {
-            return Err(DriverError::precondition_failed(
-                "If-Match did not match the current object",
-            ));
-        }
-        if req.preconditions.if_none_match && existing.is_some() {
-            return Err(DriverError::precondition_failed(
-                "If-None-Match: * but the object exists",
-            ));
-        }
-
-        let removed = state.objects.remove(req.key.as_str());
-        Ok(DeleteResult {
-            deleted: removed.is_some(),
-            removed_revision: removed.map(|o| o.metadata.revision),
-        })
+        delete_object(&self.state, ctx, req).await
     }
+}
+
+/// Atomically deletes a key, honouring preconditions.
+///
+/// Shared by the in-memory test drivers, so the conditional-delete rules exist
+/// in one place.
+pub(crate) async fn delete_object(
+    state: &Mutex<NamespaceState>,
+    ctx: &DriverContext,
+    req: DeleteRequest,
+) -> Result<DeleteResult, DriverError> {
+    check_ctx(ctx)?;
+    let mut state = state.lock().map_err(poisoned)?;
+    let existing = state.objects.get(req.key.as_str()).cloned();
+
+    if let Some(tag) = &req.preconditions.if_match
+        && existing.as_ref().and_then(|o| o.metadata.etag.as_ref()) != Some(tag)
+    {
+        return Err(DriverError::precondition_failed(
+            "If-Match did not match the current object",
+        ));
+    }
+    if req.preconditions.if_none_match && existing.is_some() {
+        return Err(DriverError::precondition_failed(
+            "If-None-Match: * but the object exists",
+        ));
+    }
+
+    let removed = state.objects.remove(req.key.as_str());
+    Ok(DeleteResult {
+        deleted: removed.is_some(),
+        removed_revision: removed.map(|o| o.metadata.revision),
+    })
 }
 
 struct RefStagedWrite {
