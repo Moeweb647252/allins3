@@ -1,0 +1,293 @@
+//! Driver factory registration and instance initialization.
+//!
+//! The registry maps a [`DriverKind`] to a factory, creates instances and
+//! tracks their health. It performs **no** S3 authorization: that belongs to
+//! the auth layer (spec §2).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use thiserror::Error;
+
+use crate::domain::{DriverContext, DriverError, DriverInstanceId};
+
+use super::descriptor::{DriverHealth, DriverKind};
+use super::factory::{DriverFactory, SecretResolver};
+use super::traits::StorageDriver;
+
+/// Registration and creation failures.
+#[derive(Debug, Error)]
+pub enum RegistryError {
+    /// No factory is registered for the requested kind.
+    #[error("no driver factory registered for kind `{0}`")]
+    UnknownKind(DriverKind),
+    /// A factory for this kind is already registered.
+    #[error("a driver factory is already registered for kind `{0}`")]
+    DuplicateKind(DriverKind),
+    /// The instance id is already in use.
+    #[error("a driver instance is already registered for id `{0}`")]
+    DuplicateInstance(DriverInstanceId),
+    /// The factory rejected the configuration or failed to create.
+    #[error("driver factory failed: {0}")]
+    Factory(#[from] DriverError),
+}
+
+/// A registry of driver factories and live instances.
+#[derive(Default)]
+pub struct DriverRegistry {
+    factories: HashMap<DriverKind, Arc<dyn DriverFactory>>,
+    instances: HashMap<DriverInstanceId, Arc<dyn StorageDriver>>,
+}
+
+impl std::fmt::Debug for DriverRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DriverRegistry")
+            .field("kinds", &self.factories.keys().collect::<Vec<_>>())
+            .field("instances", &self.instances.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl DriverRegistry {
+    /// Creates an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a factory, rejecting duplicate kinds. Within a kind,
+    /// registration order does not matter.
+    pub fn register(&mut self, factory: Arc<dyn DriverFactory>) -> Result<(), RegistryError> {
+        let kind = factory.kind();
+        if self.factories.contains_key(&kind) {
+            return Err(RegistryError::DuplicateKind(kind));
+        }
+        self.factories.insert(kind, factory);
+        Ok(())
+    }
+
+    /// Whether a kind is registered.
+    pub fn has_kind(&self, kind: &DriverKind) -> bool {
+        self.factories.contains_key(kind)
+    }
+
+    /// Creates and initializes a driver instance for a registered kind.
+    ///
+    /// The factory's `validate` runs first so a bad configuration fails before
+    /// resources are committed.
+    pub async fn create_instance(
+        &mut self,
+        ctx: &DriverContext,
+        kind: &DriverKind,
+        instance_id: &DriverInstanceId,
+        secrets: &dyn SecretResolver,
+    ) -> Result<Arc<dyn StorageDriver>, RegistryError> {
+        if self.instances.contains_key(instance_id) {
+            return Err(RegistryError::DuplicateInstance(instance_id.clone()));
+        }
+        let factory = self
+            .factories
+            .get(kind)
+            .cloned()
+            .ok_or_else(|| RegistryError::UnknownKind(kind.clone()))?;
+
+        factory.validate(ctx, secrets).await?;
+        let driver = factory.create(ctx, instance_id, secrets).await?;
+        self.instances.insert(instance_id.clone(), driver.clone());
+        Ok(driver)
+    }
+
+    /// Fetches a live instance.
+    pub fn instance(&self, id: &DriverInstanceId) -> Option<Arc<dyn StorageDriver>> {
+        self.instances.get(id).cloned()
+    }
+
+    /// The number of live instances.
+    pub fn instance_count(&self) -> usize {
+        self.instances.len()
+    }
+
+    /// Probes every instance. One unhealthy instance does not stop the others.
+    pub async fn health(&self, ctx: &DriverContext) -> HashMap<DriverInstanceId, DriverHealth> {
+        let mut out = HashMap::with_capacity(self.instances.len());
+        for (id, driver) in &self.instances {
+            let health = driver
+                .health(ctx)
+                .await
+                .unwrap_or_else(|e| DriverHealth::Unhealthy {
+                    reason: e.to_string(),
+                });
+            out.insert(id.clone(), health);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use async_trait::async_trait;
+
+    use crate::domain::NamespaceId;
+    use crate::driver::capabilities::NamespaceCapabilities;
+    use crate::driver::descriptor::DriverDescriptor;
+    use crate::driver::factory::FactoryConfig;
+    use crate::driver::traits::NamespaceHandle;
+
+    struct NoopDriver {
+        kind: DriverKind,
+        instance_id: DriverInstanceId,
+    }
+
+    #[async_trait]
+    impl StorageDriver for NoopDriver {
+        fn descriptor(&self) -> DriverDescriptor {
+            DriverDescriptor {
+                kind: self.kind.clone(),
+                instance_id: self.instance_id.clone(),
+                display_name: "noop".into(),
+                version: None,
+            }
+        }
+        async fn health(&self, _ctx: &DriverContext) -> Result<DriverHealth, DriverError> {
+            Ok(DriverHealth::Healthy)
+        }
+        async fn shutdown(&self, _ctx: &DriverContext) -> Result<(), DriverError> {
+            Ok(())
+        }
+        async fn open_namespace(
+            &self,
+            _ctx: &DriverContext,
+            _namespace: &NamespaceId,
+        ) -> Result<NamespaceHandle, DriverError> {
+            Err(DriverError::not_supported("noop"))
+        }
+    }
+
+    struct NoopFactory {
+        kind: DriverKind,
+        fail_create: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl DriverFactory for NoopFactory {
+        fn kind(&self) -> DriverKind {
+            self.kind.clone()
+        }
+        async fn validate(
+            &self,
+            _ctx: &DriverContext,
+            _secrets: &dyn SecretResolver,
+        ) -> Result<(), DriverError> {
+            Ok(())
+        }
+        async fn create(
+            &self,
+            _ctx: &DriverContext,
+            instance_id: &DriverInstanceId,
+            _secrets: &dyn SecretResolver,
+        ) -> Result<Arc<dyn StorageDriver>, DriverError> {
+            if self.fail_create.load(Ordering::Relaxed) {
+                return Err(DriverError::internal("create failed"));
+            }
+            Ok(Arc::new(NoopDriver {
+                kind: self.kind.clone(),
+                instance_id: instance_id.clone(),
+            }))
+        }
+    }
+
+    struct EmptyResolver;
+    impl SecretResolver for EmptyResolver {
+        fn resolve(&self, _reference: &str) -> Result<crate::driver::factory::Secret, DriverError> {
+            Err(DriverError::not_found("none"))
+        }
+    }
+
+    fn ctx() -> DriverContext {
+        DriverContext::new(crate::domain::RequestId::new("t"))
+    }
+
+    fn factory(kind: &str, fail: bool) -> Arc<dyn DriverFactory> {
+        Arc::new(NoopFactory {
+            kind: DriverKind::new(kind),
+            fail_create: Arc::new(AtomicBool::new(fail)),
+        })
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_kind() {
+        let mut reg = DriverRegistry::new();
+        reg.register(factory("a", false)).unwrap();
+        assert!(matches!(
+            reg.register(factory("a", false)),
+            Err(RegistryError::DuplicateKind(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_kind() {
+        let mut reg = DriverRegistry::new();
+        let err = reg
+            .create_instance(
+                &ctx(),
+                &DriverKind::new("missing"),
+                &DriverInstanceId::parse("i1").unwrap(),
+                &EmptyResolver,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, RegistryError::UnknownKind(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_instance() {
+        let mut reg = DriverRegistry::new();
+        reg.register(factory("a", false)).unwrap();
+        let id = DriverInstanceId::parse("i1").unwrap();
+        reg.create_instance(&ctx(), &DriverKind::new("a"), &id, &EmptyResolver)
+            .await
+            .unwrap();
+        let err = reg
+            .create_instance(&ctx(), &DriverKind::new("a"), &id, &EmptyResolver)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, RegistryError::DuplicateInstance(_)));
+    }
+
+    #[tokio::test]
+    async fn failed_create_does_not_register_instance() {
+        let mut reg = DriverRegistry::new();
+        reg.register(factory("a", true)).unwrap();
+        let id = DriverInstanceId::parse("i1").unwrap();
+        assert!(
+            reg.create_instance(&ctx(), &DriverKind::new("a"), &id, &EmptyResolver)
+                .await
+                .is_err()
+        );
+        assert_eq!(reg.instance_count(), 0);
+        assert!(reg.instance(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn multiple_instances_of_one_kind() {
+        let mut reg = DriverRegistry::new();
+        reg.register(factory("a", false)).unwrap();
+        for name in ["a-1", "a-2"] {
+            let id = DriverInstanceId::parse(name).unwrap();
+            reg.create_instance(&ctx(), &DriverKind::new("a"), &id, &EmptyResolver)
+                .await
+                .unwrap();
+        }
+        assert_eq!(reg.instance_count(), 2);
+    }
+
+    // Silence unused-import warning for capability type used nowhere else here.
+    #[allow(dead_code)]
+    fn _cap(_: NamespaceCapabilities) {}
+    #[allow(dead_code)]
+    fn _cfg(_: FactoryConfig) {}
+}

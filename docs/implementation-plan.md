@@ -1,6 +1,8 @@
 # 多 driver S3 服务器实现计划
 
-状态：待实施。更新日期：2026-09-22。
+状态：P1 已完成；P0 除 P0-03 外已完成。更新日期：2026-09-22。
+
+> 进展：P1（领域模型、driver 接口、能力模型、测试 driver、契约测试）已实现并通过 `cargo test --all-features`；P0 的兼容矩阵、ADR、依赖固定与协议适配评估已产出，编译级 spike 位于 `spikes/protocol-adapter/`。**P0-03 的真实 SDK/CLI 运行时验收尚未执行**，因此没有任何操作被标记为“已验证兼容”。
 
 本计划依照[实现规范](implementation-spec.md)执行。用户已确定先做通用接口，不限定生产后端；因此先完成接口、服务闭环与验证工具，再单独推进具体 driver 的生产准入。
 
@@ -41,12 +43,12 @@ P1 模型稳定后，协议适配测试向量与 P2 可独立推进；不应在�
 
 任务：
 
-- [ ] P0-01 建立兼容矩阵，记录操作、参数、payload 模式、checksum、错误响应和对应官方依据。
-- [ ] P0-02 评估 `s3s` 能否暴露原始签名输入、流式 body、trailer、取消、错误映射与所需操作。
-- [ ] P0-03 用官方签名向量及真实 SDK 请求验证普通 PUT、presigned URL、特殊 key、checksum trailer 四条风险路径。
-- [ ] P0-04 若候选库缺关键能力，记录“适配补齐/更换适配层”的具体影响；driver API 不随候选库改变。
-- [ ] P0-05 固定 Rust toolchain、`async-trait` 等直接依赖版本、许可证检查方式和 CI 命令；确定协议 profile 的字节上限。
-- [ ] P0-06 记录 ADR：对象 API 边界、元数据所有权、分阶段提交、namespace 绑定、配置 bucket、生产状态待选型。
+- [x] P0-01 建立兼容矩阵 → `docs/compatibility-matrix.md`。
+- [x] P0-02 评估 `s3s` → `docs/p0-protocol-adapter-assessment.md`。
+- [ ] P0-03 用官方签名向量及真实 SDK 请求验证四条风险路径。**未完成**：本环境无 AWS CLI/SDK 客户端。
+- [x] P0-04 记录适配补齐/更换适配层影响 → ADR-0007。
+- [x] P0-05 固定直接依赖版本与 CI 命令、字节上限 → ADR-0005。toolchain 与许可证扫描仍有未决项。
+- [x] P0-06 记录 ADR → `docs/adr/`。
 
 产物：技术验证程序、首版兼容矩阵、ADR、可复现的依赖和测试向量。`s3s` 仅是候选，不能把它的 API 覆盖范围直接当作本项目已通过的兼容范围。[官方项目说明](https://github.com/s3s-project/s3s)
 
@@ -56,12 +58,12 @@ P1 模型稳定后，协议适配测试向量与 P2 可独立推进；不应在�
 
 任务：
 
-- [ ] P1-01 实现强类型 ID、ObjectKey、metadata、revision、checksum、错误、上下文、ResolvedRange 和游标类型；ReadRequest 必须携带 expected_revision。
-- [ ] P1-02 使用 `#[async_trait]` 与 `async fn` 完成只读/可写 namespace、staged write、工厂、注册表和原生扩展的对象安全接口；对应实现使用同一宏，保持默认 `Send` future。
-- [ ] P1-03 完成能力与限制模型、档位校验和 Native/Emulated/Unsupported 规划结果。
-- [ ] P1-04 编写参考 driver、故障注入包装器与另一种独立测试实现；它们不是生产后端承诺。
-- [ ] P1-05 建立通用契约测试入口：每个实现传入 factory 和能力声明即可运行同一套测试。
-- [ ] P1-06 定义 Committed、NotCommittedFinal、InFlight、Unknown 四态；验证终态未提交能阻止全部迟到发布，查无记录不等于终态失败，并覆盖 abort、drop、取消与临时资源回收。
+- [x] P1-01 实现强类型 ID、ObjectKey、metadata、revision、checksum、错误、上下文、ResolvedRange 和游标类型；ReadRequest 携带 expected_revision。→ `src/domain/`。
+- [x] P1-02 使用 `#[async_trait]` 与 `async fn` 完成只读/可写 namespace、staged write、工厂、注册表和原生扩展的对象安全接口。→ `src/driver/`。
+- [x] P1-03 完成能力与限制模型、档位校验和 Native/Emulated/Unsupported 规划结果。→ `src/driver/capabilities.rs`。
+- [x] P1-04 编写参考 driver、故障注入包装器与另一种独立测试实现。→ `src/testing/{reference,fault,second}.rs`。
+- [x] P1-05 建立通用契约测试入口。→ `src/testing/contract.rs`，集成测试 `tests/contract_{reference,fault}.rs`。
+- [x] P1-06 定义 Committed、NotCommittedFinal、InFlight、Unknown 四态；验证终态未提交能阻止迟到发布，查无记录不等于终态失败，并覆盖 abort 与取消。→ `src/domain/error.rs`、`tests/contract_fault.rs`（`drop` 与临时资源回收仍需在 P2/P4 的真实暂存实现上补充）。
 
 产物：可编译接口、rustdoc、至少两种测试实现、统一契约测试工具。
 

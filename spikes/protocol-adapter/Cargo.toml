@@ -1,0 +1,19 @@
+# Standalone P0 spike. This crate is intentionally NOT a member of the main
+# allins3 package: the driver API must not depend on the candidate protocol
+# adapter (spec §3.2, INV-01). It exists only to compile-check the integration
+# surface we rely on.
+[package]
+name = "protocol-adapter-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Deliberately its own workspace root so a plain `cargo build` here does not
+# add s3s to the main crate's dependency graph.
+[workspace]
+
+[dependencies]
+async-trait = "0.1"
+hyper = "1"
+s3s = "=0.16.1"
+tokio = { version = "1", features = ["rt", "macros"] }
