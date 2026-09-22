@@ -1,1 +1,7 @@
 target/
+spikes/protocol-adapter/target/
+
+# Local Python environment used only by scripts/e2e_boto3.py
+.venv/
+__pycache__/
+*.pyc

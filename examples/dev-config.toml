@@ -1,0 +1,70 @@
+# Development configuration for the interface engineering preview.
+#
+# The `test-reference` / `test-vec` drivers are in-memory test tools, not a
+# production backend. `development = true` is required to register them.
+# Secrets are read from the environment; nothing secret is written here.
+
+[server]
+listen = "127.0.0.1:9000"
+region = "us-east-1"
+addressing = "path"
+development = true
+health_endpoints = true
+
+[[drivers]]
+id = "instance-a"
+kind = "test-reference"
+
+[[drivers]]
+id = "instance-b"
+kind = "test-vec"
+
+[[buckets]]
+name = "example-a"
+driver = "instance-a"
+namespace = "namespace-a"
+profile = "core-write"
+
+[[buckets]]
+name = "example-b"
+driver = "instance-b"
+namespace = "namespace-b"
+profile = "core-write"
+
+[[credentials]]
+access_key_id = "EXAMPLEACCESSKEY"
+secret_ref = "env:ALLINS3_DEV_SECRET"
+principal = "example-user"
+
+[[grants]]
+principal = "example-user"
+bucket = "example-a"
+actions = ["list", "read", "write", "delete"]
+prefix = ""
+
+[[grants]]
+principal = "example-user"
+bucket = "example-b"
+actions = ["list", "read", "write", "delete"]
+prefix = ""
+
+[limits]
+# Server-wide admission, and a per-principal share of it. A principal that
+# saturates its share gets `503 SlowDown` instead of starving other callers.
+# Set `max_concurrent_requests_per_principal = 0` to disable that limit.
+max_single_write_size = 5368709120
+max_list_keys = 1000
+max_concurrent_requests = 256
+max_concurrent_requests_per_principal = 32
+
+# Multipart staging quota for the in-memory coordinator.
+staging_quota_bytes = 268435456
+
+# Timeouts, in seconds. `request_timeout_secs = 0` disables the total timeout.
+header_timeout_secs = 30
+body_idle_timeout_secs = 60
+request_timeout_secs = 0
+
+# NOTE: `addressing = "virtual"` is rejected at validation time; this preview
+# serves path-style only. Health (`/healthz`, `/readyz`) and `/metrics` are
+# exposed while `health_endpoints = true`.

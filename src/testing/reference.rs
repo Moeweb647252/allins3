@@ -572,14 +572,20 @@ impl NativeCopy for RefCopy {
             ));
         }
 
-        let (content, user_metadata) = match req.metadata_directive {
+        // `Replace` must take the caller's content properties as well as the
+        // caller's user metadata; keeping the source properties would silently
+        // ignore half of the replacement request.
+        let (content, source_content, user_metadata) = match req.metadata_directive {
             crate::driver::MetadataDirective::Copy => (
                 source.content.clone(),
+                source.metadata.content.clone(),
                 source.metadata.user_metadata.clone(),
             ),
-            crate::driver::MetadataDirective::Replace => {
-                (source.content.clone(), req.user_metadata.clone())
-            }
+            crate::driver::MetadataDirective::Replace => (
+                source.content.clone(),
+                req.content.clone(),
+                req.user_metadata.clone(),
+            ),
         };
         let revision = state.next_revision();
         let metadata = ObjectMetadata {
@@ -587,7 +593,7 @@ impl NativeCopy for RefCopy {
             size: content.len() as u64,
             etag: source.metadata.etag.clone(),
             last_modified: SystemTime::now(),
-            content: source.metadata.content.clone(),
+            content: source_content,
             user_metadata,
             checksums: source.metadata.checksums.clone(),
             revision,

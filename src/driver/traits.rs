@@ -26,7 +26,10 @@ use super::capabilities::NamespaceCapabilities;
 use super::descriptor::{DriverDescriptor, DriverHealth};
 
 /// A back-pressured stream of object bytes.
-pub type ObjectByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, DriverError>> + Send>>;
+///
+/// The `Send + Sync` bound keeps the stream usable from the protocol adapter,
+/// which needs to forward it across tasks and into its own body type.
+pub type ObjectByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, DriverError>> + Send + Sync>>;
 
 /// A read pinned to one revision.
 ///

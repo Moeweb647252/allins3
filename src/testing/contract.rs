@@ -15,13 +15,13 @@ use std::num::NonZeroU32;
 use bytes::Bytes;
 
 use crate::domain::{
-    BeginWrite, CommitState, ContentProperties, DriverContext, DriverError, DriverErrorKind,
-    ListCursor, ListRequest, NamespaceId, ObjectKey, Preconditions, RequestId, UserMetadata,
-    WriteId,
+    BeginWrite, CommitAttributes, CommitState, ContentProperties, DriverContext, DriverError,
+    DriverErrorKind, ListCursor, ListRequest, NamespaceId, ObjectKey, Preconditions, RequestId,
+    UserMetadata, WriteId,
 };
 use crate::driver::{
-    CommitRecovery, NamespaceHandle, PlannedFeature, Profile, StorageDriver, support_for,
-    validate_profile,
+    CommitRecovery, CopyRequest, CopySource, MetadataDirective, NamespaceHandle, PlannedFeature,
+    Profile, StorageDriver, support_for, validate_profile,
 };
 
 use super::support::{new_write_id, put_object, put_object_with_metadata, read_to_end};
@@ -215,7 +215,218 @@ pub async fn run_contract(
         ));
     }
 
+    // The native optimised copy must be indistinguishable from the streaming
+    // fallback; this is the equivalence entry point every driver shares.
+    if caps.native_copy && caps.read && caps.write {
+        run(
+            "copy_native_matches_emulation",
+            check_copy_equivalence(&handle, &ctx, namespaces.primary).await,
+            &mut report,
+        )?;
+    } else {
+        report.skipped.push((
+            "copy_native_matches_emulation",
+            "requires native copy plus read + write",
+        ));
+    }
+
     Ok(report)
+}
+
+/// Proves a driver's native copy route and the streaming fallback produce the
+/// same observable object for the same metadata directive.
+async fn check_copy_equivalence(
+    handle: &NamespaceHandle,
+    ctx: &DriverContext,
+    namespace: &NamespaceId,
+) -> Result<(), String> {
+    let native = handle
+        .native_copy
+        .as_ref()
+        .ok_or("namespace declares native copy without a handle")?;
+    let write = handle.write.as_ref().ok_or("namespace is not writable")?;
+
+    let source_key = key("copy/src.bin");
+    let content = ContentProperties {
+        content_type: Some("application/octet-stream".to_string()),
+        ..Default::default()
+    };
+    let mut user_metadata = UserMetadata::new();
+    user_metadata
+        .insert("origin", "copy-check")
+        .map_err(|e| e.to_string())?;
+    let source = put_object_with_metadata(
+        handle,
+        ctx,
+        source_key.clone(),
+        b"copy payload",
+        Preconditions::none(),
+        content.clone(),
+        user_metadata.clone(),
+    )
+    .await
+    .map_err(|e| err_detail(&e))?;
+
+    // Route 1: the driver's native copy.
+    let native_key = key("copy/native.bin");
+    let native_meta = native
+        .copy(
+            ctx,
+            CopyRequest {
+                source: CopySource {
+                    namespace: namespace.clone(),
+                    key: source_key.clone(),
+                    revision: source.revision.clone(),
+                },
+                destination: native_key.clone(),
+                preconditions: Preconditions::none(),
+                metadata_directive: MetadataDirective::Copy,
+                content: content.clone(),
+                user_metadata: user_metadata.clone(),
+                write_id: new_write_id(),
+            },
+        )
+        .await
+        .map_err(|e| err_detail(&e))?;
+
+    // Route 2: the same metadata published through a staged write.
+    let emulated_key = key("copy/emulated.bin");
+    let mut staged = write
+        .begin_write(
+            ctx,
+            BeginWrite {
+                key: emulated_key.clone(),
+                expected_length: Some(source.size),
+                preconditions: Preconditions::none(),
+                write_id: new_write_id(),
+                content: content.clone(),
+                user_metadata: user_metadata.clone(),
+                checksum_algorithm: None,
+            },
+        )
+        .await
+        .map_err(|e| err_detail(&e))?;
+    staged
+        .write_chunk(ctx, Bytes::from_static(b"copy payload"))
+        .await
+        .map_err(|e| err_detail(&e))?;
+    let emulated_meta = staged
+        .commit(
+            ctx,
+            CommitAttributes {
+                length: source.size,
+                etag: source.etag.clone(),
+                checksums: Vec::new(),
+            },
+        )
+        .await
+        .map_err(|e| err_detail(&e))?;
+
+    require(
+        native_meta.size == emulated_meta.size && native_meta.size == source.size,
+        format!(
+            "native copy size {} != emulated {} != source {}",
+            native_meta.size, emulated_meta.size, source.size
+        ),
+    )?;
+    require(
+        native_meta.etag == emulated_meta.etag,
+        format!(
+            "native copy ETag {:?} != emulated {:?}",
+            native_meta.etag, emulated_meta.etag
+        ),
+    )?;
+    require(
+        native_meta.content == emulated_meta.content,
+        "native and emulated copy disagree on content properties",
+    )?;
+    require(
+        native_meta.user_metadata == emulated_meta.user_metadata,
+        "native and emulated copy disagree on user metadata",
+    )?;
+    require(
+        read_key(handle, ctx, &native_key).await? == read_key(handle, ctx, &emulated_key).await?,
+        "native and emulated copy published different bytes",
+    )?;
+    require(
+        native_meta.revision != source.revision,
+        "the native copy did not create a new revision",
+    )?;
+
+    // The same equivalence must hold for a metadata replacement.
+    let replacement = ContentProperties {
+        content_type: Some("text/plain".to_string()),
+        ..Default::default()
+    };
+    let mut replaced_metadata = UserMetadata::new();
+    replaced_metadata
+        .insert("replaced", "yes")
+        .map_err(|e| e.to_string())?;
+
+    let native_replace_key = key("copy/native-replace.bin");
+    let native_replaced = native
+        .copy(
+            ctx,
+            CopyRequest {
+                source: CopySource {
+                    namespace: namespace.clone(),
+                    key: source_key.clone(),
+                    revision: source.revision.clone(),
+                },
+                destination: native_replace_key,
+                preconditions: Preconditions::none(),
+                metadata_directive: MetadataDirective::Replace,
+                content: replacement.clone(),
+                user_metadata: replaced_metadata.clone(),
+                write_id: new_write_id(),
+            },
+        )
+        .await
+        .map_err(|e| err_detail(&e))?;
+
+    let emulated_replace_key = key("copy/emulated-replace.bin");
+    let mut staged = write
+        .begin_write(
+            ctx,
+            BeginWrite {
+                key: emulated_replace_key.clone(),
+                expected_length: Some(source.size),
+                preconditions: Preconditions::none(),
+                write_id: new_write_id(),
+                content: replacement.clone(),
+                user_metadata: replaced_metadata.clone(),
+                checksum_algorithm: None,
+            },
+        )
+        .await
+        .map_err(|e| err_detail(&e))?;
+    staged
+        .write_chunk(ctx, Bytes::from_static(b"copy payload"))
+        .await
+        .map_err(|e| err_detail(&e))?;
+    let emulated_replaced = staged
+        .commit(
+            ctx,
+            CommitAttributes {
+                length: source.size,
+                etag: source.etag.clone(),
+                checksums: Vec::new(),
+            },
+        )
+        .await
+        .map_err(|e| err_detail(&e))?;
+
+    require(
+        native_replaced.content == emulated_replaced.content
+            && native_replaced.content.content_type == replacement.content_type,
+        "native and emulated metadata replacement disagree",
+    )?;
+    require(
+        native_replaced.user_metadata == emulated_replaced.user_metadata
+            && native_replaced.user_metadata == replaced_metadata,
+        "native and emulated metadata replacement produced different user metadata",
+    )?;
+    Ok(())
 }
 
 fn run(

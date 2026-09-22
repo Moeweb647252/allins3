@@ -54,6 +54,9 @@ pub struct FaultPlan {
     pub fail_delete: bool,
     /// Commit misbehaviour.
     pub commit: CommitFault,
+    /// The namespace answers no commit-recovery queries, so an unresolved
+    /// commit outcome stays unknown instead of being reconcilable.
+    pub hide_recovery: bool,
 }
 
 impl FaultPlan {
@@ -163,14 +166,23 @@ impl StorageDriver for FaultDriver {
                 fenced_once: self.fenced_once.clone(),
             }) as Arc<dyn WriteNamespace>
         });
+        // Recovery is observed unwrapped so tests see the real state, except
+        // when the plan asks for a driver that cannot answer recovery queries at
+        // all — then the capability declaration must agree with the handle.
+        let mut capabilities = inner.capabilities.clone();
+        let recovery = if self.plan.hide_recovery {
+            capabilities.recovery = false;
+            None
+        } else {
+            inner.recovery.clone()
+        };
         Ok(NamespaceHandle {
-            capabilities: inner.capabilities.clone(),
+            capabilities,
             read,
             write,
             multipart: inner.multipart.clone(),
             native_copy: inner.native_copy.clone(),
-            // Recovery is observed unwrapped so tests see the real state.
-            recovery: inner.recovery.clone(),
+            recovery,
         })
     }
 }

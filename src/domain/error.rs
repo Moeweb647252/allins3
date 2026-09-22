@@ -182,6 +182,33 @@ impl DriverError {
         self.retry
     }
 
+    /// The commit state, inferred from the error kind when the driver did not
+    /// attach one explicitly.
+    ///
+    /// A driver must attach the observed state; this fallback only classifies
+    /// errors that provably mean "nothing was published" as
+    /// [`CommitState::NotCommittedFinal`] and stays [`CommitState::Unknown`]
+    /// otherwise, so an unknown outcome is never mistaken for a final failure.
+    pub fn commit_state_or_infer(&self) -> CommitState {
+        if let Some(state) = self.commit_state {
+            return state;
+        }
+        match self.kind {
+            DriverErrorKind::PreconditionFailed
+            | DriverErrorKind::ConditionalConflict
+            | DriverErrorKind::AccessDenied
+            | DriverErrorKind::InvalidArgument
+            | DriverErrorKind::NotSupported
+            | DriverErrorKind::NotFound
+            | DriverErrorKind::ResourceExhausted
+            | DriverErrorKind::Cancelled => CommitState::NotCommittedFinal,
+            DriverErrorKind::RevisionUnavailable
+            | DriverErrorKind::Throttled
+            | DriverErrorKind::TemporarilyUnavailable
+            | DriverErrorKind::Internal => CommitState::Unknown,
+        }
+    }
+
     /// Whether the caller may retry the operation.
     pub fn is_retryable(&self) -> bool {
         !matches!(self.retry, RetryHint::Never)

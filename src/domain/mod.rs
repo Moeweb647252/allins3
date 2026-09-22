@@ -17,7 +17,7 @@ mod metadata;
 mod range;
 mod write;
 
-pub use checksum::{Checksum, ChecksumAlgorithm};
+pub use checksum::{Checksum, ChecksumAlgorithm, ChecksumType};
 pub use context::{DriverContext, RequestId, TraceContext};
 pub use error::{CommitState, DriverError, DriverErrorKind, RetryHint};
 pub use ids::{BucketId, DriverInstanceId, IdError, NamespaceId};

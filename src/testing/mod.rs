@@ -8,6 +8,7 @@
 
 pub mod contract;
 pub mod fault;
+pub mod fixture;
 pub mod reference;
 pub mod second;
 pub mod support;
