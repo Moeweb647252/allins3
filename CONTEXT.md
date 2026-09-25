@@ -70,7 +70,7 @@
 
 ### 已实现的候选
 
-架构评审提出的三个候选现均已实现：**对象服务拆分**（Admission / NamespaceHandles / TokenStore / Multipart，见 ADR-0008）、**Composition 组合根**（`src/compose.rs`）、**StagingLedger**（`src/service/staging.rs`）。
+架构评审提出的三个候选现均已实现：**对象服务拆分**（Admission / NamespaceHandles / TokenStore / Multipart，见 ADR-0008）；ADR-0008 记为“未决”的两项后续 —— **Composition 组合根**（`src/compose.rs`）与 **StagingLedger**（`src/service/staging.rs`）—— 见 [ADR-0009](docs/adr/0009-service-decomposition-followups.md)。
 
 ## 进程级全局状态
 

@@ -12,5 +12,6 @@
 | [0006](0006-config-defined-buckets.md) | 配置定义 bucket；生产状态存储待选型 | Accepted |
 | [0007](0007-protocol-adapter.md) | 协议适配：封装 s3s 候选 | Accepted |
 | [0008](0008-object-service-decomposition.md) | 对象服务的四个协作者拆分与缝隙保持内部 | Accepted |
+| [0009](0009-service-decomposition-followups.md) | 对象服务拆分的两项后续：组合根与暂存账本 | Accepted |
 
 格式：每条 ADR 记录背景、决策、后果与替代方案。修改已接受决策需新增 ADR 并在旧条目标注 Superseded。
