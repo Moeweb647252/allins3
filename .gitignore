@@ -5,3 +5,20 @@ spikes/protocol-adapter/target/
 .venv/
 __pycache__/
 *.pyc
+# libFuzzer build output, generated corpus and crash artifacts.
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+# Anything else a fuzz run drops next to the seeds is generated data; only the
+# hand-written seeds listed below are tracked, and a new seed needs its own `!`
+# line here, so a long run cannot pollute the tree.
+fuzz/seeds/*/*
+!fuzz/seeds/part-manifest/valid-part-one
+!fuzz/seeds/part-manifest/duplicate-parts
+!fuzz/seeds/part-manifest/unknown-part
+!fuzz/seeds/signature-inputs/authorization-shape
+!fuzz/seeds/signature-inputs/presigned-shape
+!fuzz/seeds/xml-manifest/valid-empty-list
+!fuzz/seeds/xml-manifest/declared-namespace
+!fuzz/seeds/xml-manifest/valid-single-part

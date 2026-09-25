@@ -24,7 +24,36 @@ use s3s::dto::{
     UploadPartCopyOutput, UploadPartOutput,
 };
 use s3s::stream::{ByteStream, RemainingLength};
-use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, StdError};
+use s3s::{S3, S3Request, S3Response, S3Result, StdError};
+
+// --- The adapter facade ----------------------------------------------------
+//
+// `ADR-0007` keeps `s3s` inside this module. The composition root builds the
+// service, its config and its bodies through these re-exports rather than
+// naming the library, so replacing the candidate stays an adapter change.
+pub use s3s::config::S3Config;
+pub use s3s::{Body as S3Body, HttpError, HttpResponse, S3Error, S3ErrorCode};
+
+/// The built adapter service the server drives.
+pub type S3Service = s3s::service::S3Service;
+
+/// The adapter configuration derived from the resolved limits.
+///
+/// Every default this library ships is pinned explicitly here, so a dependency
+/// bump that changes one fails a test rather than silently changing behaviour
+/// (`ADR-0007` §3).
+pub fn adapter_config(limits: &crate::config::Limits) -> S3Config {
+    let mut config = S3Config::default();
+    // SigV4 only (spec §6.1); the candidate defaults to off, assert it anyway.
+    config.enable_sig_v2 = false;
+    // Preserve significant key bytes (`a//b` != `a/b`).
+    config.normalize_forward_slash_path = false;
+    // Only accept the `s3` service scope.
+    config.sig_v4_allowed_services = vec!["s3".to_string()];
+    config.put_object_max_size = Some(limits.max_single_write_size);
+    config.xml_max_body_size = limits.max_xml_bytes;
+    config
+}
 
 use crate::auth::{AccessPolicy, Action, CredentialStore};
 use crate::domain::{
@@ -88,6 +117,14 @@ impl S3Handler {
     /// connection of the server.
     fn scope<T>(&self, req: &S3Request<T>) -> S3Result<RequestScope> {
         let mut scope = scope();
+        // The backend operation deadline is the total deadline (spec §9.3): a
+        // driver call must not outlive the request that started it, so the
+        // request context carries the same bound the server enforces around the
+        // whole call. There is no separate knob because no backend call is ever
+        // allowed to run longer than its request.
+        if let Some(deadline) = self.service.limits().request_timeout {
+            scope.ctx = scope.ctx.with_timeout(deadline);
+        }
         scope.principal = self.principal_of(req);
         scope.permit = self
             .limiter
@@ -127,7 +164,7 @@ impl PrincipalLimiter {
         }
         let key = principal.unwrap_or("<unauthenticated>").to_string();
         let semaphore = {
-            let mut permits = self.permits.lock().expect("principal limiter poisoned");
+            let mut permits = crate::sync::lock(&self.permits);
             permits
                 .entry(key)
                 .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.per_principal)))
@@ -171,11 +208,15 @@ fn attach_request_id<T>(mut resp: S3Response<T>, id: &str) -> S3Response<T> {
 }
 
 fn map_error(err: ServiceError, request_id: &str) -> S3Error {
-    let code: S3ErrorCode = err
-        .code()
+    let shape = err.describe();
+    // `describe` is the single source of truth for the code name, and
+    // `every_service_error_code_is_a_known_s3_code` proves each one parses, so
+    // this fallback is unreachable rather than a silent degradation.
+    let code: S3ErrorCode = shape
+        .code
         .parse()
         .unwrap_or_else(|_| S3ErrorCode::InternalError);
-    let mut out = S3Error::with_message(code, err.message());
+    let mut out = S3Error::with_message(code, shape.message);
     out.set_request_id(request_id.to_string());
     out
 }
@@ -190,15 +231,29 @@ fn to_system_time(ts: &Timestamp) -> std::time::SystemTime {
     std::time::SystemTime::from(time::OffsetDateTime::from(ts.clone()))
 }
 
-fn to_content_properties(input: &S3ContentInput) -> ContentProperties {
-    ContentProperties {
+fn to_content_properties(input: &S3ContentInput) -> Result<ContentProperties, ServiceError> {
+    // `Expires` is an object property that must survive the round trip (spec
+    // §5.4). A value the service cannot store is rejected rather than dropped:
+    // silently publishing an object without it would change what the client
+    // asked for.
+    let expires = match input.expires.as_deref() {
+        None => None,
+        Some(raw) => Some(parse_http_date(raw).ok_or_else(|| {
+            ServiceError::InvalidArgument(
+                "`Expires` must be an HTTP date in IMF-fixdate form \
+                 (e.g. `Wed, 21 Oct 2015 07:28:00 GMT`)"
+                    .into(),
+            )
+        })?),
+    };
+    Ok(ContentProperties {
         content_type: input.content_type.clone(),
         content_encoding: input.content_encoding.clone(),
         content_language: input.content_language.clone(),
         content_disposition: input.content_disposition.clone(),
         cache_control: input.cache_control.clone(),
-        expires: None,
-    }
+        expires,
+    })
 }
 
 /// The subset of content headers shared by `PutObject`/`CopyObject`.
@@ -208,6 +263,130 @@ struct S3ContentInput {
     content_language: Option<String>,
     content_disposition: Option<String>,
     cache_control: Option<String>,
+    expires: Option<String>,
+}
+
+/// Formats a `SystemTime` as an RFC 7231 IMF-fixdate.
+///
+/// Only the components are used, so this needs no formatting feature: the shape
+/// is fixed (`Sun, 06 Nov 1994 08:49:37 GMT`).
+fn format_http_date(time: std::time::SystemTime) -> String {
+    use time::{Month, OffsetDateTime, Weekday};
+    let value = OffsetDateTime::from(time);
+    let weekday = match value.weekday() {
+        Weekday::Monday => "Mon",
+        Weekday::Tuesday => "Tue",
+        Weekday::Wednesday => "Wed",
+        Weekday::Thursday => "Thu",
+        Weekday::Friday => "Fri",
+        Weekday::Saturday => "Sat",
+        Weekday::Sunday => "Sun",
+    };
+    let month = match value.month() {
+        Month::January => "Jan",
+        Month::February => "Feb",
+        Month::March => "Mar",
+        Month::April => "Apr",
+        Month::May => "May",
+        Month::June => "Jun",
+        Month::July => "Jul",
+        Month::August => "Aug",
+        Month::September => "Sep",
+        Month::October => "Oct",
+        Month::November => "Nov",
+        Month::December => "Dec",
+    };
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        weekday,
+        value.day(),
+        month,
+        value.year(),
+        value.hour(),
+        value.minute(),
+        value.second(),
+    )
+}
+
+/// Parses the IMF-fixdate form of an HTTP date, the only form S3 clients send.
+fn parse_http_date(value: &str) -> Option<std::time::SystemTime> {
+    let (weekday, rest) = value.trim().split_once(',')?;
+    if !matches!(
+        weekday,
+        "Mon" | "Tue" | "Wed" | "Thu" | "Fri" | "Sat" | "Sun"
+    ) {
+        return None;
+    }
+    let mut fields = rest.trim_start().split(' ');
+    let day: u8 = fields.next()?.parse().ok()?;
+    let month = match fields.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i32 = fields.next()?.parse().ok()?;
+    let mut clock = fields.next()?.split(':');
+    let hour: u8 = clock.next()?.parse().ok()?;
+    let minute: u8 = clock.next()?.parse().ok()?;
+    let second: u8 = clock.next()?.parse().ok()?;
+    if clock.next().is_some() || fields.next()? != "GMT" || fields.next().is_some() {
+        return None;
+    }
+    use time::{Date, Month, PrimitiveDateTime, Time};
+    let date = Date::from_calendar_date(year, Month::try_from(month).ok()?, day).ok()?;
+    let time = Time::from_hms(hour, minute, second).ok()?;
+    Some(std::time::SystemTime::from(
+        PrimitiveDateTime::new(date, time).assume_utc(),
+    ))
+}
+
+/// Whether `value` can appear as XML 1.0 character data.
+///
+/// XML 1.0 excludes most C0 control characters. A key containing one cannot be
+/// serialised without producing a document XML parsers reject, so such a
+/// listing asks the client for `encoding-type=url` instead (spec §4.2).
+fn is_xml_1_0_text(value: &str) -> bool {
+    value.chars().all(|c| {
+        matches!(c, '\u{9}' | '\u{A}' | '\u{D}')
+            || ('\u{20}'..='\u{D7FF}').contains(&c)
+            || ('\u{E000}'..='\u{FFFD}').contains(&c)
+            || ('\u{10000}'..='\u{10FFFF}').contains(&c)
+    })
+}
+
+/// Rejects a listing whose result could not be represented in XML 1.0.
+///
+/// The alternative — emitting a broken document or rewriting the key — is
+/// explicitly refused by spec §4.2.
+fn require_encodable(
+    encoding: Option<&str>,
+    values: impl IntoIterator<Item = String>,
+    request_id: &str,
+) -> S3Result<()> {
+    if encoding.is_some() {
+        return Ok(());
+    }
+    if values.into_iter().any(|value| !is_xml_1_0_text(&value)) {
+        return Err(map_error(
+            ServiceError::InvalidRequest(
+                "the listing contains characters that XML 1.0 cannot represent; \
+                 retry with `encoding-type=url`"
+                    .into(),
+            ),
+            request_id,
+        ));
+    }
+    Ok(())
 }
 
 /// Converts request metadata, rejecting anything over the metadata limits.
@@ -251,6 +430,7 @@ fn apply_metadata(meta: &crate::domain::ObjectMetadata, out: &mut CommonObjectOu
     out.content_language = meta.content.content_language.clone();
     out.content_disposition = meta.content.content_disposition.clone();
     out.cache_control = meta.content.cache_control.clone();
+    out.expires = meta.content.expires.map(format_http_date);
 
     out.checksums = ChecksumHeaders::from_checksums(&meta.checksums);
 }
@@ -306,6 +486,7 @@ struct CommonObjectOutput {
     content_language: Option<String>,
     content_disposition: Option<String>,
     cache_control: Option<String>,
+    expires: Option<String>,
     checksums: ChecksumHeaders,
 }
 
@@ -321,6 +502,7 @@ impl CommonObjectOutput {
             content_language: None,
             content_disposition: None,
             cache_control: None,
+            expires: None,
             checksums: ChecksumHeaders::default(),
         }
     }
@@ -437,13 +619,100 @@ impl futures_core::Stream for InputStream {
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(bytes))),
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(DriverError::internal(format!(
-                "request body error: {e}"
-            ))))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(classify_request_body_error(e)))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+/// Wraps a body-bridge error so it can be kept as an internal cause.
+///
+/// [`DriverError::with_cause`] takes a sized error; the bridge yields a boxed
+/// one, and this keeps the library's text out of the client's response while
+/// leaving it reachable through `Error::source`.
+struct BodyBridgeError(StdError);
+
+impl std::fmt::Debug for BodyBridgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::fmt::Display for BodyBridgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for BodyBridgeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+/// Classifies a failure of the request body itself.
+///
+/// The bytes never reached a driver, so the outcome is a client-visible one and
+/// must not be reported as a server fault (spec §9.1): a signed chunk or trailer
+/// that does not verify is the corresponding signature error, framing the server
+/// cannot parse is an invalid request, and a body over the configured limit is
+/// too large. The library's own error is kept as the internal cause — never as
+/// the client's message, which must not leak backend detail (spec §10).
+fn classify_request_body_error(error: StdError) -> DriverError {
+    // A body that went idle is the client's fault, not a server fault: it must
+    // never be reported as an internal error (spec §9.1, §9.3).
+    if crate::timeouts::is_body_idle(error.as_ref()) {
+        return DriverError::cancelled(
+            "the request body was idle for longer than the configured body idle timeout",
+        )
+        .with_cause(BodyBridgeError(error));
+    }
+    if let Some(chunked) =
+        error.downcast_ref::<s3s::stream::aws_chunked_stream::AwsChunkedStreamError>()
+    {
+        return match chunked.to_s3_error_code() {
+            s3s::S3ErrorCode::SignatureDoesNotMatch => DriverError::payload_signature_mismatch(
+                "the signature of at least one aws-chunked chunk or trailer did not match",
+            )
+            .with_cause(BodyBridgeError(error)),
+            s3s::S3ErrorCode::EntityTooLarge => DriverError::resource_exhausted(
+                "a chunk of the request body exceeds the configured maximum chunk size",
+            )
+            .with_cause(BodyBridgeError(error)),
+            s3s::S3ErrorCode::InternalError => {
+                DriverError::internal("the request body could not be read")
+                    .with_cause(BodyBridgeError(error))
+            }
+            _ => DriverError::invalid_argument("the request body is not valid aws-chunked framing")
+                .with_cause(BodyBridgeError(error)),
+        };
+    }
+    if let Some(payload) = error.downcast_ref::<s3s::stream::upload_stream::UploadStreamError>() {
+        return match payload.to_s3_error_code() {
+            s3s::S3ErrorCode::BadDigest => DriverError::payload_digest_mismatch(
+                "the body you sent did not match the digest you declared for it",
+            )
+            .with_cause(BodyBridgeError(error)),
+            s3s::S3ErrorCode::InternalError => {
+                DriverError::internal("the request body could not be read")
+                    .with_cause(BodyBridgeError(error))
+            }
+            _ => DriverError::invalid_argument(
+                "the request body did not match the length you declared for it",
+            )
+            .with_cause(BodyBridgeError(error)),
+        };
+    }
+    if error.downcast_ref::<s3s::BodySizeLimitExceeded>().is_some() {
+        return DriverError::resource_exhausted(
+            "the request body exceeds the configured maximum size",
+        )
+        .with_cause(BodyBridgeError(error));
+    }
+    // Anything else is a transport or server-side failure: keep it internal and
+    // keep the library's text out of the client's response.
+    DriverError::internal("the request body could not be read").with_cause(BodyBridgeError(error))
 }
 
 /// A stream that yields nothing.
@@ -686,6 +955,7 @@ impl S3 for S3Handler {
             content_language: common.content_language,
             content_disposition: common.content_disposition,
             cache_control: common.cache_control,
+            expires: common.expires,
             checksum_md5: common.checksums.md5,
             checksum_crc32: common.checksums.crc32,
             checksum_crc32c: common.checksums.crc32c,
@@ -757,6 +1027,7 @@ impl S3 for S3Handler {
             content_language: common.content_language,
             content_disposition: common.content_disposition,
             cache_control: common.cache_control,
+            expires: common.expires,
             checksum_md5: common.checksums.md5,
             checksum_crc32: common.checksums.crc32,
             checksum_crc32c: common.checksums.crc32c,
@@ -801,7 +1072,9 @@ impl S3 for S3Handler {
             content_language: input.content_language.clone(),
             content_disposition: input.content_disposition.clone(),
             cache_control: input.cache_control.clone(),
-        });
+            expires: input.expires.clone(),
+        })
+        .map_err(|e| map_error(e, &scope.request_id))?;
         let user_metadata = to_user_metadata(&input.metadata, &scope.request_id)?;
         let preconditions = write_preconditions(&input.if_match, &input.if_none_match)
             .map_err(|e| map_error(e, &scope.request_id))?;
@@ -974,13 +1247,20 @@ impl S3 for S3Handler {
             .await
             .map_err(|e| map_error(e, &scope.request_id))?;
 
-        let encode = |value: &str| {
-            if encoding.as_deref() == Some("url") {
-                url_encode_key(value)
-            } else {
-                value.to_string()
-            }
-        };
+        // A result that cannot be written as XML 1.0 must not be silently
+        // broken; the client is asked for `encoding-type=url` instead.
+        require_encodable(
+            encoding.as_deref(),
+            result
+                .objects
+                .iter()
+                .map(|meta| meta.key.as_str().to_string())
+                .chain(result.common_prefixes.iter().cloned())
+                .chain(std::iter::once(input.prefix.clone().unwrap_or_default())),
+            &scope.request_id,
+        )?;
+
+        let encode = |value: &str| encode_value(value, &encoding);
 
         let contents = result
             .objects
@@ -1084,7 +1364,9 @@ impl S3 for S3Handler {
             content_language: input.content_language.clone(),
             content_disposition: input.content_disposition.clone(),
             cache_control: input.cache_control.clone(),
-        });
+            expires: input.expires.clone(),
+        })
+        .map_err(|e| map_error(e, &scope.request_id))?;
         let user_metadata = to_user_metadata(&input.metadata, &scope.request_id)?;
         let destination_key = parse_key(&input.key, &scope.request_id)?;
 
@@ -1151,7 +1433,9 @@ impl S3 for S3Handler {
             content_language: input.content_language.clone(),
             content_disposition: input.content_disposition.clone(),
             cache_control: input.cache_control.clone(),
-        });
+            expires: input.expires.clone(),
+        })
+        .map_err(|e| map_error(e, &scope.request_id))?;
         let checksum = checksum_scheme(
             input.checksum_algorithm.as_ref(),
             input.checksum_type.as_ref(),
@@ -1326,6 +1610,13 @@ impl S3 for S3Handler {
         let scope = self.scope(&req)?;
         let input = req.input;
         let key = parse_key(&input.key, &scope.request_id)?;
+        // `ListParts` echoes the key back; it must be representable as XML 1.0
+        // just like a listing result (spec §4.2).
+        require_encodable(
+            None,
+            std::iter::once(key.as_str().to_string()),
+            &scope.request_id,
+        )?;
         let marker = input.part_number_marker.map(|m| m.clamp(0, 10_000) as u16);
         let limit = input.max_parts.unwrap_or(1000).clamp(1, 1000) as u32;
 
@@ -1374,6 +1665,15 @@ impl S3 for S3Handler {
         let scope = self.scope(&req)?;
         let input = req.input;
         let limit = input.max_uploads.unwrap_or(1000).clamp(1, 1000) as u32;
+        let encoding = input.encoding_type.as_ref().map(|e| e.as_str().to_string());
+        if let Some(encoding) = &encoding
+            && encoding != "url"
+        {
+            return Err(map_error(
+                ServiceError::InvalidArgument(format!("unsupported encoding-type `{encoding}`")),
+                &scope.request_id,
+            ));
+        }
 
         let page = self
             .service
@@ -1386,11 +1686,20 @@ impl S3 for S3Handler {
             )
             .map_err(|e| map_error(e, &scope.request_id))?;
 
+        require_encodable(
+            encoding.as_deref(),
+            page.uploads
+                .iter()
+                .map(|session| session.key.to_string())
+                .chain(std::iter::once(input.prefix.clone().unwrap_or_default())),
+            &scope.request_id,
+        )?;
+
         let uploads = page
             .uploads
             .into_iter()
             .map(|session| S3MultipartUpload {
-                key: Some(session.key.to_string()),
+                key: Some(encode_value(session.key.as_str(), &encoding)),
                 upload_id: Some(session.upload_id.as_str().to_string()),
                 initiated: Some(to_timestamp(session.initiated)),
                 ..Default::default()
@@ -1401,6 +1710,7 @@ impl S3 for S3Handler {
             bucket: Some(input.bucket.clone()),
             prefix: input.prefix.clone(),
             delimiter: input.delimiter.clone(),
+            encoding_type: input.encoding_type.clone(),
             key_marker: input.key_marker.clone(),
             upload_id_marker: input.upload_id_marker.clone(),
             next_key_marker: page.next_key_marker.as_ref().map(|k| k.to_string()),
@@ -1852,6 +2162,15 @@ fn checksum_algorithm_from(
     }
 }
 
+/// Encodes a listing value for the response's requested `encoding-type`.
+fn encode_value(value: &str, encoding: &Option<String>) -> String {
+    if encoding.as_deref() == Some("url") {
+        url_encode_key(value)
+    } else {
+        value.to_string()
+    }
+}
+
 /// Percent-encodes a key for `encoding-type=url`.
 fn url_encode_key(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
@@ -1890,6 +2209,53 @@ mod tests {
     fn url_encoding_preserves_unreserved_only() {
         assert_eq!(url_encode_key("a/b c"), "a%2Fb%20c");
         assert_eq!(url_encode_key("a~b"), "a~b");
+    }
+
+    #[test]
+    fn every_service_error_code_is_a_known_s3_code() {
+        // `map_error` parses the code name the service produced; without this
+        // check a typo or a renamed code would silently degrade every response
+        // of that variant to `InternalError`.
+        for error in ServiceError::ALL {
+            assert!(
+                error.code().parse::<S3ErrorCode>().is_ok(),
+                "`{}` is not a code the adapter understands",
+                error.code()
+            );
+        }
+    }
+
+    #[test]
+    fn http_dates_round_trip() {
+        let raw = "Wed, 21 Oct 2015 07:28:00 GMT";
+        let parsed = parse_http_date(raw).expect("a valid IMF-fixdate");
+        assert_eq!(format_http_date(parsed), raw);
+        // Anything the service cannot store is a request error, not a silently
+        // dropped header (spec §5.4).
+        assert!(parse_http_date("2015-10-21T07:28:00Z").is_none());
+        assert!(parse_http_date("Wed, 32 Oct 2015 07:28:00 GMT").is_none());
+        assert!(parse_http_date("Wed, 21 Oct 2015 07:28:00 UTC").is_none());
+    }
+
+    #[test]
+    fn xml_1_0_invalid_keys_require_url_encoding() {
+        assert!(is_xml_1_0_text("a/\u{1F600}\nb"));
+        assert!(!is_xml_1_0_text("a\u{1}b"));
+        assert!(require_encodable(None, ["a/b".to_string()], "req").is_ok());
+        assert!(require_encodable(None, ["a\u{1}b".to_string()], "req").is_err());
+        assert!(require_encodable(Some("url"), ["a\u{1}b".to_string()], "req").is_ok());
+    }
+
+    #[test]
+    fn an_idle_request_body_is_a_client_error() {
+        // A client that stops sending must see a client error, never a server
+        // fault counted against the server (spec §9.1, §9.3).
+        let error: StdError = Box::new(crate::timeouts::BodyTimeoutError::Idle);
+        let mapped = classify_request_body_error(error);
+        assert_eq!(
+            ServiceError::from_driver(&mapped, true).code(),
+            "InvalidRequest"
+        );
     }
 
     #[test]

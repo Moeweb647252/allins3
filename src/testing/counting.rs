@@ -10,7 +10,6 @@
 //! reference driver's in-memory ones, so metadata, ordering and conditional
 //! rules behave identically to a real namespace.
 
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -28,7 +27,9 @@ use crate::driver::{
     ReadRequest, ReadResult, SecretResolver, StagedWrite, StorageDriver, WriteNamespace,
 };
 
-use super::reference::{NamespaceState, StoredObject, check_ctx, delete_object, page_for};
+use super::reference::{
+    NamespaceState, NamespaceTable, StoredObject, check_ctx, delete_object, page_for,
+};
 
 /// The counters a counting sink accumulates across writes.
 #[derive(Debug, Default)]
@@ -113,7 +114,7 @@ impl DriverFactory for CountingDriverFactory {
                 version: Some(env!("CARGO_PKG_VERSION").into()),
             },
             sink: self.sink.clone(),
-            namespaces: Mutex::new(BTreeMap::new()),
+            namespaces: NamespaceTable::new(),
         }))
     }
 }
@@ -122,14 +123,7 @@ impl DriverFactory for CountingDriverFactory {
 pub struct CountingDriver {
     descriptor: DriverDescriptor,
     sink: Arc<Sink>,
-    namespaces: Mutex<BTreeMap<NamespaceId, Arc<Mutex<NamespaceState>>>>,
-}
-
-impl CountingDriver {
-    fn state(&self, namespace: &NamespaceId) -> Arc<Mutex<NamespaceState>> {
-        let mut map = self.namespaces.lock().expect("namespace map poisoned");
-        map.entry(namespace.clone()).or_default().clone()
-    }
+    namespaces: NamespaceTable<NamespaceState>,
 }
 
 #[async_trait]
@@ -151,7 +145,7 @@ impl StorageDriver for CountingDriver {
         _ctx: &DriverContext,
         namespace: &NamespaceId,
     ) -> Result<NamespaceHandle, DriverError> {
-        let state = self.state(namespace);
+        let state = self.namespaces.get(namespace);
         let handle = NamespaceHandle {
             capabilities: NamespaceCapabilities {
                 read: true,

@@ -27,6 +27,7 @@ dependencies = [
  "libc",
  "md-5 0.10.6",
  "s3s",
+ "s3s-sigv4",
  "serde",
  "sha1 0.10.7",
  "sha2 0.10.9",

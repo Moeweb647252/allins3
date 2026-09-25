@@ -142,6 +142,11 @@ pub struct RawLimits {
     /// the default; set to 0 to disable the per-principal limit.
     #[serde(default = "default_per_principal")]
     pub max_concurrent_requests_per_principal: Option<usize>,
+    /// Maximum concurrent in-flight operations against any one driver instance,
+    /// however many buckets it serves. Omit to keep the default; set to 0 to
+    /// disable the per-driver limit.
+    #[serde(default = "default_per_driver")]
+    pub max_concurrent_requests_per_driver: Option<usize>,
     /// Header timeout in seconds.
     #[serde(default = "default_header_timeout")]
     pub header_timeout_secs: u64,
@@ -154,10 +159,33 @@ pub struct RawLimits {
     /// Multipart staging quota in bytes.
     #[serde(default = "default_staging_quota")]
     pub staging_quota_bytes: u64,
+    /// How long a multipart upload may sit without activity before its staged
+    /// parts may be reclaimed. Values below 1 second are raised to 1.
+    #[serde(default = "default_multipart_lease")]
+    pub multipart_lease_secs: u64,
+    /// How often the multipart lease sweeper runs, in seconds. `0` disables it.
+    #[serde(default = "default_multipart_sweep_interval")]
+    pub multipart_sweep_interval_secs: u64,
+    /// Lifetime of a server-side listing continuation token, in seconds.
+    /// Values below 1 second are raised to 1.
+    #[serde(default = "default_list_token_ttl")]
+    pub list_token_ttl_secs: u64,
+}
+
+fn default_list_token_ttl() -> u64 {
+    3600
 }
 
 fn default_staging_quota() -> u64 {
     10 * 1024 * 1024 * 1024
+}
+
+fn default_multipart_lease() -> u64 {
+    3600
+}
+
+fn default_multipart_sweep_interval() -> u64 {
+    60
 }
 
 fn default_region() -> String {
@@ -187,6 +215,9 @@ fn default_concurrency() -> usize {
 fn default_per_principal() -> Option<usize> {
     Some(256)
 }
+fn default_per_driver() -> Option<usize> {
+    Some(256)
+}
 fn default_header_timeout() -> u64 {
     30
 }
@@ -203,10 +234,14 @@ impl Default for RawLimits {
             max_list_keys: default_page(),
             max_concurrent_requests: default_concurrency(),
             max_concurrent_requests_per_principal: default_per_principal(),
+            max_concurrent_requests_per_driver: default_per_driver(),
             header_timeout_secs: default_header_timeout(),
             body_idle_timeout_secs: default_body_timeout(),
             request_timeout_secs: 0,
             staging_quota_bytes: default_staging_quota(),
+            multipart_lease_secs: default_multipart_lease(),
+            multipart_sweep_interval_secs: default_multipart_sweep_interval(),
+            list_token_ttl_secs: default_list_token_ttl(),
         }
     }
 }
@@ -235,6 +270,10 @@ pub struct Limits {
     pub max_concurrent_requests: usize,
     /// Maximum concurrent requests per principal; `0` disables the limit.
     pub max_concurrent_requests_per_principal: usize,
+    /// Maximum concurrent operations per driver instance; `0` disables the
+    /// limit. Bounds what one backend can be asked to do at once, so a slow or
+    /// saturated driver cannot consume every connection the server has.
+    pub max_concurrent_requests_per_driver: usize,
     /// Header timeout.
     pub header_timeout: std::time::Duration,
     /// Body idle timeout.
@@ -243,6 +282,12 @@ pub struct Limits {
     pub request_timeout: Option<std::time::Duration>,
     /// Multipart staging quota in bytes.
     pub staging_quota_bytes: u64,
+    /// Lease after which an inactive multipart upload may be reclaimed.
+    pub multipart_lease: std::time::Duration,
+    /// How often the multipart sweeper runs; `None` disables it.
+    pub multipart_sweep_interval: Option<std::time::Duration>,
+    /// Lifetime of a server-side listing continuation token.
+    pub list_token_ttl: std::time::Duration,
 }
 
 impl Limits {
@@ -257,11 +302,18 @@ impl Limits {
             max_concurrent_requests_per_principal: raw
                 .max_concurrent_requests_per_principal
                 .unwrap_or(0),
+            max_concurrent_requests_per_driver: raw.max_concurrent_requests_per_driver.unwrap_or(0),
             header_timeout: std::time::Duration::from_secs(raw.header_timeout_secs),
             body_idle_timeout: std::time::Duration::from_secs(raw.body_idle_timeout_secs),
             request_timeout: (raw.request_timeout_secs > 0)
                 .then(|| std::time::Duration::from_secs(raw.request_timeout_secs)),
             staging_quota_bytes: raw.staging_quota_bytes,
+            // A zero lease would reclaim an upload the instant it is created, so
+            // the floor is one second.
+            multipart_lease: std::time::Duration::from_secs(raw.multipart_lease_secs.max(1)),
+            multipart_sweep_interval: (raw.multipart_sweep_interval_secs > 0)
+                .then(|| std::time::Duration::from_secs(raw.multipart_sweep_interval_secs)),
+            list_token_ttl: std::time::Duration::from_secs(raw.list_token_ttl_secs.max(1)),
         }
     }
 }
@@ -634,6 +686,7 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// A resolver that only knows `env:ALLINS3_TEST_SECRET`; tests never mutate
     /// the process environment, which is unsynchronised with other test threads.
@@ -736,6 +789,45 @@ prefix = ""
         );
         let disabled = AppConfig::from_toml(&toml, &resolver()).expect("valid");
         assert_eq!(disabled.limits.max_concurrent_requests_per_principal, 0);
+    }
+
+    #[test]
+    fn per_driver_limit_defaults_and_can_be_disabled() {
+        let default = AppConfig::from_toml(&base_toml(), &resolver()).expect("valid");
+        assert!(default.limits.max_concurrent_requests_per_driver > 0);
+
+        let toml = format!(
+            "{}\n[limits]\nmax_concurrent_requests_per_driver = 0\n",
+            base_toml()
+        );
+        let disabled = AppConfig::from_toml(&toml, &resolver()).expect("valid");
+        assert_eq!(disabled.limits.max_concurrent_requests_per_driver, 0);
+    }
+
+    #[test]
+    fn multipart_sweeper_defaults_on_and_can_be_disabled() {
+        let default = AppConfig::from_toml(&base_toml(), &resolver()).expect("valid");
+        assert!(default.limits.multipart_lease >= Duration::from_secs(1));
+        assert!(default.limits.multipart_sweep_interval.is_some());
+
+        let toml = format!(
+            "{}\n[limits]\nmultipart_sweep_interval_secs = 0\n",
+            base_toml()
+        );
+        let disabled = AppConfig::from_toml(&toml, &resolver()).expect("valid");
+        assert!(disabled.limits.multipart_sweep_interval.is_none());
+    }
+
+    #[test]
+    fn the_continuation_token_lifetime_is_configurable() {
+        // Spec §4.3 requires the token expiry to be a deployment policy rather
+        // than a constant.
+        let default = AppConfig::from_toml(&base_toml(), &resolver()).expect("valid");
+        assert!(default.limits.list_token_ttl >= Duration::from_secs(1));
+
+        let toml = format!("{}\n[limits]\nlist_token_ttl_secs = 5\n", base_toml());
+        let configured = AppConfig::from_toml(&toml, &resolver()).expect("valid");
+        assert_eq!(configured.limits.list_token_ttl, Duration::from_secs(5));
     }
 
     #[test]

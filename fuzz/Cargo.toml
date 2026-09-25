@@ -1,0 +1,45 @@
+[package]
+name = "allins3-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Detached from the workspace: fuzz targets need libFuzzer's own build flags
+# (`--cfg fuzzing`, sanitizer coverage), which the normal build must not carry.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "=1.12.1"
+hyper = { version = "=1.11.1", features = ["http1", "server"] }
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros"] }
+
+[dependencies.allins3]
+path = ".."
+features = ["testing"]
+
+# One target per request surface `P5-05` names: XML bodies, part manifests and
+# signature inputs.
+[[bin]]
+name = "xml-manifest"
+path = "fuzz_targets/xml_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "part-manifest"
+path = "fuzz_targets/part_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signature-inputs"
+path = "fuzz_targets/signature_inputs.rs"
+test = false
+doc = false
+bench = false

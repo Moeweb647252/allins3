@@ -5,40 +5,43 @@
 //! signature. It is the only layer that decides *which* driver capability to
 //! use and how to fall back.
 
+mod admission;
 pub mod error;
+mod handles;
 pub mod multipart;
+mod tokens;
+
+pub(crate) use admission::OperationSlot;
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::Arc;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 
 use crate::auth::AccessPolicy;
 use crate::catalog::{BucketBinding, BucketCatalog};
+use crate::domain::ChecksumType;
 use crate::domain::{
     BeginWrite, Checksum, ChecksumAlgorithm, CommitAttributes, ContentProperties, DeleteRequest,
     DeleteResult, DriverContext, DriverError, DriverErrorKind, EntityTag, ListCursor, ListRequest,
     ObjectKey, ObjectMetadata, Preconditions, RangeResolution, RangeSpec, ResolvedRange,
     UserMetadata, WriteId,
 };
-use crate::domain::{ChecksumType, CommitState};
 use crate::driver::{
-    CommitRecovery, CopyRequest, CopySource, MetadataDirective, NamespaceHandle, ObjectByteStream,
-    ReadRequest, StorageDriver, validate_profile,
+    CopyRequest, CopySource, MetadataDirective, ObjectByteStream, ReadRequest, StorageDriver,
 };
 use crate::integrity::StreamingDigest;
 
+use admission::Admission;
 pub use error::ServiceError;
+use handles::NamespaceHandles;
+use tokens::{TokenRecord, TokenStore};
 
 /// How many times the read flow re-runs `stat → conditions → range → read`
 /// after a revision becomes unreadable.
 const MAX_READ_ATTEMPTS: u32 = 3;
-
-/// Server-side continuation-token lifetime.
-const TOKEN_TTL: Duration = Duration::from_secs(3600);
 
 /// HTTP-style read conditions.
 #[derive(Debug, Clone, Default)]
@@ -234,108 +237,32 @@ pub struct CopyParams {
 
 /// A batch delete item.
 #[derive(Debug, Clone)]
-pub struct DeleteItem {
+pub(crate) struct DeleteItem {
     /// The key to delete.
     pub key: ObjectKey,
 }
 
 /// One result of a batch delete.
+///
+/// A key that was already absent is reported as deleted, so there is no
+/// "removed or not" field here: S3 answers `Deleted` for a no-op delete and
+/// reserves the error slot for a real failure.
 #[derive(Debug, Clone)]
-pub struct DeleteItemResult {
+pub(crate) struct DeleteItemResult {
     /// The key.
     pub key: ObjectKey,
-    /// Whether it was removed.
-    pub deleted: bool,
     /// The error code, when the item failed.
     pub error: Option<(String, String)>,
 }
 
-/// A continuation-token record.
-struct TokenRecord {
-    bucket: String,
-    prefix: Option<String>,
-    delimiter: Option<char>,
-    encoding: Option<String>,
-    cursor: Option<String>,
-    principal: Option<String>,
-    generation: u64,
-    expires: Instant,
-}
-
-/// Server-side continuation-token store.
-///
-/// Tokens are opaque random handles, so they cannot be forged or used to leak
-/// backend cursors. Each token is bound to bucket, binding generation, prefix,
-/// delimiter, encoding and authorization scope, and every use re-authorizes.
-#[derive(Default)]
-struct TokenStore {
-    records: Mutex<HashMap<String, TokenRecord>>,
-}
-
-impl TokenStore {
-    fn issue(&self, record: TokenRecord) -> String {
-        let mut counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let id = format!(
-            "tok-{:016x}-{}",
-            {
-                counter = counter.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
-                counter
-            },
-            WriteId::generate()
-        );
-        let mut guard = self.records.lock().expect("token store poisoned");
-        guard.retain(|_, r| r.expires > Instant::now());
-        guard.insert(id.clone(), record);
-        id
-    }
-
-    fn resolve(&self, token: &str) -> Option<ResolvedToken> {
-        let mut guard = self.records.lock().expect("token store poisoned");
-        let record = guard.get(token)?;
-        if record.expires <= Instant::now() {
-            guard.remove(token);
-            return None;
-        }
-        Some(ResolvedToken {
-            bucket: record.bucket.clone(),
-            prefix: record.prefix.clone(),
-            delimiter: record.delimiter,
-            encoding: record.encoding.clone(),
-            cursor: record.cursor.clone(),
-            principal: record.principal.clone(),
-            generation: record.generation,
-        })
-    }
-}
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// A validated continuation token.
-pub struct ResolvedToken {
-    /// Bound bucket.
-    pub bucket: String,
-    /// Bound prefix.
-    pub prefix: Option<String>,
-    /// Bound delimiter.
-    pub delimiter: Option<char>,
-    /// Bound encoding type.
-    pub encoding: Option<String>,
-    /// The driver cursor to resume from.
-    pub cursor: Option<String>,
-    /// The principal that issued it.
-    pub principal: Option<String>,
-    /// The binding generation it was issued under.
-    pub generation: u64,
-}
-
 struct ServiceInner {
-    drivers: HashMap<String, std::sync::Arc<dyn StorageDriver>>,
+    handles: NamespaceHandles,
     catalog: BucketCatalog,
     limits: crate::config::Limits,
-    namespace_cache: Mutex<HashMap<String, std::sync::Arc<NamespaceHandle>>>,
     tokens: TokenStore,
+    admission: Admission,
     access: AccessPolicy,
-    multipart: Mutex<multipart::MultipartState>,
+    multipart: multipart::Multipart,
 }
 
 /// The object service.
@@ -353,31 +280,33 @@ impl ObjectService {
         access: AccessPolicy,
     ) -> Self {
         let staging_quota = limits.staging_quota_bytes;
+        let token_ttl = limits.list_token_ttl;
+        let admission = Admission::new(
+            limits.max_concurrent_requests,
+            limits.max_concurrent_requests_per_driver,
+        );
         Self {
             inner: std::sync::Arc::new(ServiceInner {
-                drivers,
+                handles: NamespaceHandles::new(drivers),
                 catalog,
                 limits,
-                namespace_cache: Mutex::new(HashMap::new()),
-                tokens: TokenStore::default(),
+                // The token lifetime is a deployment policy owned by the token
+                // store, not recomputed at each issue site (spec §4.3).
+                tokens: TokenStore::new(token_ttl),
+                admission,
                 access,
-                multipart: Mutex::new(multipart::MultipartState::with_quota(staging_quota)),
+                multipart: multipart::Multipart::new(staging_quota),
             }),
         }
     }
 
-    /// The catalog.
-    pub fn catalog(&self) -> &BucketCatalog {
-        &self.inner.catalog
-    }
-
     /// The limits.
-    pub fn limits(&self) -> &crate::config::Limits {
+    pub(crate) fn limits(&self) -> &crate::config::Limits {
         &self.inner.limits
     }
 
     /// Authorizes an action against the configured policy.
-    pub fn authorize(
+    pub(crate) fn authorize(
         &self,
         principal: Option<&str>,
         action: crate::auth::Action,
@@ -388,15 +317,15 @@ impl ObjectService {
     }
 
     /// Opens and capability-checks every configured bucket at startup.
-    pub async fn warmup(&self, ctx: &DriverContext) -> Result<(), ServiceError> {
+    pub(crate) async fn warmup(&self, ctx: &DriverContext) -> Result<(), ServiceError> {
         for binding in self.inner.catalog.iter() {
-            self.namespace_for(binding, ctx).await?;
+            self.inner.handles.get(binding, ctx).await?;
         }
         Ok(())
     }
 
     /// Looks up a binding, mapping an absent bucket to `NoSuchBucket`.
-    pub fn binding(&self, bucket: &str) -> Result<BucketBinding, ServiceError> {
+    pub(crate) fn binding(&self, bucket: &str) -> Result<BucketBinding, ServiceError> {
         self.inner
             .catalog
             .get(bucket)
@@ -404,50 +333,44 @@ impl ObjectService {
             .ok_or(ServiceError::NoSuchBucket)
     }
 
-    async fn namespace_for(
+    /// Resolves a binding together with the slots the operation needs
+    /// (spec §9.3): one in the server-wide budget, one in its driver's.
+    ///
+    /// Every operation that reaches a driver, or that consumes a request body
+    /// (`PutObject`, `UploadPart`, `CompleteMultipartUpload`), resolves its
+    /// binding through this call, so the server never holds more than
+    /// `max_concurrent_requests` operations at once and one driver instance
+    /// never serves more than `max_concurrent_requests_per_driver` of them,
+    /// however many buckets it backs. Saturation is answered with `SlowDown`
+    /// rather than queued, keeping each queue bounded at zero, and a graceful
+    /// drain waits for every slot to come back rather than exiting under an
+    /// operation. A multi-step operation (`CopyObject`, `UploadPartCopy`)
+    /// admits once here at its own entry and performs its steps through the
+    /// non-admitting `*_in` helpers, so no operation holds two shares of the
+    /// same scope: a second claim on one driver instance would be refused by
+    /// the operation's own limit — at a limit of one, forever. Operations that
+    /// only consult the catalog (`HeadBucket`, `ListBuckets`, creating, listing
+    /// or aborting an upload) use [`ObjectService::binding`] and take no slot.
+    pub(crate) fn binding_slot(
+        &self,
+        bucket: &str,
+    ) -> Result<(BucketBinding, OperationSlot), ServiceError> {
+        let binding = self.binding(bucket)?;
+        let slot = self.operation_slot(&binding)?;
+        Ok((binding, slot))
+    }
+
+    /// Takes an operation's slots for an already resolved binding.
+    pub(crate) fn operation_slot(
         &self,
         binding: &BucketBinding,
-        ctx: &DriverContext,
-    ) -> Result<std::sync::Arc<NamespaceHandle>, ServiceError> {
-        let cache_key = format!("{}#{}", binding.bucket, binding.generation);
-        if let Some(handle) = self
-            .inner
-            .namespace_cache
-            .lock()
-            .expect("namespace cache poisoned")
-            .get(&cache_key)
-            .cloned()
-        {
-            return Ok(handle);
-        }
+    ) -> Result<OperationSlot, ServiceError> {
+        self.inner.admission.slot(binding)
+    }
 
-        let driver = self
-            .inner
-            .drivers
-            .get(binding.driver.as_str())
-            .cloned()
-            .ok_or_else(|| {
-                ServiceError::Internal(format!("driver `{}` is not registered", binding.driver))
-            })?;
-        let handle = driver
-            .open_namespace(ctx, &binding.namespace)
-            .await
-            .map_err(|e| ServiceError::from_driver(&e, false))?;
-
-        validate_profile(binding.profile, &handle.capabilities).map_err(|e| {
-            ServiceError::Internal(format!(
-                "bucket `{}` capability mismatch: {e}",
-                binding.bucket
-            ))
-        })?;
-
-        let handle = std::sync::Arc::new(handle);
-        self.inner
-            .namespace_cache
-            .lock()
-            .expect("namespace cache poisoned")
-            .insert(cache_key, handle.clone());
-        Ok(handle)
+    /// Waits until no operation is in flight (used by graceful shutdown).
+    pub async fn drain(&self) {
+        self.inner.admission.drain().await;
     }
 
     fn require_writable(&self, binding: &BucketBinding) -> Result<(), ServiceError> {
@@ -460,12 +383,12 @@ impl ObjectService {
     // --- Bucket operations -------------------------------------------------
 
     /// `HeadBucket`.
-    pub fn head_bucket(&self, bucket: &str) -> Result<BucketBinding, ServiceError> {
+    pub(crate) fn head_bucket(&self, bucket: &str) -> Result<BucketBinding, ServiceError> {
         self.binding(bucket)
     }
 
     /// `ListBuckets`, filtered by the caller's read permission.
-    pub fn list_buckets(&self, principal: Option<&str>) -> Vec<BucketBinding> {
+    pub(crate) fn list_buckets(&self, principal: Option<&str>) -> Vec<BucketBinding> {
         self.inner
             .catalog
             .iter()
@@ -497,8 +420,8 @@ impl ObjectService {
         conditions: &ReadConditions,
         range: Option<RangeSpec>,
     ) -> Result<HeadResult, ServiceError> {
-        let binding = self.binding(bucket)?;
-        let handle = self.namespace_for(&binding, ctx).await?;
+        let (binding, _slot) = self.binding_slot(bucket)?;
+        let handle = self.inner.handles.get(&binding, ctx).await?;
 
         for _ in 0..MAX_READ_ATTEMPTS {
             let meta = match handle.read.stat(ctx, key).await {
@@ -539,8 +462,25 @@ impl ObjectService {
         conditions: &ReadConditions,
         range: Option<RangeSpec>,
     ) -> Result<GetResult, ServiceError> {
-        let binding = self.binding(bucket)?;
-        let handle = self.namespace_for(&binding, ctx).await?;
+        let (binding, _slot) = self.binding_slot(bucket)?;
+        self.get_object_in(&binding, ctx, key, conditions, range)
+            .await
+    }
+
+    /// `GetObject` against an already resolved binding, without admitting.
+    ///
+    /// The internal steps of a multi-step operation (a copy) use this: the
+    /// operation holds one slot for its whole span, and a second claim on the
+    /// same scope would stall it at a limit of one.
+    async fn get_object_in(
+        &self,
+        binding: &BucketBinding,
+        ctx: &DriverContext,
+        key: &ObjectKey,
+        conditions: &ReadConditions,
+        range: Option<RangeSpec>,
+    ) -> Result<GetResult, ServiceError> {
+        let handle = self.inner.handles.get(binding, ctx).await?;
 
         for _ in 0..MAX_READ_ATTEMPTS {
             let meta = match handle.read.stat(ctx, key).await {
@@ -602,12 +542,27 @@ impl ObjectService {
         ctx: &DriverContext,
         bucket: &str,
         key: &ObjectKey,
+        body: ObjectByteStream,
+        params: PutParams,
+    ) -> Result<ObjectMetadata, ServiceError> {
+        let (binding, _slot) = self.binding_slot(bucket)?;
+        self.put_object_in(&binding, ctx, key, body, params).await
+    }
+
+    /// `PutObject` against an already resolved binding, without admitting.
+    ///
+    /// See [`ObjectService::get_object_in`]: the admitting happens once, at the
+    /// entry point of the operation that owns the whole span.
+    async fn put_object_in(
+        &self,
+        binding: &BucketBinding,
+        ctx: &DriverContext,
+        key: &ObjectKey,
         mut body: ObjectByteStream,
         params: PutParams,
     ) -> Result<ObjectMetadata, ServiceError> {
-        let binding = self.binding(bucket)?;
-        self.require_writable(&binding)?;
-        let handle = self.namespace_for(&binding, ctx).await?;
+        self.require_writable(binding)?;
+        let handle = self.inner.handles.get(binding, ctx).await?;
         let write = handle
             .write
             .as_ref()
@@ -781,16 +736,16 @@ impl ObjectService {
     }
 
     /// `DeleteObject`.
-    pub async fn delete_object(
+    pub(crate) async fn delete_object(
         &self,
         ctx: &DriverContext,
         bucket: &str,
         key: &ObjectKey,
         preconditions: Preconditions,
     ) -> Result<DeleteResult, ServiceError> {
-        let binding = self.binding(bucket)?;
+        let (binding, _slot) = self.binding_slot(bucket)?;
         self.require_writable(&binding)?;
-        let handle = self.namespace_for(&binding, ctx).await?;
+        let handle = self.inner.handles.get(&binding, ctx).await?;
         let write = handle
             .write
             .as_ref()
@@ -811,20 +766,20 @@ impl ObjectService {
     ///
     /// Results are per item; the whole batch is never reported as a success if
     /// any item failed.
-    pub async fn delete_objects(
+    pub(crate) async fn delete_objects(
         &self,
         ctx: &DriverContext,
         bucket: &str,
         items: &[DeleteItem],
     ) -> Result<Vec<DeleteItemResult>, ServiceError> {
-        let binding = self.binding(bucket)?;
+        let (binding, _slot) = self.binding_slot(bucket)?;
         self.require_writable(&binding)?;
         if items.len() > 1000 {
             return Err(ServiceError::MalformedXml(
                 "DeleteObjects accepts at most 1000 keys per request".into(),
             ));
         }
-        let handle = self.namespace_for(&binding, ctx).await?;
+        let handle = self.inner.handles.get(&binding, ctx).await?;
         let write = handle
             .write
             .as_ref()
@@ -842,16 +797,16 @@ impl ObjectService {
                 )
                 .await
             {
-                Ok(result) => results.push(DeleteItemResult {
+                // A delete that removed nothing is still a success: S3 answers
+                // `Deleted` for a key that was already absent.
+                Ok(_) => results.push(DeleteItemResult {
                     key: item.key.clone(),
-                    deleted: result.deleted,
                     error: None,
                 }),
                 Err(e) => {
                     let service = ServiceError::from_driver(&e, true);
                     results.push(DeleteItemResult {
                         key: item.key.clone(),
-                        deleted: false,
                         error: Some((service.code().to_string(), service.message())),
                     });
                 }
@@ -876,7 +831,7 @@ impl ObjectService {
         encoding: Option<String>,
         max_keys: Option<u32>,
     ) -> Result<ListV2Result, ServiceError> {
-        let binding = self.binding(bucket)?;
+        let (binding, _slot) = self.binding_slot(bucket)?;
 
         // Constrain the requested prefix by the principal's list scope.
         let policy_prefix = self
@@ -926,7 +881,7 @@ impl ObjectService {
             .unwrap_or(self.inner.limits.max_list_keys)
             .clamp(1, self.inner.limits.max_list_keys);
 
-        let handle = self.namespace_for(&binding, ctx).await?;
+        let handle = self.inner.handles.get(&binding, ctx).await?;
         let mut request =
             ListRequest::new(NonZeroU32::new(page_limit).expect("page limit is non-zero"))
                 .with_prefix(token_prefix.clone())
@@ -960,7 +915,6 @@ impl ObjectService {
                     cursor: Some(cursor.as_str().to_string()),
                     principal: principal.map(str::to_string),
                     generation: binding.generation,
-                    expires: Instant::now() + TOKEN_TTL,
                 })
             })
         } else {
@@ -990,14 +944,19 @@ impl ObjectService {
         destination_bucket: &str,
         params: CopyParams,
     ) -> Result<ObjectMetadata, ServiceError> {
-        let binding = self.binding(destination_bucket)?;
+        // One slot admits the whole copy. Its source read and its destination
+        // write must not each claim one of their own: a copy that reads and
+        // writes through one driver holding two shares of it would be rejected
+        // by its own limit — at a limit of one, forever.
+        let (binding, _slot) = self.binding_slot(destination_bucket)?;
         self.require_writable(&binding)?;
 
         // Stable read of the source at a checked revision.
+        let source_binding = self.binding(&params.source_bucket)?;
         let source = self
-            .get_object(
+            .get_object_in(
+                &source_binding,
                 ctx,
-                &params.source_bucket,
                 &params.source_key,
                 &params.source_conditions,
                 None,
@@ -1014,9 +973,8 @@ impl ObjectService {
 
         // Native copy is only valid for a same-namespace copy.
         if params.source_bucket == destination_bucket {
-            let handle = self.namespace_for(&binding, ctx).await?;
+            let handle = self.inner.handles.get(&binding, ctx).await?;
             if let Some(native) = &handle.native_copy {
-                let source_binding = self.binding(&params.source_bucket)?;
                 let request = CopyRequest {
                     source: CopySource {
                         namespace: source_binding.namespace.clone(),
@@ -1051,41 +1009,11 @@ impl ObjectService {
             preconditions: params.preconditions.clone(),
         };
 
-        self.put_object(
-            ctx,
-            destination_bucket,
-            &params.destination_key,
-            source.stream,
-            put,
-        )
-        .await
+        self.put_object_in(&binding, ctx, &params.destination_key, source.stream, put)
+            .await
     }
 
     // --- Recovery ----------------------------------------------------------
-
-    /// Queries the commit outcome of a write attempt, when the bucket's driver
-    /// supports recovery.
-    pub async fn query_commit(
-        &self,
-        ctx: &DriverContext,
-        bucket: &str,
-        write_id: &WriteId,
-    ) -> Result<CommitState, ServiceError> {
-        let binding = self.binding(bucket)?;
-        let handle = self.namespace_for(&binding, ctx).await?;
-        let recovery: &dyn CommitRecovery = handle.recovery.as_deref().ok_or_else(|| {
-            ServiceError::NotImplemented("commit recovery is not supported".into())
-        })?;
-        recovery
-            .query(ctx, write_id)
-            .await
-            .map_err(|e| ServiceError::from_driver(&e, true))
-    }
-
-    /// The backing driver for a bucket, used for health reporting.
-    pub fn driver_for(&self, binding: &BucketBinding) -> Option<std::sync::Arc<dyn StorageDriver>> {
-        self.inner.drivers.get(binding.driver.as_str()).cloned()
-    }
 }
 
 async fn next_chunk(stream: &mut ObjectByteStream) -> Option<Result<Bytes, DriverError>> {
@@ -1096,6 +1024,7 @@ async fn next_chunk(stream: &mut ObjectByteStream) -> Option<Result<Bytes, Drive
 mod tests {
     use super::*;
     use crate::domain::{ObjectRevision, RequestId};
+    use std::time::Duration;
 
     fn meta(etag: &str, last_modified_secs: u64) -> ObjectMetadata {
         ObjectMetadata {
@@ -1169,42 +1098,6 @@ mod tests {
             cond.evaluate(&meta("abc", 100)),
             ConditionOutcome::PreconditionFailed
         );
-    }
-
-    #[test]
-    fn token_store_roundtrip_and_binding() {
-        let store = TokenStore::default();
-        let token = store.issue(TokenRecord {
-            bucket: "b".into(),
-            prefix: Some("p/".into()),
-            delimiter: Some('/'),
-            encoding: None,
-            cursor: Some("i:5".into()),
-            principal: Some("alice".into()),
-            generation: 7,
-            expires: Instant::now() + TOKEN_TTL,
-        });
-        let resolved = store.resolve(&token).expect("token resolves");
-        assert_eq!(resolved.bucket, "b");
-        assert_eq!(resolved.generation, 7);
-        assert_eq!(resolved.cursor.as_deref(), Some("i:5"));
-        assert!(store.resolve("tok-forged").is_none());
-    }
-
-    #[test]
-    fn expired_token_is_rejected() {
-        let store = TokenStore::default();
-        let token = store.issue(TokenRecord {
-            bucket: "b".into(),
-            prefix: None,
-            delimiter: None,
-            encoding: None,
-            cursor: None,
-            principal: None,
-            generation: 1,
-            expires: Instant::now(),
-        });
-        assert!(store.resolve(&token).is_none());
     }
 
     #[test]

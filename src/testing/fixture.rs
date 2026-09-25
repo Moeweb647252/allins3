@@ -43,10 +43,14 @@ pub fn default_limits() -> Limits {
         max_list_keys: 1000,
         max_concurrent_requests: 64,
         max_concurrent_requests_per_principal: 16,
+        max_concurrent_requests_per_driver: 64,
         header_timeout: Duration::from_secs(30),
         body_idle_timeout: Duration::from_secs(60),
         request_timeout: None,
         staging_quota_bytes: 256 * 1024 * 1024,
+        multipart_lease: Duration::from_secs(3600),
+        multipart_sweep_interval: None,
+        list_token_ttl: Duration::from_secs(3600),
     }
 }
 

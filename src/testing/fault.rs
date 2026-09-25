@@ -50,6 +50,12 @@ pub struct FaultPlan {
     pub fail_list: bool,
     /// `begin_write` fails.
     pub fail_begin_write: bool,
+    /// The first `begin_write` fails and later ones succeed, so a caller that
+    /// could not open a staged write once can be observed to retry.
+    pub fail_first_begin_write: bool,
+    /// The first `write_chunk` fails and later ones succeed, so a staged write
+    /// that fails after it was opened can be observed to abort and be retried.
+    pub fail_first_write_chunk: bool,
     /// `delete` fails.
     pub fail_delete: bool,
     /// Commit misbehaviour.
@@ -124,6 +130,8 @@ impl DriverFactory for FaultDriverFactory {
             inner,
             plan: self.plan,
             fenced_once: Arc::new(AtomicBool::new(false)),
+            begin_write_once: Arc::new(AtomicBool::new(false)),
+            write_chunk_once: Arc::new(AtomicBool::new(false)),
         }))
     }
 }
@@ -133,6 +141,10 @@ struct FaultDriver {
     plan: FaultPlan,
     /// Whether the one-shot fence has already been consumed.
     fenced_once: Arc<AtomicBool>,
+    /// Whether the one-shot `begin_write` fault has already been consumed.
+    begin_write_once: Arc<AtomicBool>,
+    /// Whether the one-shot `write_chunk` fault has already been consumed.
+    write_chunk_once: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -164,6 +176,8 @@ impl StorageDriver for FaultDriver {
                 inner: w,
                 plan: self.plan,
                 fenced_once: self.fenced_once.clone(),
+                begin_write_once: self.begin_write_once.clone(),
+                write_chunk_once: self.write_chunk_once.clone(),
             }) as Arc<dyn WriteNamespace>
         });
         // Recovery is observed unwrapped so tests see the real state, except
@@ -224,6 +238,8 @@ struct FaultWrite {
     inner: Arc<dyn WriteNamespace>,
     plan: FaultPlan,
     fenced_once: Arc<AtomicBool>,
+    begin_write_once: Arc<AtomicBool>,
+    write_chunk_once: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -233,7 +249,10 @@ impl WriteNamespace for FaultWrite {
         ctx: &DriverContext,
         req: BeginWrite,
     ) -> Result<Box<dyn StagedWrite>, DriverError> {
-        if self.plan.fail_begin_write {
+        if self.plan.fail_begin_write
+            || (self.plan.fail_first_begin_write
+                && !self.begin_write_once.swap(true, Ordering::SeqCst))
+        {
             return Err(injected("begin_write"));
         }
         let inner = self.inner.begin_write(ctx, req).await?;
@@ -241,6 +260,7 @@ impl WriteNamespace for FaultWrite {
             inner,
             plan: self.plan,
             fenced_once: self.fenced_once.clone(),
+            write_chunk_once: self.write_chunk_once.clone(),
         }))
     }
 
@@ -260,11 +280,15 @@ struct FaultStagedWrite {
     inner: Box<dyn StagedWrite>,
     plan: FaultPlan,
     fenced_once: Arc<AtomicBool>,
+    write_chunk_once: Arc<AtomicBool>,
 }
 
 #[async_trait]
 impl StagedWrite for FaultStagedWrite {
     async fn write_chunk(&mut self, ctx: &DriverContext, bytes: Bytes) -> Result<(), DriverError> {
+        if self.plan.fail_first_write_chunk && !self.write_chunk_once.swap(true, Ordering::SeqCst) {
+            return Err(injected("write_chunk"));
+        }
         self.inner.write_chunk(ctx, bytes).await
     }
 
@@ -277,6 +301,7 @@ impl StagedWrite for FaultStagedWrite {
             inner,
             plan,
             fenced_once,
+            ..
         } = *self;
         match plan.commit {
             CommitFault::None => inner.commit(ctx, attrs).await,

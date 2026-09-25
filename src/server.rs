@@ -14,17 +14,19 @@ use std::time::Duration;
 use bytes::Bytes;
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
-use s3s::HttpResponse;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 
 use crate::config::{Addressing, AppConfig};
 use crate::domain::{DriverContext, DriverInstanceId, RequestId};
 use crate::driver::{DriverFactory, DriverKind, DriverRegistry, StorageDriver};
-use crate::protocol::s3::{PrincipalLimiter, S3Handler, build_service};
+use crate::protocol::s3::{
+    HttpError, HttpResponse, PrincipalLimiter, S3Body, S3Error, S3ErrorCode, S3Handler, S3Service,
+    adapter_config, build_service,
+};
 use crate::service::ObjectService;
+use crate::timeouts::IdleTimeoutBody;
 
 /// Builds the driver registry with the kinds this build supports.
 pub fn build_registry(config: &AppConfig) -> Result<DriverRegistry, String> {
@@ -96,16 +98,21 @@ pub async fn run(config: AppConfig) -> Result<(), String> {
         .map_err(|e| format!("startup capability check failed: {e}"))?;
 
     let ready = Arc::new(AtomicBool::new(true));
-    let s3_config = s3s_config(&config);
+    let s3_config = adapter_config(&config.limits);
     let limiter = PrincipalLimiter::new(config.limits.max_concurrent_requests_per_principal);
     let handler = S3Handler::new(service.clone(), credentials.clone(), limiter);
     let s3_service = build_service(handler, credentials.clone(), policy, s3_config);
 
+    // Each bound is resolved into `None` when disabled, so the enforcement
+    // points can treat "no bound" as a plain absence rather than a sentinel.
     let http = HttpService {
         s3: s3_service,
         ready: ready.clone(),
         health_endpoints: config.health_endpoints,
         metrics: Arc::new(Metrics::new()),
+        body_idle_timeout: (config.limits.body_idle_timeout > Duration::ZERO)
+            .then_some(config.limits.body_idle_timeout),
+        request_timeout: config.limits.request_timeout,
     };
 
     let listener = TcpListener::bind(&config.listen)
@@ -113,7 +120,37 @@ pub async fn run(config: AppConfig) -> Result<(), String> {
         .map_err(|e| format!("failed to bind {}: {e}", config.listen))?;
     log(&format!("listening on http://{}", config.listen));
 
-    let inflight = Arc::new(Semaphore::new(config.limits.max_concurrent_requests));
+    // The multipart staging sweeper: staged parts of an abandoned upload hold
+    // the staging quota forever unless something reclaims them, so the server
+    // owns the task, gives it a cancel path and joins it before exit (spec §10).
+    // Its lease is measured from the upload's last activity, so an upload that
+    // is still receiving parts is never reclaimed under a client.
+    let (sweep_stop, sweep_stopped) = tokio::sync::watch::channel(false);
+    let mut sweeper = config.limits.multipart_sweep_interval.map(|interval| {
+        let service = service.clone();
+        let lease = config.limits.multipart_lease;
+        tokio::spawn(async move {
+            service
+                .run_multipart_sweeper(
+                    lease,
+                    interval,
+                    async move {
+                        let mut stop = sweep_stopped;
+                        let _ = stop.changed().await;
+                    },
+                    |outcome| {
+                        if outcome.reclaimed_uploads > 0 {
+                            log(&format!(
+                                "multipart sweep reclaimed {} upload(s) and {} byte(s)",
+                                outcome.reclaimed_uploads, outcome.reclaimed_bytes
+                            ));
+                        }
+                    },
+                )
+                .await;
+        })
+    });
+
     let mut shutdown = Box::pin(shutdown_signal());
 
     loop {
@@ -127,21 +164,23 @@ pub async fn run(config: AppConfig) -> Result<(), String> {
                     }
                 };
                 let http = http.clone();
-                let inflight = inflight.clone();
-                let header_timeout = config.limits.header_timeout;
+                // The header timeout belongs to the header read, not to the
+                // whole connection: wrapping the connection future cut every
+                // transfer that outlived it (spec §9.3 forbids one short total
+                // timeout blocking all large objects).
+                let header_timeout = (config.limits.header_timeout.as_secs() > 0)
+                    .then_some(config.limits.header_timeout);
                 tokio::spawn(async move {
-                    let Ok(permit) = inflight.acquire_owned().await else {
-                        return;
-                    };
                     let io = TokioIo::new(stream);
-                    let builder = ConnBuilder::new(TokioExecutor::new());
+                    let mut builder = ConnBuilder::new(TokioExecutor::new());
+                    builder
+                        .http1()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(header_timeout);
                     let conn = builder.serve_connection_with_upgrades(io, http);
-                    match tokio::time::timeout(header_timeout, conn).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => log(&format!("connection error from {peer}: {e}")),
-                        Err(_) => log(&format!("connection from {peer} timed out")),
+                    if let Err(e) = conn.await {
+                        log(&format!("connection error from {peer}: {e}"));
                     }
-                    drop(permit);
                 });
             }
             _ = &mut shutdown => {
@@ -152,12 +191,16 @@ pub async fn run(config: AppConfig) -> Result<(), String> {
     }
 
     ready.store(false, Ordering::SeqCst);
-    let drain = async {
-        let _ = inflight
-            .acquire_many(config.limits.max_concurrent_requests as u32)
-            .await;
-    };
-    if tokio::time::timeout(Duration::from_secs(10), drain)
+    // Stop the sweeper before draining, so it cannot hold the multipart lock
+    // while in-flight requests finish.
+    let _ = sweep_stop.send(true);
+    if let Some(sweeper) = sweeper.take() {
+        let _ = sweeper.await;
+    }
+    // Server-wide admission lives in the service (spec §9.3), so waiting for
+    // every one of its slots is the same "no operation is still running"
+    // signal the listener semaphore used to provide.
+    if tokio::time::timeout(Duration::from_secs(10), service.drain())
         .await
         .is_err()
     {
@@ -167,21 +210,43 @@ pub async fn run(config: AppConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn s3s_config(config: &AppConfig) -> s3s::config::S3Config {
-    let mut s3_config = s3s::config::S3Config::default();
-    // SigV4 only (spec §6.1); the candidate defaults to off, assert it anyway.
-    s3_config.enable_sig_v2 = false;
-    // Preserve significant key bytes (`a//b` != `a/b`).
-    s3_config.normalize_forward_slash_path = false;
-    // Only accept the `s3` service scope.
-    s3_config.sig_v4_allowed_services = vec!["s3".to_string()];
-    s3_config.put_object_max_size = Some(config.limits.max_single_write_size);
-    s3_config.xml_max_body_size = config.limits.max_xml_bytes;
-    s3_config
-}
-
+/// Resolves when the process is asked to stop: `SIGINT` (Ctrl-C) or `SIGTERM`.
+///
+/// `SIGTERM` is the signal a process manager actually sends (systemd, a
+/// container runtime, launchd). `ctrl_c` alone handles only `SIGINT`, so under
+/// `SIGTERM` the kernel's default disposition killed the process with in-flight
+/// work still running — the ordered drain spec §7.2 requires was never reached,
+/// which is what the plan's P5-03 means by 真实进程信号.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut interrupt = match signal(SignalKind::interrupt()) {
+            Ok(stream) => stream,
+            Err(error) => {
+                log(&format!("cannot register SIGINT handler: {error}"));
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(error) => {
+                log(&format!("cannot register SIGTERM handler: {error}"));
+                let _ = interrupt.recv().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn log(message: &str) {
@@ -246,10 +311,14 @@ impl Drop for InflightGuard {
 /// The top-level HTTP service: health endpoints plus the S3 service.
 #[derive(Clone)]
 struct HttpService {
-    s3: s3s::service::S3Service,
+    s3: S3Service,
     ready: Arc<AtomicBool>,
     health_endpoints: bool,
     metrics: Arc<Metrics>,
+    /// Body idle timeout, applied to every request body (spec §9.3).
+    body_idle_timeout: Option<Duration>,
+    /// Total request deadline, applied around the whole S3 call.
+    request_timeout: Option<Duration>,
 }
 
 impl hyper::service::Service<Request<Incoming>> for HttpService {
@@ -284,16 +353,43 @@ impl hyper::service::Service<Request<Incoming>> for HttpService {
         }
         let s3 = self.s3.clone();
         let metrics = self.metrics.clone();
+        let body_idle_timeout = self.body_idle_timeout;
+        let request_timeout = self.request_timeout;
         Box::pin(async move {
             metrics.requests.fetch_add(1, Ordering::Relaxed);
             metrics.inflight.fetch_add(1, Ordering::Relaxed);
             let guard = InflightGuard(metrics.clone());
-            let result =
-                <s3s::service::S3Service as hyper::service::Service<Request<Incoming>>>::call(
-                    &s3, req,
-                )
-                .await;
-            let response = result.unwrap_or_else(internal_error);
+            // The body idle bound wraps the body itself, so a client that stops
+            // sending is abandoned without ever putting a timer on a response
+            // being written to a slow reader (spec §9.3).
+            let (parts, body) = req.into_parts();
+            let idled = Arc::new(AtomicBool::new(false));
+            let request = Request::from_parts(
+                parts,
+                S3Body::http_body_unsync(IdleTimeoutBody::new(
+                    body,
+                    body_idle_timeout,
+                    idled.clone(),
+                )),
+            );
+            let call = s3.call(request);
+            // The total deadline is the one bound around the whole call. It is
+            // off unless configured, so by default it never cuts off a large
+            // object.
+            let result = match request_timeout {
+                Some(limit) => match tokio::time::timeout(limit, call).await {
+                    Ok(result) => result,
+                    Err(_) => Ok(request_timeout_response()),
+                },
+                None => call.await,
+            };
+            let mut response = result.unwrap_or_else(internal_error);
+            // A control body (XML) is read by the protocol library, which reports
+            // a body error as an internal error; the client's stall must still
+            // be a client error (spec §9.1).
+            if idled.load(Ordering::Relaxed) {
+                response = body_idle_response();
+            }
             match response.status().as_u16() {
                 status if status >= 500 => {
                     metrics.server_errors.fetch_add(1, Ordering::Relaxed);
@@ -310,19 +406,45 @@ impl hyper::service::Service<Request<Incoming>> for HttpService {
 }
 
 fn text_response(status: StatusCode, body: &'static str) -> HttpResponse {
-    let mut response = Response::new(s3s::Body::from(Bytes::from_static(body.as_bytes())));
+    let mut response = Response::new(S3Body::from(Bytes::from_static(body.as_bytes())));
     *response.status_mut() = status;
     response
 }
 
 fn owned_text_response(status: StatusCode, body: String) -> HttpResponse {
-    let mut response = Response::new(s3s::Body::from(Bytes::from(body)));
+    let mut response = Response::new(S3Body::from(Bytes::from(body)));
     *response.status_mut() = status;
     response
 }
 
-fn internal_error(_e: s3s::HttpError) -> HttpResponse {
-    let mut response = Response::new(s3s::Body::from(Bytes::from_static(b"internal error")));
+/// The response to a request whose body went idle (spec §9.3).
+///
+/// The client's stall is not a server fault, so it is reported as
+/// `400 InvalidRequest` and counted as a client error.
+fn body_idle_response() -> HttpResponse {
+    S3Error::with_message(
+        S3ErrorCode::InvalidRequest,
+        "The request body was idle for longer than the configured body idle timeout",
+    )
+    .to_http_response()
+    .unwrap_or_else(|_| text_response(StatusCode::BAD_REQUEST, "request body idle"))
+}
+
+/// The response to a request that outlived the configured total deadline.
+///
+/// `RequestTimeout` is the S3 code for a request cut off while still in flight:
+/// a client-visible timeout, not a server fault.
+fn request_timeout_response() -> HttpResponse {
+    S3Error::with_message(
+        S3ErrorCode::RequestTimeout,
+        "The request took longer than the configured total deadline",
+    )
+    .to_http_response()
+    .unwrap_or_else(|_| text_response(StatusCode::REQUEST_TIMEOUT, "request timeout"))
+}
+
+fn internal_error(_e: HttpError) -> HttpResponse {
+    let mut response = Response::new(S3Body::from(Bytes::from_static(b"internal error")));
     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
     response
 }

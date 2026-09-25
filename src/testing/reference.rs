@@ -10,7 +10,6 @@
 //! (see `docs/implementation-spec.md` §9.2).
 
 use std::collections::{BTreeMap, HashMap};
-use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -24,9 +23,8 @@ use crate::domain::{
 };
 use crate::driver::{
     CommitRecovery, CopyRequest, DriverDescriptor, DriverFactory, DriverHealth, DriverKind,
-    FactoryConfig, MultipartNamespace, NamespaceCapabilities, NamespaceHandle, NativeCopy,
-    ReadNamespace, ReadRequest, ReadResult, SecretResolver, StagedWrite, StorageDriver,
-    WriteNamespace,
+    MultipartNamespace, NamespaceCapabilities, NamespaceHandle, NativeCopy, ReadNamespace,
+    ReadRequest, ReadResult, SecretResolver, StagedWrite, StorageDriver, WriteNamespace,
 };
 
 use super::support::one_shot_stream;
@@ -49,6 +47,37 @@ impl NamespaceState {
     pub(crate) fn next_revision(&mut self) -> ObjectRevision {
         self.next_revision += 1;
         ObjectRevision::new(format!("rev-{}", self.next_revision))
+    }
+}
+
+/// The get-or-create namespace table shared by the in-memory test drivers.
+///
+/// Only the plumbing lives here. Each driver keeps its own state type and its
+/// own state machine: [`super::second`] exists to be an *independent*
+/// implementation (`INV-01`), so its staging and commit logic is deliberately
+/// not shared with the reference driver — sharing it would defeat the point of
+/// having two implementations to compare.
+///
+/// A poisoned table is recovered rather than unwrapped, so one panicked request
+/// cannot turn every later request into a panic (spec §10).
+pub(crate) struct NamespaceTable<S> {
+    namespaces: Mutex<HashMap<NamespaceId, Arc<Mutex<S>>>>,
+}
+
+impl<S: Default> NamespaceTable<S> {
+    /// An empty table.
+    pub(crate) fn new() -> Self {
+        Self {
+            namespaces: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The state of `namespace`, created on first use.
+    pub(crate) fn get(&self, namespace: &NamespaceId) -> Arc<Mutex<S>> {
+        crate::sync::lock(&self.namespaces)
+            .entry(namespace.clone())
+            .or_default()
+            .clone()
     }
 }
 
@@ -105,7 +134,7 @@ impl DriverFactory for ReferenceDriverFactory {
                 version: Some(env!("CARGO_PKG_VERSION").into()),
             },
             capabilities: self.capabilities.clone(),
-            namespaces: Mutex::new(HashMap::new()),
+            namespaces: NamespaceTable::new(),
         }))
     }
 }
@@ -114,16 +143,7 @@ impl DriverFactory for ReferenceDriverFactory {
 pub struct ReferenceDriver {
     descriptor: DriverDescriptor,
     capabilities: NamespaceCapabilities,
-    namespaces: Mutex<HashMap<NamespaceId, Arc<Mutex<NamespaceState>>>>,
-}
-
-impl ReferenceDriver {
-    fn state(&self, namespace: &NamespaceId) -> Arc<Mutex<NamespaceState>> {
-        let mut map = self.namespaces.lock().expect("namespace map poisoned");
-        map.entry(namespace.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(NamespaceState::default())))
-            .clone()
-    }
+    namespaces: NamespaceTable<NamespaceState>,
 }
 
 #[async_trait]
@@ -145,7 +165,7 @@ impl StorageDriver for ReferenceDriver {
         _ctx: &DriverContext,
         namespace: &NamespaceId,
     ) -> Result<NamespaceHandle, DriverError> {
-        let state = self.state(namespace);
+        let state = self.namespaces.get(namespace);
         let caps = self.capabilities.clone();
 
         let read = Arc::new(RefRead {
@@ -642,7 +662,3 @@ impl CommitRecovery for RefRecovery {
             .unwrap_or(CommitState::Unknown))
     }
 }
-
-// Suppress unused warnings for items kept for API symmetry.
-#[allow(dead_code)]
-fn _unused(_: &FactoryConfig, _: NonZeroU32) {}

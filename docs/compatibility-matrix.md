@@ -15,11 +15,11 @@
 | --- | --- | --- | --- |
 | `ListBuckets` | 仅返回 principal 可见的配置 bucket | [ListBuckets](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListBuckets.html) | 已验证（SDK） |
 | `HeadBucket` / `GetBucketLocation` | 逻辑 catalog 存在性、region | [HeadBucket](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadBucket.html) | 已验证（SDK） |
-| `HeadObject` | 条件读、无响应体、Range 头规则、长度与 content-type | [HeadObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html) | 已验证（SDK） |
+| `HeadObject` | 条件读、无响应体、Range 头规则、长度与内容属性（含 `Expires`） | [HeadObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html) | 已验证（SDK） |
 | `GetObject` | 条件先于 Range；单区间；`206`/`416`；部分响应不携带整体 checksum | [GetObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html) | 已验证（SDK），含 `bytes=a-b`、`bytes=-n` 与越界 `416` |
-| `PutObject` | 流式校验、`Content-MD5`、checksum、原子发布、`If-None-Match: *` | [PutObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html) | 已验证（SDK），含条件写 `412` |
+| `PutObject` | 流式校验、`Content-MD5`、checksum、原子发布、`If-None-Match: *`、保留 `Expires` 等内容属性（不可解析的 `Expires` → `400 InvalidArgument`） | [PutObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html) | 已验证（SDK），含条件写 `412` |
 | `DeleteObject` / `DeleteObjects` | 不存在也成功；≤1000 key；逐项结果；quiet | [DeleteObjects](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html) | 已验证（SDK） |
-| `ListObjectsV2` | prefix/delimiter/分页/`start-after`/`encoding-type=url`/token 作用域 | [ListObjectsV2](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html) | 已验证（SDK），伪造 token 被拒 |
+| `ListObjectsV2` | prefix/delimiter/分页/`start-after`/`encoding-type=url`/token 作用域与可配置 TTL | [ListObjectsV2](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html) | 已验证（SDK），伪造 token 被拒 |
 | `CopyObject` | 源 revision 固定、`COPY`/`REPLACE`、原生/补齐等价 | [CopyObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html) | 已验证（SDK）；原生与流式补齐等价由契约检查 `copy_native_matches_emulation` 保证 |
 | 条件写/条件删 | 原子条件能力 | [条件写](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) | 已验证（SDK）`If-None-Match: *`；`If-Match: *` 明确 `501` |
 | `CreateMultipartUpload` | 不修改现有目标对象 | [CreateMultipartUpload](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateMultipartUpload.html) | 已验证（SDK） |
@@ -42,7 +42,7 @@
 | 错误 secret / 未知 access key | 已验证（SDK） | 已知 access key + 错误 secret → `403 SignatureDoesNotMatch`；未知 key → `403 InvalidAccessKeyId` |
 | 签名被篡改（预签名 `X-Amz-Signature` 或 key 被改） | 已验证（SDK） | `400/403`，不会命中其他对象 |
 | SigV2 / SigV4a | 未支持 | `enable_sig_v2 = false`；无 SigV4a（`s3s` 候选行为见 ADR-0007） |
-| `aws-chunked`（signed/unsigned）与 checksum trailer | 已验证（手工请求） | `s3s` 只解码 trailer，值必须由服务层核对：声明值与流式摘要不符（或声明未送达）返回 `400 BadDigest` 且不发布；`PutObject` 与 `UploadPart` 两条入口语义一致（part 的算法必须与 upload scheme 相同，否则读 body 之前即 `400 InvalidRequest`）。声明了 `x-amz-trailer` 却没有分块框架、或分块结束却没有 trailer 的请求同样被拒。CLI 与 botocore 1.42 对 HTTP endpoint 一律把 checksum 放入请求头（debug 显示 `'in': 'header'`，非可寻址 body 直接报 `io.UnsupportedOperation: seek`），因此该路径只能用 `scripts/e2e_streaming_trailer.py` 手工构造的 `STREAMING-UNSIGNED-PAYLOAD-TRAILER` 请求验证（21/21） |
+| `aws-chunked`（signed/unsigned）与 checksum trailer | 已验证（手工请求） | `s3s` 只解码 trailer，值必须由服务层核对：声明值与流式摘要不符（或声明未送达）返回 `400 BadDigest` 且不发布；`PutObject` 与 `UploadPart` 两条入口语义一致（part 的算法必须与 upload scheme 相同，否则读 body 之前即 `400 InvalidRequest`）。声明了 `x-amz-trailer` 却没有分块框架、或分块结束却没有 trailer 的请求同样被拒。CLI 与 botocore 1.42 对 HTTP endpoint 一律把 checksum 放入请求头（debug 显示 `'in': 'header'`，非可寻址 body 直接报 `io.UnsupportedOperation: seek`），因此该路径只能用 `scripts/e2e_streaming_trailer.py` 手工构造的请求验证（34/34）：`STREAMING-UNSIGNED-PAYLOAD-TRAILER` 的 trailer 校验，以及 `STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]` 的逐块签名与 trailer 块签名（单块/trailer 签名被改 → `403 SignatureDoesNotMatch`，不发布） |
 
 ## 3. Checksum 支持范围
 
@@ -73,20 +73,31 @@
 | 范围越界 | `416 InvalidRange` |
 | 已检查 revision 不可读（重读预算耗尽） | `503 ServiceUnavailable` |
 | 校验不符 / 长度不符 | `400 BadDigest` |
-| 超过配置或声明的对象大小 | `413 EntityTooLarge` |
+| 请求体摘要与声明不符（`x-amz-content-sha256`、声明长度） | `400 BadDigest` |
+| 请求体分块或 trailer 签名不符（`aws-chunked`） | `403 SignatureDoesNotMatch`（库内部细节仅作为 cause） |
+| 请求体分帧不合法（`aws-chunked`） | `400 InvalidArgument` |
+| 超过配置或声明的对象大小 | `400 EntityTooLarge` |
+| 请求体空闲超过 `body_idle_timeout_secs` | `400 InvalidRequest`（客户端停滞，不计为服务端故障） |
+| 整次请求超过 `request_timeout_secs` 总 deadline | `400 RequestTimeout` |
 | 暂存配额/限流/暂时不可用 | `503 SlowDown` |
+| 全局并发超限（服务器在途操作达上限，含 `UploadPart`） | `503 SlowDown` |
 | 每 principal 并发超限 | `503 SlowDown` |
+| 每 driver 并发超限（同一 driver 实例被占满） | `503 SlowDown` |
+| 排空期间到达的请求（已建立的连接；新连接不再被服务） | `503 SlowDown`（正文完整、连接保持） |
 | 能力未支持 | `501 NotImplemented` |
 | 参数/XML 不合法 | `400 InvalidArgument` / `InvalidRequest` / `MalformedXML` |
 | 未知提交结果/内部错误 | `500 InternalError` |
 
+表中的状态码是 S3 错误码经 `s3s` 的 `S3ErrorCode::status_code` 映射得到的，不由本仓库自行指定（`EntityTooLarge` → `400 Bad Request`，与 AWS 对单个 PUT 超限的返回一致）；因此超限一项是 `400 EntityTooLarge`，不是 `413`。实测见第 6 节。
+
 ## 5. 已知兼容差异（必须记录）
 
 - **virtual-hosted-style 未实现**：配置成 `addressing = "virtual"` 会在校验阶段失败（fail closed），不会静默按 path-style 提供。兼容矩阵因此标为未支持。
-- **列举中的 XML 1.0 不可表示字符**：未请求 `encoding-type=url` 时返回 `InvalidRequest`，不输出破损 XML、不改写 key（key 字节始终原样保留，含 `a//b`、`+`、空格）。
+- **列举中的 XML 1.0 不可表示字符**：未请求 `encoding-type=url` 时返回 `InvalidRequest`，不输出破损 XML、不改写 key（key 字节始终原样保留，含 `a//b`、`+`、空格）。覆盖 `ListObjectsV2`、`ListMultipartUploads`（两者都接受 `encoding-type=url` 并对其结果编码）与 `ListParts`（回显的 key 同样受此规则约束）；证据：`tests/property_protocol.rs::a_listing_that_xml_cannot_represent_asks_for_url_encoding` 与 `src/protocol/s3/mod.rs` 的 `xml_1_0_invalid_keys_require_url_encoding`。
 - **首期不支持**：Versioning、Object Lock、ACL、完整 IAM、STS、SSE（`ServerSideEncryption` 等参数返回 `501`）、生命周期、通知、复制、网站托管、Select、Directory Buckets、SigV2、SigV4a。
 - **multipart checksum**：已实现两种模式（见第 3 节）。`ETag` 仍按规范 §5.4 发布 `md5(parts)-N`（与 checksum 是两个独立字段），不随 checksum 模式变化。
 - **checksum trailer 无第三方客户端证据**：CLI/botocore 1.42 对 HTTP endpoint 使用请求头形式的 checksum，不发出 `aws-chunked` trailer，因此该路径只用本仓库手工构造的请求验证（第 2 节）；`mc`/`s3cmd`/`rclone` 未安装、未验证。
+- **排空只在 `SIGINT`/`SIGTERM` 下发生**：其他信号（如 `SIGKILL`）仍由内核直接终止，在途请求不会完成——这与 §7.2 的关闭顺序不矛盾（不可捕获的信号无法排空），但运维上必须以这两个信号停机。
 - **持久性**：`test-reference` / `test-vec` 为内存测试 driver，重启即丢；生产准入（P6）需要真实 driver，见 [driver 接入指南](driver-guide.md)。
 - 不支持的功能必须明确失败，不得忽略有业务含义的参数后返回成功（`INV-12`）。
 
@@ -99,13 +110,22 @@ cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings &&
 # 协议适配 spike（独立 workspace）
 cd spikes/protocol-adapter && cargo test
 
+# P5-05 模糊测试（独立 workspace，根目录的 fmt/clippy/test 不编译它）
+scripts/fuzz.sh                    # 三个目标各 20000 轮；ALLINS3_FUZZ_RUNS 可调
+scripts/fuzz.sh xml-manifest       # 单个目标；crash 写入 fuzz/artifacts/<target>/
+
 # 真实 SDK 端到端（失败会在第一条断言处退出）
 cargo build --features testing
 ALLINS3_DEV_SECRET=devsecret ./target/debug/allins3 examples/dev-config.toml &   # 监听 127.0.0.1:9000
 ALLINS3_SECRET_KEY=devsecret .venv/bin/python scripts/e2e_boto3.py             # 67/67 checks passed
-ALLINS3_SECRET_KEY=devsecret .venv/bin/python scripts/e2e_streaming_trailer.py # 21/21 checks passed
+ALLINS3_SECRET_KEY=devsecret .venv/bin/python scripts/e2e_streaming_trailer.py # 34/34 checks passed
 bash scripts/e2e_cli.sh                                                        # 29/29 checks passed（自行启停服务器）
+bash scripts/e2e_drain.sh                                                      # 20/20 排空时序（SIGINT/SIGTERM 各两种时序；自行启停服务器）
+.venv/bin/python scripts/e2e_timeouts.py                                       # 21/21 请求边界（§9.3 的 header/body idle/总 deadline；自行启停服务器）
 ALLINS3_BENCH_FULL=1 cargo test --release --all-features --test resource_budget -- --nocapture
+
+# 超限对象的状态码（把 max_single_write_size 临时改成 1 MiB 的配置）
+# boto3 put_object 2 MiB → 400 EntityTooLarge「Request body exceeds the configured maximum object size.」；head_object → 404
 curl -sS http://127.0.0.1:9000/healthz   # 200 ok
 curl -sS http://127.0.0.1:9000/readyz    # 200 ready
 curl -sS http://127.0.0.1:9000/metrics   # 计数器

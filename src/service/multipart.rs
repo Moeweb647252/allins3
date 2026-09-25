@@ -11,18 +11,17 @@
 //! validation and quota accounting are real.
 
 use std::collections::{BTreeMap, HashMap};
-use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 
 use crate::domain::{
     BeginWrite, Checksum, ChecksumAlgorithm, ChecksumType, CommitAttributes, CommitState,
-    ContentProperties, DriverContext, DriverError, DriverErrorKind, EntityTag, ObjectKey,
-    ObjectMetadata, PartNumber, Preconditions, UserMetadata, WriteId,
+    ContentProperties, DriverContext, EntityTag, ObjectKey, ObjectMetadata, PartNumber,
+    Preconditions, UserMetadata, WriteId,
 };
 use crate::driver::UploadId;
-use crate::integrity::{StreamingDigest, composite_checksum, hex, md5_digest};
+use crate::integrity::{StreamingDigest, composite_checksum, hex};
 
 use super::{ObjectService, ServiceError, next_chunk};
 
@@ -152,11 +151,17 @@ pub struct UploadSession {
     pub checksum: Option<MultipartChecksum>,
     /// Creation time.
     pub initiated: SystemTime,
+    /// When this upload last received a part.
+    ///
+    /// The reclaim lease is measured from here rather than from `initiated`, so
+    /// an upload that is still being fed parts is never reclaimed under a
+    /// client no matter how long it has been open.
+    pub last_activity: SystemTime,
 }
 
 /// A staged part.
 #[derive(Debug, Clone)]
-pub struct StoredPart {
+pub(crate) struct StoredPart {
     /// The part number.
     pub number: u16,
     /// Size in bytes.
@@ -171,7 +176,7 @@ pub struct StoredPart {
 
 impl StoredPart {
     /// The part ETag.
-    pub fn etag(&self) -> EntityTag {
+    pub(crate) fn etag(&self) -> EntityTag {
         EntityTag::new(hex(&self.md5)).expect("md5 hex is a valid tag")
     }
 }
@@ -212,7 +217,7 @@ pub struct SweepOutcome {
 /// Multipart state: sessions, staged parts, in-flight completion claims and
 /// completion records.
 #[derive(Default)]
-pub struct MultipartState {
+pub(crate) struct MultipartState {
     uploads: HashMap<String, UploadSession>,
     parts: HashMap<String, BTreeMap<u16, StoredPart>>,
     /// Uploads with a completion attempt in flight (`upload_id -> write_id`).
@@ -220,12 +225,15 @@ pub struct MultipartState {
     /// Completion records by attempt id, for recovery queries.
     completions: HashMap<String, CompletionRecord>,
     staged_bytes: u64,
+    /// Bytes of part bodies currently being received, charged to the quota
+    /// before they are buffered.
+    reserved_bytes: u64,
     quota: u64,
 }
 
 impl MultipartState {
     /// Creates state with a staging quota in bytes.
-    pub fn with_quota(quota: u64) -> Self {
+    pub(crate) fn with_quota(quota: u64) -> Self {
         Self {
             quota,
             ..Self::default()
@@ -233,9 +241,71 @@ impl MultipartState {
     }
 }
 
+/// The multipart state of one service.
+///
+/// The owner of the state, so the coordinator is the only thing that knows how
+/// it is locked: every other layer reaches multipart through [`ObjectService`]'s
+/// operations and never takes the lock itself.
+pub(crate) struct Multipart {
+    state: std::sync::Mutex<MultipartState>,
+}
+
+impl Multipart {
+    /// Empty state sharing `quota` bytes of staging between all uploads.
+    pub(crate) fn new(quota: u64) -> Self {
+        Self {
+            state: std::sync::Mutex::new(MultipartState::with_quota(quota)),
+        }
+    }
+
+    /// Locks the state for one coordinator step.
+    pub(crate) fn store(&self) -> std::sync::MutexGuard<'_, MultipartState> {
+        crate::sync::lock(&self.state)
+    }
+}
+
+/// The staging quota charged for one part body while it is being received.
+///
+/// The charge is taken per chunk, before the chunk is buffered, so a part the
+/// quota cannot hold is refused mid-body instead of after the whole body has
+/// been read into memory (spec §9.3). It is released however the read ends —
+/// staged, refused, cancelled or failed — so a refused part never holds quota
+/// that another uploader could have used.
+struct StagingReservation<'a> {
+    service: &'a ObjectService,
+    bytes: u64,
+}
+
+impl<'a> StagingReservation<'a> {
+    fn new(service: &'a ObjectService) -> Self {
+        Self { service, bytes: 0 }
+    }
+
+    /// Charges one more received chunk.
+    fn grow(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    /// Releases the charge early, before the part is staged: staged bytes are
+    /// counted by `staged_bytes`, and counting both would charge one part
+    /// twice against the quota.
+    fn release(&mut self) {
+        let bytes = std::mem::take(&mut self.bytes);
+        if bytes > 0 {
+            self.service.release_staging(bytes);
+        }
+    }
+}
+
+impl Drop for StagingReservation<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// The target upload and the source object of an `UploadPartCopy`.
 #[derive(Debug, Clone)]
-pub struct UploadPartCopyRequest {
+pub(crate) struct UploadPartCopyRequest {
     /// The upload's bucket.
     pub bucket: String,
     /// The upload's target key.
@@ -298,10 +368,7 @@ const COMPLETION_RECORD_LIMIT: usize = 4096;
 
 impl ObjectService {
     fn multipart(&self) -> std::sync::MutexGuard<'_, MultipartState> {
-        self.inner
-            .multipart
-            .lock()
-            .expect("multipart state poisoned")
+        self.inner.multipart.store()
     }
 
     /// Creates a multipart upload without touching any existing object.
@@ -327,6 +394,7 @@ impl ObjectService {
             user_metadata,
             checksum,
             initiated: SystemTime::now(),
+            last_activity: SystemTime::now(),
         };
         let mut state = self.multipart();
         state
@@ -373,6 +441,32 @@ impl ObjectService {
         upload_id: &str,
         part_number: u16,
         checksums: PartChecksums,
+        body: crate::driver::ObjectByteStream,
+    ) -> Result<PartSummary, ServiceError> {
+        // A part upload buffers up to `max_single_write_size` of request body, so
+        // it takes the same operation slot as any other write: a saturated
+        // server or driver instance answers `SlowDown` instead of queueing, and a
+        // graceful drain waits for a part still in flight instead of exiting
+        // under it. Admitting happens here, once for the whole operation;
+        // `upload_part_copy` admits at its own entry instead of through this.
+        let (_binding, _slot) = self.binding_slot(bucket)?;
+        self.upload_part_in(ctx, bucket, key, upload_id, part_number, checksums, body)
+            .await
+    }
+
+    /// The staging itself, for a caller that already admitted the operation.
+    ///
+    /// A copy reads its source and stages the part as one span, so it admits
+    /// once at its own entry rather than through each step here.
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_part_in(
+        &self,
+        ctx: &DriverContext,
+        bucket: &str,
+        key: &ObjectKey,
+        upload_id: &str,
+        part_number: u16,
+        checksums: PartChecksums,
         mut body: crate::driver::ObjectByteStream,
     ) -> Result<PartSummary, ServiceError> {
         PartNumber::new(part_number).map_err(|e| ServiceError::InvalidArgument(e.to_string()))?;
@@ -390,10 +484,18 @@ impl ObjectService {
                     .as_ref()
                     .map(|trailer| trailer.algorithm())
             });
-        let scheme = {
+        let (scheme, replaced) = {
             let state = self.multipart();
             let session = self.require_session(&state, bucket, key, upload_id)?;
-            match (session.checksum, part_algorithm) {
+            // Receiving a replacement for a staged part needs no room for both
+            // copies at once: the staged one is released in the same step that
+            // stages the new bytes, so the quota is charged for the difference.
+            let replaced = state
+                .parts
+                .get(upload_id)
+                .and_then(|parts| parts.get(&part_number))
+                .map_or(0, |part| part.size);
+            let scheme = match (session.checksum, part_algorithm) {
                 (Some(scheme), Some(algorithm)) if scheme.algorithm != algorithm => {
                     return Err(ServiceError::InvalidRequest(format!(
                         "the part checksum algorithm `{}` does not match the upload's `{}`",
@@ -406,10 +508,15 @@ impl ObjectService {
                 // one fixes the scheme for the remaining parts.
                 (None, Some(algorithm)) => Some(MultipartChecksum::from_algorithm(algorithm)?),
                 (None, None) => None,
-            }
+            };
+            (scheme, replaced)
         };
 
         let mut buffer: Vec<u8> = Vec::new();
+        // The quota is charged per chunk, before a chunk is buffered, so a part
+        // the staging quota cannot hold is refused while it is still streaming
+        // rather than after the whole body has been read into memory.
+        let mut reservation = StagingReservation::new(self);
         let mut md5 = StreamingDigest::new(ChecksumAlgorithm::Md5);
         let mut digest = scheme.map(|scheme| StreamingDigest::new(scheme.algorithm));
         let limit = self.inner.limits.max_single_write_size;
@@ -429,6 +536,8 @@ impl ObjectService {
                             "part exceeds the configured maximum size".into(),
                         ));
                     }
+                    self.reserve_staging(chunk.len() as u64, replaced)?;
+                    reservation.grow(chunk.len() as u64);
                     md5.update(&chunk);
                     if let Some(hasher) = digest.as_mut() {
                         hasher.update(&chunk);
@@ -438,6 +547,10 @@ impl ObjectService {
                 Some(Err(e)) => return Err(ServiceError::from_driver(&e, true)),
             }
         }
+
+        // From here the received bytes are counted as staged, so the
+        // reservation must stop counting them as in-flight.
+        reservation.release();
 
         let data = Bytes::from(buffer);
         let size = data.len() as u64;
@@ -501,6 +614,10 @@ impl ObjectService {
             }
             _ => {}
         }
+        // The part is about to be staged, so the upload's reclaim lease resets.
+        if let Some(session) = state.uploads.get_mut(upload_id) {
+            session.last_activity = SystemTime::now();
+        }
 
         // The part count is bounded; replacing an existing part is always allowed.
         let staged = state.parts.get(upload_id);
@@ -548,6 +665,33 @@ impl ObjectService {
             checksum,
             last_modified: SystemTime::now(),
         })
+    }
+
+    /// Charges `bytes` of a part body that is being received to the staging
+    /// quota, refusing the chunk when the quota cannot hold it.
+    ///
+    /// The charge is taken before the bytes are buffered, so the refusal
+    /// reaches the client while the body is still streaming and the resident
+    /// buffer never grows past what the quota allows. `credit` is the staged
+    /// size of the part this attempt replaces: staging the replacement releases
+    /// the old part in the same step, so only the difference is charged.
+    fn reserve_staging(&self, bytes: u64, credit: u64) -> Result<(), ServiceError> {
+        let mut state = self.multipart();
+        let used = state
+            .staged_bytes
+            .saturating_sub(credit)
+            .saturating_add(state.reserved_bytes);
+        if used.saturating_add(bytes) > state.quota {
+            return Err(ServiceError::SlowDown);
+        }
+        state.reserved_bytes = state.reserved_bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    /// Returns bytes previously charged by [`ObjectService::reserve_staging`].
+    fn release_staging(&self, bytes: u64) {
+        let mut state = self.multipart();
+        state.reserved_bytes = state.reserved_bytes.saturating_sub(bytes);
     }
 
     /// Lists parts of an upload.
@@ -663,7 +807,7 @@ impl ObjectService {
     where
         M: Into<CompletionPart> + Clone,
     {
-        let binding = self.binding(bucket)?;
+        let (binding, _slot) = self.binding_slot(bucket)?;
         self.require_writable(&binding)?;
         let manifest: Vec<CompletionPart> = manifest.iter().cloned().map(Into::into).collect();
 
@@ -842,13 +986,27 @@ impl ObjectService {
         };
 
         let total: u64 = ordered.iter().map(|p| p.size).sum();
-        let handle = self.namespace_for(&binding, ctx).await?;
-        let write = handle
-            .write
-            .as_ref()
-            .ok_or_else(|| ServiceError::NotImplemented("bucket is not writable".into()))?;
+        // The three steps that can fail before a single part byte reaches the
+        // backend - opening the namespace, finding a writable handle, starting
+        // the staged write - leave nothing that could publish later. A failure
+        // there must therefore release the claim, or a retry with the same
+        // upload id would be refused forever even though the first attempt
+        // never had a publish path.
+        let handle = match self.inner.handles.get(&binding, ctx).await {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.release_claim(upload_id, &write_id);
+                return Err(e);
+            }
+        };
+        let Some(write) = handle.write.as_ref() else {
+            self.release_claim(upload_id, &write_id);
+            return Err(ServiceError::NotImplemented(
+                "bucket is not writable".into(),
+            ));
+        };
 
-        let mut staged = write
+        let mut staged = match write
             .begin_write(
                 ctx,
                 BeginWrite {
@@ -862,23 +1020,31 @@ impl ObjectService {
                 },
             )
             .await
-            .map_err(|e| ServiceError::from_driver(&e, true))?;
+        {
+            Ok(staged) => staged,
+            Err(e) => {
+                self.release_claim(upload_id, &write_id);
+                return Err(ServiceError::from_driver(&e, true));
+            }
+        };
 
         for part in &ordered {
             if let Err(e) = staged.write_chunk(ctx, part.data.clone()).await {
                 // A failed part write never published anything; the attempt is
                 // final as soon as the abort is acknowledged.
-                let state = staged.abort(ctx).await;
-                self.record_completion(
-                    &write_id,
-                    &session,
-                    if state.is_ok() {
-                        CommitState::NotCommittedFinal
-                    } else {
-                        CommitState::Unknown
-                    },
-                    upload_id,
-                );
+                let aborted = staged.abort(ctx).await;
+                let attempt_state = if aborted.is_ok() {
+                    CommitState::NotCommittedFinal
+                } else {
+                    CommitState::Unknown
+                };
+                // A proven final non-commit allows a replacement attempt, so it
+                // must not leave the claim behind: an unresolved outcome keeps
+                // it, because a late publish is still possible.
+                if attempt_state.permits_replacement_attempt() {
+                    self.release_claim(upload_id, &write_id);
+                }
+                self.record_completion(&write_id, &session, attempt_state, upload_id);
                 return Err(ServiceError::from_driver(&e, true));
             }
         }
@@ -1005,14 +1171,6 @@ impl ObjectService {
         );
     }
 
-    /// Looks up what happened to a completion attempt.
-    ///
-    /// `None` means *no record* — not that the attempt failed. A caller must
-    /// not treat an absent record as a final failure.
-    pub fn completion_state(&self, write_id: &str) -> Option<CompletionRecord> {
-        self.multipart().completions.get(write_id).cloned()
-    }
-
     /// All recorded completion attempts of one upload, oldest first.
     pub fn completion_records_for_upload(&self, upload_id: &str) -> Vec<CompletionRecord> {
         let state = self.multipart();
@@ -1047,7 +1205,7 @@ impl ObjectService {
             .uploads
             .iter()
             .filter(|(_, s)| {
-                now.duration_since(s.initiated)
+                now.duration_since(s.last_activity)
                     .is_ok_and(|age| age >= lease)
             })
             .map(|(id, _)| id.clone())
@@ -1104,15 +1262,20 @@ impl ObjectService {
     }
 
     /// Reads a source range and stores it as a part (`UploadPartCopy`).
-    pub async fn upload_part_copy(
+    pub(crate) async fn upload_part_copy(
         &self,
         ctx: &DriverContext,
         copy: UploadPartCopyRequest,
     ) -> Result<(PartSummary, ObjectMetadata), ServiceError> {
+        // Like `copy_object`, one slot admits the whole copy-part: the source
+        // read and the staging below must not each claim a share of the
+        // destination's scope, or a limit of one would stall the operation.
+        let (_binding, _slot) = self.binding_slot(&copy.bucket)?;
+        let source_binding = self.binding(&copy.source_bucket)?;
         let source = self
-            .get_object(
+            .get_object_in(
+                &source_binding,
                 ctx,
-                &copy.source_bucket,
                 &copy.source_key,
                 &super::ReadConditions::default(),
                 copy.range,
@@ -1120,7 +1283,7 @@ impl ObjectService {
             .await?;
         let metadata = source.metadata.clone();
         let summary = self
-            .upload_part(
+            .upload_part_in(
                 ctx,
                 &copy.bucket,
                 &copy.key,
@@ -1136,17 +1299,36 @@ impl ObjectService {
     /// Whether multipart state holds no sessions (used by tests).
     pub fn multipart_is_idle(&self) -> bool {
         let state = self.multipart();
-        state.uploads.is_empty() && state.staged_bytes == 0
+        state.uploads.is_empty() && state.staged_bytes == 0 && state.reserved_bytes == 0
     }
 
-    /// The configured multipart token/lease lifetime (reserved for cleanup).
-    pub fn _multipart_lease(&self) -> Duration {
-        Duration::from_secs(3600)
-    }
-
-    #[allow(dead_code)]
-    fn _unused_helpers(_: DriverError, _: DriverErrorKind, _: NonZeroU32, _: ChecksumType) {
-        let _ = md5_digest(&[]);
+    /// Reclaims expired multipart staging on a fixed interval until `shutdown`
+    /// resolves.
+    ///
+    /// This is the sweeper's whole body, kept here rather than inline in the
+    /// server so its cancel path and reclaim behaviour can be tested (spec
+    /// §10: a background task has one owner, a cancel path and a shutdown wait;
+    /// spec §8.2: a sweeper reclaims by lease, never by file age).
+    pub async fn run_multipart_sweeper<F, S>(
+        &self,
+        lease: Duration,
+        interval: Duration,
+        shutdown: S,
+        mut on_sweep: F,
+    ) where
+        F: FnMut(SweepOutcome),
+        S: std::future::Future<Output = ()>,
+    {
+        let mut ticker = tokio::time::interval(interval);
+        // A sweep that runs late must not then fire a burst of catch-up sweeps.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => return,
+                _ = ticker.tick() => on_sweep(self.sweep_expired_uploads(lease)),
+            }
+        }
     }
 }
 

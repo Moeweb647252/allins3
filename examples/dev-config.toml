@@ -49,18 +49,45 @@ actions = ["list", "read", "write", "delete"]
 prefix = ""
 
 [limits]
-# Server-wide admission, and a per-principal share of it. A principal that
-# saturates its share gets `503 SlowDown` instead of starving other callers.
-# Set `max_concurrent_requests_per_principal = 0` to disable that limit.
+# Server-wide admission, a per-principal share of it, and a per-driver share.
+# Saturating any of them answers `503 SlowDown` instead of queueing, so no
+# waiting set grows without bound: the server-wide limit bounds operations in
+# flight across every driver, one principal cannot starve other callers, and one
+# driver instance never takes on more operations than its share, however many
+# buckets it backs. Set either per-* limit to 0 to disable it; the server-wide
+# limit is never zero.
 max_single_write_size = 5368709120
 max_list_keys = 1000
 max_concurrent_requests = 256
 max_concurrent_requests_per_principal = 32
+max_concurrent_requests_per_driver = 64
 
-# Multipart staging quota for the in-memory coordinator.
+# Multipart staging quota for the in-memory coordinator, and the lease the
+# background sweeper reclaims by. The lease is measured from an upload's last
+# part, so an upload that is still being fed parts is never reclaimed under a
+# client; a completion attempt in flight, or one with an unknown outcome, is
+# skipped. Set `multipart_sweep_interval_secs = 0` to disable the sweeper (an
+# abandoned upload then holds its staged bytes and quota until the server
+# restarts).
 staging_quota_bytes = 268435456
+multipart_lease_secs = 3600
+multipart_sweep_interval_secs = 60
 
-# Timeouts, in seconds. `request_timeout_secs = 0` disables the total timeout.
+# Lifetime of a server-side listing continuation token. Tokens are opaque
+# server-side handles (nothing is signed with them), so this expiry is the only
+# policy that applies; it is bound to the bucket, generation, prefix, delimiter,
+# encoding and principal, and a client cannot use an expired one.
+list_token_ttl_secs = 3600
+
+# Timeouts, in seconds. Spec §9.3 keeps four bounds separate so no short total
+# timeout can cut off a large object:
+#   header_timeout_secs    bounds only the request-header read (0 disables);
+#   body_idle_timeout_secs bounds a gap between request-body bytes, so a stalled
+#                          client is abandoned without touching a response being
+#                          written to a slow reader (0 disables);
+#   request_timeout_secs   bounds the whole request and is also the backend
+#                          operation deadline a driver call must respect
+#                          (0 disables).
 header_timeout_secs = 30
 body_idle_timeout_secs = 60
 request_timeout_secs = 0

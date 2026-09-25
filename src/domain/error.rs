@@ -19,6 +19,15 @@ pub enum DriverErrorKind {
     NotFound,
     /// A precondition (`If-Match` / `If-None-Match`) was not satisfied.
     PreconditionFailed,
+    /// A signature over the request payload (a signed chunk or trailer) did not
+    /// verify. Reported by the protocol body bridge, never by a storage driver:
+    /// the bytes never reached a driver because the client's own signature
+    /// proved them wrong.
+    PayloadSignatureMismatch,
+    /// The request payload did not hash to the digest the client declared for it
+    /// (`x-amz-content-sha256`). Also reported by the protocol body bridge: the
+    /// declared value and the delivered bytes disagree (spec §9.1).
+    PayloadDigestMismatch,
     /// A concurrent conditional operation was rejected; the caller should not
     /// blindly retry with different semantics.
     ConditionalConflict,
@@ -50,6 +59,8 @@ impl DriverErrorKind {
         match self {
             Self::NotFound => "not_found",
             Self::PreconditionFailed => "precondition_failed",
+            Self::PayloadSignatureMismatch => "payload_signature_mismatch",
+            Self::PayloadDigestMismatch => "payload_digest_mismatch",
             Self::ConditionalConflict => "conditional_conflict",
             Self::AccessDenied => "access_denied",
             Self::InvalidArgument => "invalid_argument",
@@ -195,6 +206,8 @@ impl DriverError {
         }
         match self.kind {
             DriverErrorKind::PreconditionFailed
+            | DriverErrorKind::PayloadSignatureMismatch
+            | DriverErrorKind::PayloadDigestMismatch
             | DriverErrorKind::ConditionalConflict
             | DriverErrorKind::AccessDenied
             | DriverErrorKind::InvalidArgument
@@ -224,6 +237,16 @@ impl DriverError {
     /// A precondition was not satisfied.
     pub fn precondition_failed(message: impl Into<String>) -> Self {
         Self::new(DriverErrorKind::PreconditionFailed, message)
+    }
+
+    /// A signature over the request payload did not verify.
+    pub fn payload_signature_mismatch(message: impl Into<String>) -> Self {
+        Self::new(DriverErrorKind::PayloadSignatureMismatch, message)
+    }
+
+    /// The request payload did not match the digest declared for it.
+    pub fn payload_digest_mismatch(message: impl Into<String>) -> Self {
+        Self::new(DriverErrorKind::PayloadDigestMismatch, message)
     }
 
     /// A concurrent conditional operation lost the race.

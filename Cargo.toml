@@ -15,6 +15,9 @@ hyper = { version = "=1.11.1", features = ["http1", "server"] }
 hyper-util = { version = "=0.1.20", features = ["server", "tokio", "http1"] }
 md-5 = "=0.10.6"
 s3s = { version = "=0.16.1", default-features = false }
+# Only behind the `testing` feature: the in-process protocol harness signs its
+# own requests with the same crate the server verifies them with.
+s3s-sigv4 = { version = "=0.16.1", optional = true }
 serde = { version = "=1.0.229", features = ["derive"] }
 sha1 = "=0.10.7"
 sha2 = "=0.10.9"
@@ -35,13 +38,14 @@ toml = "=0.9.12"
 [dev-dependencies]
 futures-util = "=0.3.34"
 libc = "=0.2.189"
-tokio = { version = "=1.53.1", features = ["full"] }
+# `test-util` is what lets the timeout tests drive a paused clock.
+tokio = { version = "=1.53.1", features = ["full", "test-util"] }
 
 [features]
 default = []
-# Enables the test-support drivers, fault injector and reusable contract-test
-# harness from the `allins3::testing` module.
-testing = []
+# Enables the test-support drivers, fault injector, reusable contract-test
+# harness and the in-process protocol harness from the `allins3::testing` module.
+testing = ["dep:s3s-sigv4"]
 
 [[test]]
 name = "contract_reference"
@@ -61,6 +65,10 @@ required-features = ["testing"]
 
 [[test]]
 name = "property_parsing"
+required-features = ["testing"]
+
+[[test]]
+name = "property_protocol"
 required-features = ["testing"]
 
 [[test]]

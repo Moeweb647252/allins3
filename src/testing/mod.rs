@@ -10,6 +10,7 @@ pub mod contract;
 pub mod counting;
 pub mod fault;
 pub mod fixture;
+pub mod protocol;
 pub mod reference;
 pub mod second;
 pub mod support;

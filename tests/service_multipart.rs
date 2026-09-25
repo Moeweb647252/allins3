@@ -414,6 +414,110 @@ async fn a_fenced_attempt_resolves_to_final_non_commit_and_allows_one_retry() {
 }
 
 #[tokio::test]
+async fn a_completion_that_cannot_open_the_backend_is_retryable() {
+    let factory = Arc::new(FaultDriverFactory::new(
+        Arc::new(ReferenceDriverFactory::new("reference")),
+        FaultPlan {
+            fail_first_begin_write: true,
+            ..FaultPlan::none()
+        },
+    ));
+    let service = service_with(factory).await;
+    let key = object_key("multi/retry-backend.bin");
+    let upload_id = start_upload(&service, &key).await;
+    let etag = upload_part(&service, &key, &upload_id, 1, b"retry me").await;
+
+    let manifest = [(1u16, Some(etag))];
+    service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            None,
+            Preconditions::none(),
+        )
+        .await
+        .expect_err("a backend that cannot open a staged write must fail the completion");
+
+    // Nothing was staged, so the claim must not outlive the failure: the parts
+    // are still there and no attempt was recorded.
+    let parts = service
+        .list_parts(BUCKET, &key, &upload_id, None, 100)
+        .expect("list parts");
+    assert_eq!(parts.parts.len(), 1);
+    assert!(service.latest_completion_state(&upload_id).is_none());
+
+    // The retry is a normal completion, not one refused as "already being
+    // completed" for the rest of the upload's life.
+    let meta = service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            None,
+            Preconditions::none(),
+        )
+        .await
+        .expect("the retry must not be refused as already completing");
+    assert_eq!(meta.size, 8);
+    assert_eq!(read_object(&service, &key).await, b"retry me");
+}
+
+#[tokio::test]
+async fn a_part_write_failure_that_aborts_finally_allows_the_retry() {
+    let factory = Arc::new(FaultDriverFactory::new(
+        Arc::new(ReferenceDriverFactory::new("reference")),
+        FaultPlan {
+            fail_first_write_chunk: true,
+            ..FaultPlan::none()
+        },
+    ));
+    let service = service_with(factory).await;
+    let key = object_key("multi/retry-chunk.bin");
+    let upload_id = start_upload(&service, &key).await;
+    let etag = upload_part(&service, &key, &upload_id, 1, b"chunked").await;
+
+    let manifest = [(1u16, Some(etag))];
+    service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            None,
+            Preconditions::none(),
+        )
+        .await
+        .expect_err("a part write that fails must fail the completion");
+
+    // The acknowledged abort proved the attempt final, so the claim must be
+    // gone and the upload retryable.
+    assert_eq!(
+        service.latest_completion_state(&upload_id),
+        Some(CommitState::NotCommittedFinal)
+    );
+    let meta = service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            None,
+            Preconditions::none(),
+        )
+        .await
+        .expect("a final non-commit must not refuse the retry");
+    assert_eq!(meta.size, 7);
+    assert_eq!(read_object(&service, &key).await, b"chunked");
+}
+
+#[tokio::test]
 async fn an_unresolvable_commit_outcome_blocks_replay_and_is_never_swept() {
     let factory = Arc::new(FaultDriverFactory::new(
         Arc::new(ReferenceDriverFactory::new("reference")),
@@ -499,6 +603,129 @@ async fn a_sweep_reclaims_only_expired_uploads() {
             .list_parts(BUCKET, &key, &upload_id, None, 100)
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn the_background_sweeper_reclaims_abandoned_staging_and_stops_on_request() {
+    // Spec §10 wants every background task to have an owner, a cancel path and
+    // a shutdown wait; spec §8.2 wants reclaim driven by a lease. This is the
+    // task the server actually runs, not a direct call to the sweep.
+    let service = service_with(Arc::new(ReferenceDriverFactory::new("reference"))).await;
+    let key = object_key("multi/abandoned.bin");
+    let upload_id = start_upload(&service, &key).await;
+    upload_part(&service, &key, &upload_id, 1, b"abandoned").await;
+    assert!(!service.multipart_is_idle());
+
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let sweeper = tokio::spawn({
+        let service = service.clone();
+        async move {
+            service
+                .run_multipart_sweeper(
+                    Duration::ZERO,
+                    Duration::from_millis(5),
+                    async move {
+                        let mut stop = stop_rx;
+                        let _ = stop.changed().await;
+                    },
+                    |_| {},
+                )
+                .await;
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !service.multipart_is_idle() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        service.multipart_is_idle(),
+        "the sweeper must reclaim an upload whose lease expired"
+    );
+
+    // The cancel path is real: the task ends when asked and joining it does not
+    // hang.
+    stop_tx.send(true).expect("the sweeper is still listening");
+    tokio::time::timeout(Duration::from_secs(5), sweeper)
+        .await
+        .expect("the sweeper stops when told")
+        .expect("the sweeper task did not panic");
+}
+
+#[tokio::test]
+async fn a_part_upload_resets_the_reclaim_lease() {
+    // The lease is measured from the upload's last activity, so an upload that
+    // is still being fed parts is never reclaimed under the client. The first
+    // sleep outlasts the lease from creation, so a lease measured from
+    // `initiated` would reclaim here.
+    const LEASE: Duration = Duration::from_millis(100);
+    let service = service_with(Arc::new(ReferenceDriverFactory::new("reference"))).await;
+    let key = object_key("multi/live.bin");
+    let upload_id = start_upload(&service, &key).await;
+    tokio::time::sleep(LEASE + Duration::from_millis(20)).await;
+    upload_part(&service, &key, &upload_id, 1, b"first").await;
+
+    let kept = service.sweep_expired_uploads(LEASE);
+    assert_eq!(
+        kept.reclaimed_uploads, 0,
+        "a part just uploaded must keep the upload alive"
+    );
+    assert!(!service.multipart_is_idle());
+}
+
+#[tokio::test]
+async fn an_aborted_upload_returns_its_staged_bytes_to_the_quota() {
+    let mut limits = fixture::default_limits();
+    limits.max_single_write_size = 16 * 1024 * 1024;
+    limits.staging_quota_bytes = 4 * 1024 * 1024;
+    let factory: Arc<dyn DriverFactory> = Arc::new(ReferenceDriverFactory::new("reference"));
+    let service = fixture::service(
+        vec![(DRIVER, factory)],
+        vec![BucketSpec {
+            bucket: BUCKET,
+            driver: DRIVER,
+            namespace: "ns-a",
+            profile: Profile::CoreWrite,
+        }],
+        limits,
+        fixture::full_access(),
+    )
+    .await;
+
+    let key = object_key("multi/abort-quota.bin");
+    let upload_id = start_upload(&service, &key).await;
+    upload_part_bytes(
+        &service,
+        &key,
+        &upload_id,
+        1,
+        vec![b'a'; 3 * 1024 * 1024],
+        None,
+    )
+    .await
+    .expect("a part inside the quota");
+
+    service
+        .abort_multipart(BUCKET, &key, &upload_id)
+        .expect("abort the upload");
+    assert!(
+        service.multipart_is_idle(),
+        "abort must return the staged bytes to the quota"
+    );
+
+    // The reclaimed bytes are what the next upload draws on.
+    let next_key = object_key("multi/abort-quota-next.bin");
+    let next_upload = start_upload(&service, &next_key).await;
+    upload_part_bytes(
+        &service,
+        &next_key,
+        &next_upload,
+        1,
+        vec![b'b'; 3 * 1024 * 1024],
+        None,
+    )
+    .await
+    .expect("the next upload must be able to use the reclaimed quota");
 }
 
 #[tokio::test]

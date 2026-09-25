@@ -27,7 +27,7 @@ use crate::driver::{
     SecretResolver, StagedWrite, StorageDriver, WriteNamespace,
 };
 
-use super::reference::StoredObject;
+use super::reference::{NamespaceTable, StoredObject};
 use super::support::one_shot_stream;
 
 #[derive(Default)]
@@ -99,7 +99,7 @@ impl DriverFactory for VecDriverFactory {
                 display_name: "sorted-vec test driver".into(),
                 version: Some(env!("CARGO_PKG_VERSION").into()),
             },
-            namespaces: Mutex::new(HashMap::new()),
+            namespaces: NamespaceTable::new(),
         }))
     }
 }
@@ -107,16 +107,7 @@ impl DriverFactory for VecDriverFactory {
 /// A second in-memory driver backed by a sorted vector.
 pub struct VecDriver {
     descriptor: DriverDescriptor,
-    namespaces: Mutex<HashMap<NamespaceId, Arc<Mutex<VecState>>>>,
-}
-
-impl VecDriver {
-    fn state(&self, namespace: &NamespaceId) -> Arc<Mutex<VecState>> {
-        let mut map = self.namespaces.lock().expect("namespace map poisoned");
-        map.entry(namespace.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(VecState::default())))
-            .clone()
-    }
+    namespaces: NamespaceTable<VecState>,
 }
 
 fn io_err<T>(_e: std::sync::PoisonError<T>) -> DriverError {
@@ -154,7 +145,7 @@ impl StorageDriver for VecDriver {
         _ctx: &DriverContext,
         namespace: &NamespaceId,
     ) -> Result<NamespaceHandle, DriverError> {
-        let state = self.state(namespace);
+        let state = self.namespaces.get(namespace);
         let read = Arc::new(VecRead {
             state: state.clone(),
         });
