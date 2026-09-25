@@ -19,7 +19,7 @@
 
 ## 模块与接缝
 
-以下名字是本仓库认可的说法；接口（interface）指调用方必须知道的最小面，实现（implementation）指其后的一切。
+以下名字是本仓库认可的说法；接口（interface）指调用方必须知道的最小面，实现（implementation）指其后的一切。拆分理由与“缝隙保持内部”的决定见 [ADR-0008](docs/adr/0008-object-service-decomposition.md)。
 
 ### Admission（准入）
 
