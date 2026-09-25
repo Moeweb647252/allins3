@@ -37,7 +37,7 @@ ADR-0004 §5/§7 已把绑定与句柄的语义定死，但“谁持有句柄缓
 - 服务核心可在不启动服务器的情况下测试：当前 121 个单元测试 + 64 个集成测试全绿，重构后 `e2e_boto3` / `e2e_streaming_trailer` / `e2e_cli` / `e2e_drain` / `e2e_timeouts` 全部通过。
 - 收窄可见性时暴露出三处死代码（`catalog()`、`query_commit()`、`completion_state()` 无调用方）并删除；这是把“只有适配层在用”的入口降为 `pub(crate)` 的直接收益。
 - 代价：`ObjectService` 上的薄委托是新增的一层间接，读代码时需要在两个类型之间跳一次；这是有意的，换来的是每个关注点可独立推理与测试。
-- 未决：`StagingLedger` 与 `Composition`（组合根）仍是候选，留待真实痛点出现时再评估。
+- 后续：`Composition`（组合根）已作为 `src/compose.rs` 实现，收拢了 `server::run` / `fixture::service` / `ProtocolHarness::new` 各自重推的启动接线（`ADR-0008` 的替代方案里曾把它列为正交候选）。仍未实现的是 `StagingLedger`。
 
 ## 替代方案
 

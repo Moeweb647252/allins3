@@ -5,7 +5,6 @@
 //! accepting, waits for in-flight requests up to a deadline, then exits
 //! (spec §7.2).
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,90 +17,33 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use tokio::net::TcpListener;
 
-use crate::config::{Addressing, AppConfig};
-use crate::domain::{DriverContext, DriverInstanceId, RequestId};
-use crate::driver::{DriverFactory, DriverKind, DriverRegistry, StorageDriver};
-use crate::protocol::s3::{
-    HttpError, HttpResponse, PrincipalLimiter, S3Body, S3Error, S3ErrorCode, S3Handler, S3Service,
-    adapter_config, build_service,
-};
-use crate::service::ObjectService;
+use crate::compose;
+use crate::config::AppConfig;
+use crate::protocol::s3::{HttpError, HttpResponse, S3Body, S3Error, S3ErrorCode, S3Service};
 use crate::timeouts::IdleTimeoutBody;
-
-/// Builds the driver registry with the kinds this build supports.
-pub fn build_registry(config: &AppConfig) -> Result<DriverRegistry, String> {
-    let mut registry = DriverRegistry::new();
-    let kinds: Vec<String> = {
-        let mut kinds: Vec<String> = config.drivers.iter().map(|d| d.kind.clone()).collect();
-        kinds.sort();
-        kinds.dedup();
-        kinds
-    };
-
-    for kind in kinds {
-        let factory: Arc<dyn DriverFactory> = match kind.as_str() {
-            #[cfg(feature = "testing")]
-            "test-reference" => Arc::new(crate::testing::reference::ReferenceDriverFactory::new(
-                kind.clone(),
-            )),
-            #[cfg(feature = "testing")]
-            "test-vec" => Arc::new(crate::testing::second::VecDriverFactory::new(kind.clone())),
-            other => {
-                return Err(format!(
-                    "driver kind `{other}` is not registered in this build"
-                ));
-            }
-        };
-        registry
-            .register(factory)
-            .map_err(|e| format!("failed to register driver kind `{kind}`: {e}"))?;
-    }
-    Ok(registry)
-}
 
 /// Starts the service and serves until a shutdown signal.
 pub async fn run(config: AppConfig) -> Result<(), String> {
     log(&format!("config: {}", config.redacted_summary()));
 
-    let ctx = DriverContext::new(RequestId::new("startup"));
-    let mut registry = build_registry(&config)?;
+    // Wiring lives in one place (`compose`); this function owns only the
+    // process concerns: the listener, the sweeper's lifecycle, and shutdown.
+    let mut registry = compose::build_registry(&config)?;
+    let instances = compose::instances_from_config(&mut registry, &config).await?;
 
-    // Create every driver instance referenced by a bucket.
-    let mut instances: HashMap<String, Arc<dyn StorageDriver>> = HashMap::new();
-    for driver in &config.drivers {
-        let kind = DriverKind::new(driver.kind.clone());
-        let instance_id = DriverInstanceId::parse(driver.id.clone())
-            .map_err(|e| format!("invalid driver id `{}`: {e}", driver.id))?;
-        let instance = registry
-            .create_instance(&ctx, &kind, &instance_id, &crate::config::EnvSecretResolver)
-            .await
-            .map_err(|e| format!("failed to create driver `{}`: {e}", driver.id))?;
-        instances.insert(driver.id.clone(), instance);
-    }
-
-    // Config validation already produced a duplicate-free catalog.
-    let catalog = config.catalog.clone();
-
-    let credentials = Arc::new(config.credentials.clone());
-    let policy = Arc::new(config.access.clone());
-    let service = ObjectService::new(
-        catalog,
+    let service = compose::object_service(
+        config.catalog.clone(),
         instances,
         config.limits.clone(),
         config.access.clone(),
-    );
-
-    // Open and capability-check all namespaces before readiness.
-    service
-        .warmup(&ctx)
-        .await
-        .map_err(|e| format!("startup capability check failed: {e}"))?;
+    )
+    .await
+    .map_err(|e| format!("startup capability check failed: {e}"))?;
 
     let ready = Arc::new(AtomicBool::new(true));
-    let s3_config = adapter_config(&config.limits);
-    let limiter = PrincipalLimiter::new(config.limits.max_concurrent_requests_per_principal);
-    let handler = S3Handler::new(service.clone(), credentials.clone(), limiter);
-    let s3_service = build_service(handler, credentials.clone(), policy, s3_config);
+    let credentials = Arc::new(config.credentials.clone());
+    let policy = Arc::new(config.access.clone());
+    let s3_service = compose::s3_service(service.clone(), credentials, policy, &config.limits);
 
     // Each bound is resolved into `None` when disabled, so the enforcement
     // points can treat "no bound" as a plain absence rather than a sentinel.
@@ -447,9 +389,4 @@ fn internal_error(_e: HttpError) -> HttpResponse {
     let mut response = Response::new(S3Body::from(Bytes::from_static(b"internal error")));
     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
     response
-}
-
-/// The addressing style, exposed for tests.
-pub fn addressing(config: &AppConfig) -> Addressing {
-    config.addressing
 }

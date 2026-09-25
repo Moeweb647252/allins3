@@ -15,9 +15,7 @@ use crate::config::Limits;
 use crate::domain::{
     BucketId, DriverContext, DriverError, DriverInstanceId, NamespaceId, RequestId,
 };
-use crate::driver::{
-    DriverFactory, DriverKind, DriverRegistry, Profile, Secret, SecretResolver, StorageDriver,
-};
+use crate::driver::{DriverFactory, Profile, Secret, SecretResolver, StorageDriver};
 use crate::service::ObjectService;
 
 /// A resolver that knows no secrets, for drivers that take none.
@@ -88,18 +86,10 @@ pub async fn service(
 ) -> ObjectService {
     let mut drivers: HashMap<String, Arc<dyn StorageDriver>> = HashMap::new();
     for (id, factory) in factories {
-        let mut registry = DriverRegistry::new();
-        registry.register(factory.clone()).expect("register");
-        let kind = factory.kind();
-        let instance = registry
-            .create_instance(
-                &ctx("fixture"),
-                &DriverKind::new(kind.as_str()),
-                &DriverInstanceId::parse(id).expect("instance id"),
-                &NoSecrets,
-            )
-            .await
-            .expect("create instance");
+        let instance =
+            crate::compose::instance_from_factory(factory, id, &ctx("fixture"), &NoSecrets)
+                .await
+                .expect("create instance");
         drivers.insert(id.to_string(), instance);
     }
 
@@ -117,7 +107,7 @@ pub async fn service(
         .collect::<Vec<_>>();
 
     let catalog = BucketCatalog::from_bindings(bindings).expect("catalog");
-    let service = ObjectService::new(catalog, drivers, limits, access);
-    service.warmup(&ctx("warmup")).await.expect("warmup");
-    service
+    crate::compose::object_service(catalog, drivers, limits, access)
+        .await
+        .expect("warmup")
 }

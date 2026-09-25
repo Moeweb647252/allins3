@@ -20,9 +20,7 @@ use s3s::HttpRequest;
 use crate::auth::{Credential, CredentialStore};
 use crate::driver::{DriverFactory, Profile, Secret};
 use crate::integrity::{compute_checksum, hex};
-use crate::protocol::s3::{
-    PrincipalLimiter, S3Body as Body, S3Handler, S3Service, adapter_config, build_service,
-};
+use crate::protocol::s3::{S3Body as Body, S3Service};
 use crate::service::ObjectService;
 
 use super::fixture::{self, BucketSpec};
@@ -110,19 +108,15 @@ impl ProtocolHarness {
             .expect("one credential"),
         );
         let policy = Arc::new(fixture::full_access());
-        // The same adapter configuration the server derives from its resolved
-        // limits: SigV4 only, significant key bytes kept.
-        let config = adapter_config(&fixture::default_limits());
-
-        let handler = S3Handler::new(
+        // The same wiring the server uses, over the same limits: the adapter
+        // cannot diverge from the service it fronts (see `crate::compose`).
+        let service = crate::compose::s3_service(
             objects.clone(),
-            credentials.clone(),
-            PrincipalLimiter::new(8),
+            credentials,
+            policy,
+            &fixture::default_limits(),
         );
-        Self {
-            service: build_service(handler, credentials, policy, config),
-            objects,
-        }
+        Self { service, objects }
     }
 
     /// The object service behind the protocol, for arranging state that is not

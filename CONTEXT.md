@@ -55,9 +55,15 @@
 - **接口**：S3 用例（put/get/head/list/copy/delete、multipart 全流程）以及给组合根用的薄委托。
 - **可见性规则**：跨 crate 的集成测试用到的入口保持 `pub`；只被同 crate 的适配层或测试装置调用的入口是 `pub(crate)`。spec §10 要求公共接口变更同步更新规范与契约测试。
 
+### Composition（组合根）
+
+- **持有**：启动接线 —— 注册 driver kind、按配置创建实例、建服务并 warmup、把 S3 适配层包在服务外。
+- **接口**：`src/compose.rs` 内的一组函数；对 crate 内其余部分可见（`pub(crate)`），对外仍是 `server::run` 与测试装置。
+- **不负责**：监听、进程生命周期、后台任务（清理器的所有者仍是 `server`）。
+- **理由**：`server::run`、`fixture::service`、`ProtocolHarness::new` 曾各自维护一份略有差异的启动顺序，适配层标志可能与服务实际配置漂移。
+
 ### 未实现的候选（记录以免重复提议）
 
-- **Composition（组合根）**：把 `server::run`、`fixture::service`、`ProtocolHarness::new` 各自重推的接线收成一个模块。
 - **StagingLedger**：见上。
 
 ## 边界规则

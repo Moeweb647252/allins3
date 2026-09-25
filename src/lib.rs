@@ -22,6 +22,7 @@ pub mod server;
 pub mod service;
 pub mod timeouts;
 
+pub(crate) mod compose;
 pub(crate) mod sync;
 
 /// Test-support drivers, fault injection and the reusable contract-test
