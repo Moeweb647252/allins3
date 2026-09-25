@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::auth::{AccessPolicy, CredentialStore};
 use crate::catalog::BucketCatalog;
-use crate::config::{AppConfig, EnvSecretResolver, Limits};
+use crate::config::{AppConfig, Limits};
 use crate::domain::{DriverContext, DriverInstanceId, RequestId};
 use crate::driver::{DriverFactory, DriverKind, DriverRegistry, SecretResolver, StorageDriver};
 use crate::protocol::s3::{PrincipalLimiter, S3Handler, S3Service, adapter_config, build_service};
@@ -66,12 +66,15 @@ pub fn build_registry(config: &AppConfig) -> Result<DriverRegistry, String> {
 
 /// Creates every driver instance the config names, keyed by instance id.
 ///
-/// Config validation already guaranteed the ids are unique and the kinds
-/// registered, so a failure here is an instance-level fault (bad secret,
-/// unwritable backend), not a configuration mistake.
+/// The secret resolver is a parameter, not a hard-wired environment read: the
+/// production entry passes [`crate::config::EnvSecretResolver`], and a test can
+/// pass a resolver it controls. Config validation already guaranteed the ids
+/// are unique and the kinds registered, so a failure here is an instance-level
+/// fault (bad secret, unwritable backend), not a configuration mistake.
 pub async fn instances_from_config(
     registry: &mut DriverRegistry,
     config: &AppConfig,
+    secrets: &dyn SecretResolver,
 ) -> Result<HashMap<String, Arc<dyn StorageDriver>>, String> {
     let ctx = startup_ctx();
     let mut instances: HashMap<String, Arc<dyn StorageDriver>> = HashMap::new();
@@ -80,7 +83,7 @@ pub async fn instances_from_config(
         let instance_id = DriverInstanceId::parse(driver.id.clone())
             .map_err(|e| format!("invalid driver id `{}`: {e}", driver.id))?;
         let instance = registry
-            .create_instance(&ctx, &kind, &instance_id, &EnvSecretResolver)
+            .create_instance(&ctx, &kind, &instance_id, secrets)
             .await
             .map_err(|e| format!("failed to create driver `{}`: {e}", driver.id))?;
         instances.insert(driver.id.clone(), instance);

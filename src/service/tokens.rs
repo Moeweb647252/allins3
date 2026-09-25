@@ -52,9 +52,11 @@ struct StoredToken {
 pub(crate) struct TokenStore {
     records: Mutex<HashMap<String, StoredToken>>,
     ttl: Duration,
+    /// Mints the short prefix of a handle. It lives on the store rather than in
+    /// a process-wide static so two stores cannot influence each other's ids:
+    /// a test that builds a fresh store starts from a known value.
+    counter: AtomicU64,
 }
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl TokenStore {
     /// A store whose tokens live for `ttl`.
@@ -62,6 +64,7 @@ impl TokenStore {
         Self {
             records: Mutex::new(HashMap::new()),
             ttl,
+            counter: AtomicU64::new(0),
         }
     }
 
@@ -70,7 +73,7 @@ impl TokenStore {
     /// Expired handles are dropped on the way in, so the table cannot grow
     /// without bound even if no client ever resumes a token.
     pub(crate) fn issue(&self, record: TokenRecord) -> String {
-        let mut counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut counter = self.counter.fetch_add(1, Ordering::Relaxed);
         let id = format!(
             "tok-{:016x}-{}",
             {
@@ -162,5 +165,23 @@ mod tests {
             1,
             "expired handles must not accumulate"
         );
+    }
+
+    #[test]
+    fn each_store_mints_from_its_own_sequence() {
+        // The counter is store state, not a process-wide static, so two stores
+        // built in the same test start from the same point. Under a shared
+        // static the second store would depend on how many tokens the first
+        // (or any other test in the process) had already minted.
+        let first = TokenStore::new(Duration::from_secs(3600));
+        let second = TokenStore::new(Duration::from_secs(3600));
+        let prefix = |token: &str| token.split('-').nth(1).unwrap_or_default().to_string();
+
+        let a = prefix(&first.issue(record()));
+        let b = prefix(&second.issue(record()));
+        assert_eq!(a, b, "a fresh store starts its own sequence");
+
+        let c = prefix(&first.issue(record()));
+        assert_ne!(a, c, "a store still mints distinct handles");
     }
 }

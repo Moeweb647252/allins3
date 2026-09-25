@@ -66,6 +66,20 @@
 
 - **StagingLedger**：见上。
 
+## 进程级全局状态
+
+规则：新增进程级可变状态（`static`、`OnceLock`、`thread_local`、模块级缓存）不进入本仓库。每个状态归它服务的那个对象所有，随对象创建与销毁，这样两个实例、两个测试不会互相影响。
+
+有意保留的进程级边界（每处只是一次读取或无状态生成器）：
+
+| 位置 | 内容 | 为何保留 |
+| --- | --- | --- |
+| `main::main` | `std::env::args` / `ALLINS3_CONFIG` | 进程入口；参数与环境只在此读一次 |
+| `config::EnvSecretResolver` | `std::env::var` 读密钥 | 生产环境的密钥源；测试用 `AppConfig::from_toml(text, &dyn SecretResolver)` 或 `compose::instances_from_config(..., secrets)` 注入自己的解析器 |
+| `domain::WriteId::generate` | 进程内唯一的 `WriteId` 序号 | `WriteId` 的契约就是「进程内唯一、不可重用」，它不是可配置依赖；测试断言唯一性而非具体值 |
+
+已注入化（原先各自挂着 `static COUNTER`）：`TokenStore` 的令牌序号与 `S3Handler` 的 `x-amz-request-id` 序号 —— 两者都是对象生命周期内的状态，现由对象自身持有。
+
 ## 边界规则
 
 - 依赖方向 `protocol/s3 → service → driver`，`domain` 是共用叶子（ADR-0001）。

@@ -18,7 +18,7 @@ use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use tokio::net::TcpListener;
 
 use crate::compose;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, EnvSecretResolver};
 use crate::protocol::s3::{HttpError, HttpResponse, S3Body, S3Error, S3ErrorCode, S3Service};
 use crate::timeouts::IdleTimeoutBody;
 
@@ -29,7 +29,8 @@ pub async fn run(config: AppConfig) -> Result<(), String> {
     // Wiring lives in one place (`compose`); this function owns only the
     // process concerns: the listener, the sweeper's lifecycle, and shutdown.
     let mut registry = compose::build_registry(&config)?;
-    let instances = compose::instances_from_config(&mut registry, &config).await?;
+    let instances =
+        compose::instances_from_config(&mut registry, &config, &EnvSecretResolver).await?;
 
     let service = compose::object_service(
         config.catalog.clone(),

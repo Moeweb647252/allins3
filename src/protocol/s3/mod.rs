@@ -6,6 +6,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context as TaskContext, Poll};
 
 use async_trait::async_trait;
@@ -88,6 +89,10 @@ pub struct S3Handler {
     service: ObjectService,
     credentials: Arc<CredentialStore>,
     limiter: PrincipalLimiter,
+    /// Mints the `x-amz-request-id` of each request. Owned by the handler, not a
+    /// process-wide static, so one service cannot advance another's ids and a
+    /// test observes the sequence it started.
+    request_counter: Arc<AtomicU64>,
 }
 
 impl S3Handler {
@@ -101,6 +106,20 @@ impl S3Handler {
             service,
             credentials,
             limiter,
+            request_counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// A fresh request scope: a unique id and a request context, before any
+    /// admission decision is made.
+    fn request_scope(&self) -> RequestScope {
+        let n = self.request_counter.fetch_add(1, Ordering::Relaxed);
+        let request_id = format!("req-{n:016x}");
+        RequestScope {
+            ctx: DriverContext::new(RequestId::new(request_id.clone())),
+            request_id,
+            principal: None,
+            permit: None,
         }
     }
 
@@ -116,7 +135,7 @@ impl S3Handler {
     /// concurrency limit. One principal must not be able to occupy every
     /// connection of the server.
     fn scope<T>(&self, req: &S3Request<T>) -> S3Result<RequestScope> {
-        let mut scope = scope();
+        let mut scope = self.request_scope();
         // The backend operation deadline is the total deadline (spec §9.3): a
         // driver call must not outlive the request that started it, so the
         // request context carries the same bound the server enforces around the
@@ -185,19 +204,6 @@ struct RequestScope {
     /// Held for the whole request so the principal's slot is released when the
     /// operation ends, however it ends.
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-}
-
-fn scope() -> RequestScope {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let request_id = format!("req-{n:016x}");
-    RequestScope {
-        ctx: DriverContext::new(RequestId::new(request_id.clone())),
-        request_id,
-        principal: None,
-        permit: None,
-    }
 }
 
 fn attach_request_id<T>(mut resp: S3Response<T>, id: &str) -> S3Response<T> {
