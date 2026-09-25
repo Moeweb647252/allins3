@@ -104,6 +104,7 @@ async fn read(service: &ObjectService, key: &ObjectKey) -> Vec<u8> {
 async fn start_upload(service: &ObjectService, bucket: &str, key: &ObjectKey) -> String {
     service
         .create_multipart(
+            &ctx(),
             bucket,
             key,
             Some("tester"),
@@ -111,6 +112,7 @@ async fn start_upload(service: &ObjectService, bucket: &str, key: &ObjectKey) ->
             UserMetadata::new(),
             None,
         )
+        .await
         .expect("create multipart upload")
         .upload_id
         .as_str()
@@ -638,11 +640,15 @@ async fn mutated_manifests_never_publish_a_partial_object() {
                 "iteration {iteration}: a rejected manifest published an object"
             );
         }
-        let _ = harness.objects().abort_multipart(
-            BUCKET,
-            &ObjectKey::parse(&key).expect("key"),
-            &upload_id,
-        );
+        let _ = harness
+            .objects()
+            .abort_multipart(
+                &ctx(),
+                BUCKET,
+                &ObjectKey::parse(&key).expect("key"),
+                &upload_id,
+            )
+            .await;
     }
 }
 
@@ -754,7 +760,9 @@ async fn arbitrary_part_manifests_are_either_rejected_or_exactly_published() {
             assert!(retry.is_ok(), "iteration {iteration}: {retry:?}");
             assert_eq!(read(&service, &key).await, payload.to_vec());
         }
-        let _ = service.abort_multipart(MANIFEST_BUCKET, &key, &upload_id);
+        let _ = service
+            .abort_multipart(&ctx(), MANIFEST_BUCKET, &key, &upload_id)
+            .await;
     }
 }
 

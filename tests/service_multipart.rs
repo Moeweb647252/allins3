@@ -12,12 +12,13 @@ use std::time::Duration;
 
 use allins3::domain::{
     Checksum, ChecksumAlgorithm, ChecksumType, CommitState, ContentProperties, DriverContext,
-    EntityTag, ObjectKey, Preconditions, UserMetadata,
+    EntityTag, NamespaceId, ObjectKey, Preconditions, UserMetadata,
 };
-use allins3::driver::{DriverFactory, Profile};
+use allins3::driver::{DriverFactory, NamespaceCapabilities, Profile, UploadHandle, UploadId};
 use allins3::integrity::{base64, compute_checksum};
 use allins3::service::multipart::{
-    DeclaredCompletionChecksum, MIN_PART_SIZE, MultipartChecksum, PartChecksums, PartSummary,
+    CompletionPart, DeclaredCompletionChecksum, MIN_PART_SIZE, MultipartChecksum, PartChecksums,
+    PartSummary,
 };
 use allins3::service::{ObjectService, ReadConditions, ServiceError, TrailerChecksum};
 use allins3::testing::fault::{FaultDriverFactory, FaultPlan};
@@ -54,6 +55,7 @@ fn object_key(value: &str) -> ObjectKey {
 async fn start_upload(service: &ObjectService, key: &ObjectKey) -> String {
     service
         .create_multipart(
+            &ctx(),
             BUCKET,
             key,
             Some("tester"),
@@ -61,6 +63,7 @@ async fn start_upload(service: &ObjectService, key: &ObjectKey) -> String {
             UserMetadata::new(),
             None,
         )
+        .await
         .expect("create multipart upload")
         .upload_id
         .as_str()
@@ -136,6 +139,7 @@ async fn start_upload_with_checksum(
 ) -> String {
     service
         .create_multipart(
+            &ctx(),
             BUCKET,
             key,
             Some("tester"),
@@ -143,6 +147,7 @@ async fn start_upload_with_checksum(
             UserMetadata::new(),
             Some(MultipartChecksum::new(algorithm, checksum_type).expect("supported scheme")),
         )
+        .await
         .expect("create multipart upload")
         .upload_id
         .as_str()
@@ -243,7 +248,8 @@ async fn a_changed_manifest_is_rejected_and_the_retry_succeeds() {
 
     // A rejected completion must not consume the staged parts.
     let parts = service
-        .list_parts(BUCKET, &key, &upload_id, None, 100)
+        .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+        .await
         .expect("list parts");
     assert_eq!(parts.parts.len(), 1);
     assert!(service.latest_completion_state(&upload_id).is_none());
@@ -444,7 +450,8 @@ async fn a_completion_that_cannot_open_the_backend_is_retryable() {
     // Nothing was staged, so the claim must not outlive the failure: the parts
     // are still there and no attempt was recorded.
     let parts = service
-        .list_parts(BUCKET, &key, &upload_id, None, 100)
+        .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+        .await
         .expect("list parts");
     assert_eq!(parts.parts.len(), 1);
     assert!(service.latest_completion_state(&upload_id).is_none());
@@ -570,12 +577,18 @@ async fn an_unresolvable_commit_outcome_blocks_replay_and_is_never_swept() {
     );
 
     // ...nor aborted, nor reclaimed by a sweep with an expired lease.
-    assert!(service.abort_multipart(BUCKET, &key, &upload_id).is_err());
-    let swept = service.sweep_expired_uploads(Duration::ZERO);
+    assert!(
+        service
+            .abort_multipart(&ctx(), BUCKET, &key, &upload_id)
+            .await
+            .is_err()
+    );
+    let swept = service.sweep_expired_uploads(&ctx(), Duration::ZERO).await;
     assert_eq!(swept.reclaimed_uploads, 0);
     assert_eq!(swept.skipped_pending, 1);
     let uploads = service
-        .list_uploads(BUCKET, None, None, None, 100)
+        .list_uploads(&ctx(), BUCKET, None, None, None, 100)
+        .await
         .expect("list uploads");
     assert_eq!(uploads.uploads.len(), 1);
 }
@@ -588,19 +601,22 @@ async fn a_sweep_reclaims_only_expired_uploads() {
     upload_part(&service, &key, &upload_id, 1, b"sweep me").await;
 
     // A live lease keeps the staged parts.
-    let kept = service.sweep_expired_uploads(Duration::from_secs(3600));
+    let kept = service
+        .sweep_expired_uploads(&ctx(), Duration::from_secs(3600))
+        .await;
     assert_eq!(kept.reclaimed_uploads, 0);
     assert_eq!(kept.reclaimed_bytes, 0);
     assert!(!service.multipart_is_idle());
 
     // An expired lease reclaims the parts and returns the bytes to the quota.
-    let swept = service.sweep_expired_uploads(Duration::ZERO);
+    let swept = service.sweep_expired_uploads(&ctx(), Duration::ZERO).await;
     assert_eq!(swept.reclaimed_uploads, 1);
     assert_eq!(swept.reclaimed_bytes, 8);
     assert!(service.multipart_is_idle());
     assert!(
         service
-            .list_parts(BUCKET, &key, &upload_id, None, 100)
+            .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+            .await
             .is_err()
     );
 }
@@ -665,7 +681,7 @@ async fn a_part_upload_resets_the_reclaim_lease() {
     tokio::time::sleep(LEASE + Duration::from_millis(20)).await;
     upload_part(&service, &key, &upload_id, 1, b"first").await;
 
-    let kept = service.sweep_expired_uploads(LEASE);
+    let kept = service.sweep_expired_uploads(&ctx(), LEASE).await;
     assert_eq!(
         kept.reclaimed_uploads, 0,
         "a part just uploaded must keep the upload alive"
@@ -706,7 +722,8 @@ async fn an_aborted_upload_returns_its_staged_bytes_to_the_quota() {
     .expect("a part inside the quota");
 
     service
-        .abort_multipart(BUCKET, &key, &upload_id)
+        .abort_multipart(&ctx(), BUCKET, &key, &upload_id)
+        .await
         .expect("abort the upload");
     assert!(
         service.multipart_is_idle(),
@@ -781,7 +798,11 @@ async fn concurrent_completion_and_abort_are_arbitrated() {
             None,
             Preconditions::none()
         ),
-        async { service.abort_multipart(BUCKET, &other, &upload_id) },
+        async {
+            service
+                .abort_multipart(&ctx(), BUCKET, &other, &upload_id)
+                .await
+        },
     );
     assert!(
         !(completed.is_ok() && aborted.is_ok()),
@@ -1065,7 +1086,8 @@ async fn part_checksums_are_verified_and_reported() {
     assert!(matches!(err, ServiceError::BadDigest(_)), "got {err:?}");
     assert!(
         service
-            .list_parts(BUCKET, &key, &upload_id, None, 100)
+            .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+            .await
             .expect("list parts")
             .parts
             .is_empty(),
@@ -1110,7 +1132,8 @@ async fn part_checksums_are_verified_and_reported() {
     );
 
     let page = service
-        .list_parts(BUCKET, &key, &upload_id, None, 100)
+        .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+        .await
         .expect("list parts");
     assert_eq!(
         page.parts[0].checksum.as_ref().map(|c| c.value.clone()),
@@ -1198,7 +1221,8 @@ async fn a_part_trailer_checksum_is_verified_after_the_body() {
 
     // Only the verified part is staged; the rejected attempts added nothing.
     let page = service
-        .list_parts(BUCKET, &key, &upload_id, None, 100)
+        .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+        .await
         .expect("list parts");
     assert_eq!(page.parts.len(), 1, "{page:?}");
     assert_eq!(
@@ -1368,4 +1392,585 @@ async fn a_part_that_names_an_algorithm_fixes_the_upload_scheme() {
         stored.value().as_ref(),
         digest(ChecksumAlgorithm::Crc32, &body).as_slice()
     );
+}
+
+// --- The native route ------------------------------------------------------
+//
+// The same operations, on a namespace whose plan selects `Multipart = Native`:
+// the driver owns the parts and assembles them, while the service keeps the
+// protocol semantics. The assertions mirror the coordinator's, so the two
+// routes can be read side by side.
+
+/// A service over a namespace that declares native multipart.
+async fn native_service() -> ObjectService {
+    let mut caps = NamespaceCapabilities::full_memory();
+    caps.multipart = true;
+    let factory: Arc<dyn DriverFactory> =
+        Arc::new(ReferenceDriverFactory::with_capabilities("reference", caps));
+    service_with(factory).await
+}
+
+async fn published_etag(service: &ObjectService, key: &ObjectKey) -> String {
+    service
+        .head_object(&ctx(), BUCKET, key, &ReadConditions::default(), None)
+        .await
+        .expect("head object")
+        .metadata
+        .etag
+        .expect("etag")
+        .as_str()
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_native_upload_publishes_through_the_driver() {
+    let service = native_service().await;
+    let key = object_key("native/object.bin");
+    let upload_id = start_upload(&service, &key).await;
+    let first = upload_part_bytes(
+        &service,
+        &key,
+        &upload_id,
+        1,
+        vec![b'a'; MIN_PART_SIZE as usize],
+        None,
+    )
+    .await
+    .expect("first part")
+    .etag;
+    let second = upload_part(&service, &key, &upload_id, 2, b"tail").await;
+
+    let manifest = [(1u16, Some(first)), (2u16, Some(second))];
+    let meta = service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            None,
+            Preconditions::none(),
+        )
+        .await
+        .expect("complete");
+    assert_eq!(meta.size, MIN_PART_SIZE + 4);
+    let etag = meta.etag.clone().expect("etag");
+    assert!(
+        etag.as_str().ends_with("-2"),
+        "the multipart etag must carry the part count: {etag:?}"
+    );
+
+    let body = read_object(&service, &key).await;
+    assert_eq!(body.len(), (MIN_PART_SIZE + 4) as usize);
+    assert!(body.ends_with(b"tail"));
+    assert!(service.multipart_is_idle());
+
+    // The upload is consumed exactly once.
+    assert!(
+        service
+            .complete_multipart(
+                &ctx(),
+                BUCKET,
+                &key,
+                &upload_id,
+                &manifest,
+                None,
+                Preconditions::none()
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(published_etag(&service, &key).await, etag.as_str());
+}
+
+#[tokio::test]
+async fn a_native_completion_is_validated_before_it_publishes() {
+    let service = native_service().await;
+    let key = object_key("native/rejected.bin");
+    let upload_id = start_upload(&service, &key).await;
+    let etag = upload_part(&service, &key, &upload_id, 1, b"payload").await;
+
+    let wrong = [(
+        1u16,
+        Some(EntityTag::new("not-the-part-etag").expect("tag")),
+    )];
+    let err = service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &wrong,
+            None,
+            Preconditions::none(),
+        )
+        .await
+        .expect_err("a mismatched part ETag must be rejected");
+    assert!(matches!(err, ServiceError::InvalidArgument(_)), "{err:?}");
+
+    // Nothing was published, and the rejected attempt left the parts alone.
+    assert!(
+        service
+            .head_object(&ctx(), BUCKET, &key, &ReadConditions::default(), None)
+            .await
+            .is_err()
+    );
+    let parts = service
+        .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+        .await
+        .expect("list parts");
+    assert_eq!(parts.parts.len(), 1);
+    assert!(!service.multipart_is_idle());
+
+    let right = [(1u16, Some(etag))];
+    service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &right,
+            None,
+            Preconditions::none(),
+        )
+        .await
+        .expect("a corrected retry publishes");
+    assert_eq!(read_object(&service, &key).await, b"payload");
+}
+
+#[tokio::test]
+async fn a_native_completion_verifies_the_declared_object_checksum() {
+    let service = native_service().await;
+    let key = object_key("native/checksum.bin");
+    let upload_id = start_upload_with_checksum(
+        &service,
+        &key,
+        ChecksumAlgorithm::Crc32,
+        ChecksumType::FullObject,
+    )
+    .await;
+    let etag = upload_part(&service, &key, &upload_id, 1, b"assembled bytes").await;
+    let manifest = [(1u16, Some(etag))];
+
+    let wrong = DeclaredCompletionChecksum {
+        algorithm: Some(ChecksumAlgorithm::Crc32),
+        value: Some(vec![0, 0, 0, 0]),
+        checksum_type: Some(ChecksumType::FullObject),
+        part_count: None,
+    };
+    let err = service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            Some(wrong),
+            Preconditions::none(),
+        )
+        .await
+        .expect_err("a declared checksum that does not match must not publish");
+    assert!(matches!(err, ServiceError::BadDigest(_)), "{err:?}");
+    assert!(
+        service
+            .head_object(&ctx(), BUCKET, &key, &ReadConditions::default(), None)
+            .await
+            .is_err()
+    );
+
+    let correct = DeclaredCompletionChecksum {
+        algorithm: Some(ChecksumAlgorithm::Crc32),
+        value: Some(digest(ChecksumAlgorithm::Crc32, b"assembled bytes")),
+        checksum_type: Some(ChecksumType::FullObject),
+        part_count: None,
+    };
+    let meta = service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            Some(correct),
+            Preconditions::none(),
+        )
+        .await
+        .expect("the matching checksum publishes");
+    let stored = meta.checksums.first().expect("a checksum is stored");
+    assert_eq!(stored.algorithm(), ChecksumAlgorithm::Crc32);
+    assert_eq!(
+        stored.value().as_ref(),
+        digest(ChecksumAlgorithm::Crc32, b"assembled bytes").as_slice()
+    );
+}
+
+#[tokio::test]
+async fn a_native_upload_abort_removes_it() {
+    let service = native_service().await;
+    let key = object_key("native/abort.bin");
+    let upload_id = start_upload(&service, &key).await;
+    upload_part(&service, &key, &upload_id, 1, b"dropped").await;
+
+    service
+        .abort_multipart(&ctx(), BUCKET, &key, &upload_id)
+        .await
+        .expect("abort the upload");
+    assert!(service.multipart_is_idle());
+    assert!(
+        service
+            .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+            .await
+            .is_err()
+    );
+    assert!(
+        service
+            .head_object(&ctx(), BUCKET, &key, &ReadConditions::default(), None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn the_native_route_keeps_its_uploads_out_of_the_coordinator() {
+    let native = native_service().await;
+    let coordinator = service_with(Arc::new(ReferenceDriverFactory::new("reference"))).await;
+    let key = object_key("native/routing.bin");
+
+    // The plan, not an ad-hoc handle check, decides where the upload lives: a
+    // native namespace keeps it in the driver, and the sweep retires a native
+    // record only once the driver no longer holds the upload, so an expired
+    // lease reclaims nothing here and the client can still finish the upload...
+    let native_upload = start_upload(&native, &key).await;
+    upload_part(&native, &key, &native_upload, 1, b"kept").await;
+    let swept = native.sweep_expired_uploads(&ctx(), Duration::ZERO).await;
+    assert_eq!(
+        swept.reclaimed_uploads, 0,
+        "the service must not reclaim a driver-side upload"
+    );
+    assert_eq!(swept.skipped_pending, 0);
+    assert!(
+        native
+            .list_parts(&ctx(), BUCKET, &key, &native_upload, None, 100)
+            .await
+            .is_ok(),
+        "the driver-side upload must survive the sweep"
+    );
+    native
+        .abort_multipart(&ctx(), BUCKET, &key, &native_upload)
+        .await
+        .expect("abort the native upload");
+
+    // ... while the same sequence on the coordinator is the coordinator's to
+    // reclaim.
+    let coordinated_upload = start_upload(&coordinator, &key).await;
+    upload_part(&coordinator, &key, &coordinated_upload, 1, b"kept").await;
+    let swept = coordinator
+        .sweep_expired_uploads(&ctx(), Duration::ZERO)
+        .await;
+    assert_eq!(swept.reclaimed_uploads, 1);
+    assert_eq!(swept.reclaimed_bytes, 4);
+}
+
+#[tokio::test]
+async fn the_sweep_retires_a_native_record_once_the_driver_forgets_the_upload() {
+    let mut caps = NamespaceCapabilities::full_memory();
+    caps.multipart = true;
+    let factory: Arc<dyn DriverFactory> =
+        Arc::new(ReferenceDriverFactory::with_capabilities("reference", caps));
+    let (service, _other, driver) = fixture::two_services_over_shared_drivers(
+        factory,
+        BucketSpec {
+            bucket: BUCKET,
+            driver: DRIVER,
+            namespace: "ns-a",
+            profile: Profile::CoreWrite,
+        },
+        fixture::default_limits(),
+        fixture::full_access(),
+    )
+    .await;
+
+    let key = object_key("native/forgotten.bin");
+    let upload_id = start_upload(&service, &key).await;
+    upload_part(&service, &key, &upload_id, 1, b"orphan").await;
+
+    // The driver still holds the upload, so an expired lease keeps the record
+    // even though the service has nothing staged for it.
+    let kept = service.sweep_expired_uploads(&ctx(), Duration::ZERO).await;
+    assert_eq!(kept.reclaimed_uploads, 0);
+    assert!(!service.multipart_is_idle());
+
+    // The driver forgets the upload out of band (its own session lifetime, or
+    // an abort from another replica). The record can no longer drive anything,
+    // so the next sweep retires it and the service goes idle again.
+    let namespace = driver
+        .open_namespace(&ctx(), &NamespaceId::parse("ns-a").expect("namespace"))
+        .await
+        .expect("open namespace");
+    namespace
+        .multipart
+        .as_ref()
+        .expect("native multipart")
+        .abort(
+            &ctx(),
+            &UploadHandle {
+                upload_id: UploadId::from_raw(upload_id.clone()),
+                key: key.clone(),
+            },
+        )
+        .await
+        .expect("driver-side abort");
+
+    let swept = service.sweep_expired_uploads(&ctx(), Duration::ZERO).await;
+    assert_eq!(swept.reclaimed_uploads, 1);
+    assert!(service.multipart_is_idle());
+    assert!(
+        service
+            .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+            .await
+            .is_err(),
+        "a retired native upload is no longer drivable"
+    );
+}
+
+#[tokio::test]
+async fn a_native_upload_another_service_created_is_adopted_and_drivable() {
+    let mut caps = NamespaceCapabilities::full_memory();
+    caps.multipart = true;
+    let factory: Arc<dyn DriverFactory> =
+        Arc::new(ReferenceDriverFactory::with_capabilities("reference", caps));
+    let (creator, adopter, _driver) = fixture::two_services_over_shared_drivers(
+        factory,
+        BucketSpec {
+            bucket: BUCKET,
+            driver: DRIVER,
+            namespace: "ns-a",
+            profile: Profile::CoreWrite,
+        },
+        fixture::default_limits(),
+        fixture::full_access(),
+    )
+    .await;
+
+    let key = object_key("native/adopted.bin");
+    let upload_id = start_upload(&creator, &key).await;
+    let etag = upload_part(&creator, &key, &upload_id, 1, b"adopted").await;
+
+    // The adopter has no session for this upload: `ListMultipartUploads` is the
+    // driver's answer, and everything it reports must be drivable, so the
+    // adopter takes the upload on instead of reporting a session every entry
+    // point would refuse.
+    let page = adopter
+        .list_uploads(&ctx(), BUCKET, None, None, None, 100)
+        .await
+        .expect("list uploads");
+    assert_eq!(page.uploads.len(), 1);
+    assert_eq!(page.uploads[0].upload_id.as_str(), upload_id);
+    assert!(!adopter.multipart_is_idle());
+
+    // Drivable: the adopter can list the parts and finish the upload.
+    let parts = adopter
+        .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+        .await
+        .expect("list parts");
+    assert_eq!(parts.parts.len(), 1);
+    assert_eq!(parts.parts[0].etag, etag);
+    adopter
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &[(1u16, Some(etag))],
+            None,
+            Preconditions::none(),
+        )
+        .await
+        .expect("complete the adopted upload");
+    assert!(adopter.multipart_is_idle());
+    assert_eq!(read_object(&adopter, &key).await, b"adopted".to_vec());
+}
+
+#[tokio::test]
+async fn an_empty_upload_marker_selects_from_the_beginning_on_both_routes() {
+    // S3 defines the marker as a pair whose empty value means "from the start";
+    // the coordinated route always read it that way, and the native route must
+    // too, instead of rejecting the empty key or applying a lone marker.
+    for service in [
+        native_service().await,
+        service_with(Arc::new(ReferenceDriverFactory::new("reference"))).await,
+    ] {
+        for name in ["markers/a.bin", "markers/b.bin"] {
+            let key = object_key(name);
+            let upload_id = start_upload(&service, &key).await;
+            upload_part(&service, &key, &upload_id, 1, b"part").await;
+        }
+        let all = service
+            .list_uploads(&ctx(), BUCKET, None, None, None, 100)
+            .await
+            .expect("list uploads");
+        assert_eq!(all.uploads.len(), 2);
+        let empty = service
+            .list_uploads(&ctx(), BUCKET, None, Some(""), Some(""), 100)
+            .await
+            .expect("an empty marker is the start of the listing");
+        assert_eq!(empty.uploads.len(), 2);
+        // A lone marker is not a position: it is ignored on both routes.
+        let lone = service
+            .list_uploads(&ctx(), BUCKET, None, None, Some("whatever"), 100)
+            .await
+            .expect("a lone upload-id marker is ignored");
+        assert_eq!(lone.uploads.len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn the_native_route_and_the_coordinator_agree() {
+    let native = native_service().await;
+    let coordinator = service_with(Arc::new(ReferenceDriverFactory::new("reference"))).await;
+    let key = object_key("parity/object.bin");
+
+    let mut published = Vec::new();
+    for service in [&native, &coordinator] {
+        let upload_id = start_upload(service, &key).await;
+        let first = upload_part_bytes(
+            service,
+            &key,
+            &upload_id,
+            1,
+            vec![b'p'; MIN_PART_SIZE as usize],
+            None,
+        )
+        .await
+        .expect("first part")
+        .etag;
+        let second = upload_part(service, &key, &upload_id, 2, b"end").await;
+        let manifest = [(1u16, Some(first)), (2u16, Some(second))];
+        service
+            .complete_multipart(
+                &ctx(),
+                BUCKET,
+                &key,
+                &upload_id,
+                &manifest,
+                None,
+                Preconditions::none(),
+            )
+            .await
+            .expect("complete");
+        published.push((
+            published_etag(service, &key).await,
+            read_object(service, &key).await,
+        ));
+    }
+
+    assert_eq!(
+        published[0].0, published[1].0,
+        "the published ETags must agree"
+    );
+    assert_eq!(
+        published[0].1, published[1].1,
+        "the published bytes must agree"
+    );
+}
+
+#[tokio::test]
+async fn a_part_checksum_under_another_algorithm_is_refused_on_both_routes() {
+    let native = native_service().await;
+    let coordinator = service_with(Arc::new(ReferenceDriverFactory::new("reference"))).await;
+    let key = object_key("manifest/algorithm.bin");
+
+    for service in [&native, &coordinator] {
+        // The upload runs under CRC32, and a part digest is only computed under
+        // that, so a declaration under SHA256 has nothing to be checked against
+        // on either route.
+        let upload_id = start_upload_with_checksum(
+            service,
+            &key,
+            ChecksumAlgorithm::Crc32,
+            ChecksumType::FullObject,
+        )
+        .await;
+        let etag = upload_part(service, &key, &upload_id, 1, b"payload").await;
+
+        let wrong = [CompletionPart {
+            number: 1,
+            etag: Some(etag.clone()),
+            checksum: Some((
+                ChecksumAlgorithm::Sha256,
+                digest(ChecksumAlgorithm::Sha256, b"payload"),
+            )),
+        }];
+        let err = service
+            .complete_multipart(
+                &ctx(),
+                BUCKET,
+                &key,
+                &upload_id,
+                &wrong,
+                None,
+                Preconditions::none(),
+            )
+            .await
+            .expect_err("a part declared under another algorithm must be refused");
+        assert!(matches!(err, ServiceError::InvalidRequest(_)), "{err:?}");
+
+        // Nothing was published and the part is untouched, so the same manifest
+        // under the upload's own algorithm still completes.
+        assert!(
+            service
+                .head_object(&ctx(), BUCKET, &key, &ReadConditions::default(), None)
+                .await
+                .is_err()
+        );
+        let right = [CompletionPart {
+            number: 1,
+            etag: Some(etag),
+            checksum: Some((
+                ChecksumAlgorithm::Crc32,
+                digest(ChecksumAlgorithm::Crc32, b"payload"),
+            )),
+        }];
+        service
+            .complete_multipart(
+                &ctx(),
+                BUCKET,
+                &key,
+                &upload_id,
+                &right,
+                None,
+                Preconditions::none(),
+            )
+            .await
+            .expect("a part declared under the upload's algorithm publishes");
+        assert_eq!(read_object(service, &key).await, b"payload");
+    }
+}
+
+#[tokio::test]
+async fn a_zero_part_marker_is_accepted_on_both_routes() {
+    let native = native_service().await;
+    let coordinator = service_with(Arc::new(ReferenceDriverFactory::new("reference"))).await;
+    let key = object_key("native/marker.bin");
+
+    for service in [&native, &coordinator] {
+        let upload_id = start_upload(service, &key).await;
+        upload_part(service, &key, &upload_id, 1, b"one").await;
+        upload_part(service, &key, &upload_id, 2, b"two").await;
+
+        // `part-number-marker=0` asks for the first page; it is not part 0, and
+        // rejecting it would make one route refuse a request the other serves.
+        let page = service
+            .list_parts(&ctx(), BUCKET, &key, &upload_id, Some(0), 100)
+            .await
+            .expect("a zero part marker must be accepted");
+        assert_eq!(page.parts.len(), 2, "{page:?}");
+
+        let page = service
+            .list_parts(&ctx(), BUCKET, &key, &upload_id, Some(1), 100)
+            .await
+            .expect("list parts");
+        assert_eq!(page.parts.len(), 1, "{page:?}");
+        assert_eq!(page.parts[0].number, 2);
+    }
 }

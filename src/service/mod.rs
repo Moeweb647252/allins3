@@ -37,7 +37,7 @@ use crate::integrity::StreamingDigest;
 
 use admission::Admission;
 pub use error::ServiceError;
-use handles::NamespaceHandles;
+use handles::{CopyRoute, NamespaceHandles};
 use tokens::{TokenRecord, TokenStore};
 
 /// How many times the read flow re-runs `stat → conditions → range → read`
@@ -274,11 +274,17 @@ pub struct ObjectService {
 
 impl ObjectService {
     /// Creates a service over a catalog and a set of driver instances.
+    ///
+    /// `production` is the deployment mode from configuration
+    /// (`development = false`). It is a policy the service must apply at the
+    /// moment it opens a namespace, because only the opened namespace knows
+    /// whether it can back persistent writes (ADR-0006 §4).
     pub fn new(
         catalog: BucketCatalog,
         drivers: HashMap<String, std::sync::Arc<dyn StorageDriver>>,
         limits: crate::config::Limits,
         access: AccessPolicy,
+        production: bool,
     ) -> Self {
         let staging_quota = limits.staging_quota_bytes;
         let token_ttl = limits.list_token_ttl;
@@ -288,7 +294,7 @@ impl ObjectService {
         );
         Self {
             inner: std::sync::Arc::new(ServiceInner {
-                handles: NamespaceHandles::new(drivers),
+                handles: NamespaceHandles::new(drivers, production),
                 catalog,
                 limits,
                 // The token lifetime is a deployment policy owned by the token
@@ -565,8 +571,7 @@ impl ObjectService {
         self.require_writable(binding)?;
         let handle = self.inner.handles.get(binding, ctx).await?;
         let write = handle
-            .write
-            .as_ref()
+            .writer()
             .ok_or_else(|| ServiceError::NotImplemented("bucket is not writable".into()))?;
 
         let max_single = self.inner.limits.max_single_write_size;
@@ -748,8 +753,7 @@ impl ObjectService {
         self.require_writable(&binding)?;
         let handle = self.inner.handles.get(&binding, ctx).await?;
         let write = handle
-            .write
-            .as_ref()
+            .writer()
             .ok_or_else(|| ServiceError::NotImplemented("bucket is not writable".into()))?;
         write
             .delete(
@@ -782,8 +786,7 @@ impl ObjectService {
         }
         let handle = self.inner.handles.get(&binding, ctx).await?;
         let write = handle
-            .write
-            .as_ref()
+            .writer()
             .ok_or_else(|| ServiceError::NotImplemented("bucket is not writable".into()))?;
 
         let mut results = Vec::with_capacity(items.len());
@@ -972,10 +975,12 @@ impl ObjectService {
             MetadataDirective::Replace => (params.content.clone(), params.user_metadata.clone()),
         };
 
-        // Native copy is only valid for a same-namespace copy.
+        // Native copy is only valid for a same-namespace copy, and only when
+        // the plan for this namespace selected the native route: the decision
+        // is read from the plan rather than re-derived from the handle.
         if params.source_bucket == destination_bucket {
-            let handle = self.inner.handles.get(&binding, ctx).await?;
-            if let Some(native) = &handle.native_copy {
+            let namespace = self.inner.handles.get(&binding, ctx).await?;
+            if let CopyRoute::Native(native) = namespace.copy_route() {
                 let request = CopyRequest {
                     source: CopySource {
                         namespace: source_binding.namespace.clone(),

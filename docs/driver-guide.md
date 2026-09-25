@@ -12,18 +12,31 @@
 | `StagedWrite` | `src/driver/traits.rs` | `write_chunk` 追加且背压由调用方施加；`commit(self)` 与 `abort(self)` 都消费自身；`abort` 必须使后续发布不可能 |
 | `CommitRecovery`（可选） | `src/driver/extensions.rs` | `query(write_id)`：`Committed` / `NotCommittedFinal` / `InFlight` / `Unknown`；**查不到记录必须返回 `Unknown`**，不能当作终态失败 |
 | `NativeCopy`（可选） | `src/driver/extensions.rs` | 仅在同一原生复制域内；只接受 registry 解析出的 `CopySource`（namespace + key + revision），不接受任意 URL |
-| `MultipartNamespace`（可选） | `src/driver/extensions.rs` | 后端原生 multipart；不实现时由服务层协调器用 staged write 补齐 |
+| `MultipartNamespace`（可选） | `src/driver/extensions.rs` | 后端原生 multipart；声明 `multipart = true` 就会被服务层路由到这里（ADR-0010），不声明则由协调器用 staged write 补齐 |
 | `DriverFactory` + `SecretResolver` | `src/driver/factory.rs` | 注册 kind、解析 `env:NAME` 之类引用；secret 值不得进入日志或错误消息 |
 
 ## 2. 能力声明必须与句柄一致
 
-`NamespaceCapabilities` 中的每个能力都必须与实际提供的句柄一致，`NamespaceHandle::is_self_consistent()` 会在契约测试里检查：
+`NamespaceCapabilities` 中的每个能力都必须与实际提供的句柄一致。`NamespaceHandle::is_self_consistent()` 在契约测试里检查，**服务层打开 namespace 时也会检查**——不一致的驱动在启动/打开时即失败，而不是被路由静默降级：
 
 - `write` ⇔ `write` 句柄存在，`multipart` ⇔ `multipart`，`native_copy` ⇔ `native_copy`，`recovery` ⇔ `recovery`。
 - `persistence = Volatile`、`consistency = Eventual`、`exclusive_writer = false` 中任意一项都会让 `is_production_write_capable()` 为假。
 - `limits` 必须反映真实上限（单次写入、对象大小、part 数、part 最小大小、metadata 数量与字节）。服务层用这些值做规划与拒绝，写小了只是保守，写大了会在真实后端失败。
 
 档位（bucket 配置的 `profile`）在启动时校验并在 `warmup` 阶段对每个 namespace 实际打开一次：能力不足会让服务器启动失败，而不是运行时降级。
+
+生产模式（`development = false`）下这条线更严：任何非 `CoreRead` 的 bucket 在打开 namespace 时都必须通过 `is_production_write_capable()`，否则服务器启动失败并给出具体缺失项。测试 driver 的 kind 前缀 `test-` 只能在 `development = true` 下注册（`config` 校验），而 `is_production_write_capable()` 覆盖真实 driver 声明易失存储或非排他写入的情况。
+
+打开 namespace 时服务层还会用 `features_for_profile(profile)` 调用 `plan()` 并把结果缓存下来，之后的路由（原生 copy、原生 multipart、补齐）只读这份规划。因此**声明即路由**：声明了 `multipart = true` 就必须真的能用原生 multipart 完成一次上传（契约 harness 的 `multipart_native_semantics` 会验证），否则应在声明里写 `false` 并让服务层协调器兜底。
+
+原生 multipart 的几处契约细节：`create_upload` 会收到该 upload 固定的 checksum 方案（`MultipartChecksumScheme`），`list_parts` 上报的每个 part 摘要必须按它计算；`complete` 会在发布**之前**用传入的 `expected` 校验对象级 checksum，校验不过必须不发布且不消耗 upload（契约 harness 现在两段都验：错的声明值被拒后可重试，对的声明值被接受）；`list_uploads` 的驱动契约不带 prefix（由服务层过滤）。
+
+原生 upload 的生命周期归驱动：服务侧只保留一条绑定记录。两条由此而生的契约：
+
+- **一个已消失的原生 upload，`list_parts` 必须返回 `NotFound`**。清理器就是靠这个判断服务侧记录能不能退休：`NotFound` 表示驱动已忘记它（租约、TTL 或另一个副本 abort 过），记录随之回收；其他任何错误都按「仍在」处理，把记录留在下一轮。若驱动用别的错误表示「不存在」，服务侧记录会一直保留。
+- **`list_uploads` 上报的每个 upload 都必须可驱动**。服务对没有记录的原生 upload 会就地收养成 session（checksum/content/metadata 留空，由你持有），因此后续的 `list_parts` / `begin_part` / `complete` / `abort` 都按它自己的绑定工作。
+
+完成清单的校验（part 是否存在与重复、ETag 一致、升序、非末段 5 MiB、part 声明的 checksum）由服务层一份实现完成，原生路径与协调器路径跑的是同一个函数，驱动不需要再判断一遍：同一条 S3 请求不会在一条路径上被接受、在另一条上被拒绝。其中 part 的 checksum 声明必须与该 upload 的 scheme 算法一致，算法不一致的声明一律拒（驱动只按 scheme 计算摘要，没有可比较的值），因此驱动未上报某个 part 的摘要时会得到「拒绝」而不是「放行」。
 
 ## 3. 语义红线
 
@@ -53,6 +66,8 @@ python3 scripts/e2e_boto3.py
 契约 harness 会验证：CRUD、暂存不可见、原子发布与 abort、revision 稳定读、元数据更新产生新 revision、有序分页、delimiter 折叠、条件写、namespace 隔离、提交恢复四态，以及**原生复制与流式补齐的等价性**（`copy_native_matches_emulation`）。能力不足的检查会被跳过并在报告中列出原因，不会静默通过。
 
 ## 5. 生产准入（P6 清单）
+
+运行时已就位的部分：生产模式下可写 binding 必须 `is_production_write_capable()`（启动即拒绝）；退出时对每个 driver 实例调用 `StorageDriver::shutdown`（有 bounded deadline，失败只记日志）；`/readyz` 汇总每实例 `health`，任一实例不服务即返回 `503`。
 
 在标记某配置可用于生产前，必须补充：
 

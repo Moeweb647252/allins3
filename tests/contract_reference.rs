@@ -127,6 +127,26 @@ async fn read_only_capabilities_reject_core_write_profile() {
 }
 
 #[tokio::test]
+async fn a_namespace_that_declares_native_multipart_must_provide_it() {
+    let mut caps = NamespaceCapabilities::full_memory();
+    caps.multipart = true;
+    let (driver, _) = build(
+        Arc::new(ReferenceDriverFactory::with_capabilities(
+            "reference-native",
+            caps,
+        )),
+        "ref-native",
+    )
+    .await;
+
+    let report = run_for(driver.as_ref()).await;
+    assert!(
+        report.passed.contains(&"multipart_native_semantics"),
+        "the native multipart checks must run when the namespace declares them: {report:?}"
+    );
+}
+
+#[tokio::test]
 async fn vec_driver_routes_copy_to_emulation() {
     let (driver, _) = build(Arc::new(VecDriverFactory::new("vec")), "vec-cap").await;
     let handle = driver

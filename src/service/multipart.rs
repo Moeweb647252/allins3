@@ -1,26 +1,38 @@
-//! The generic multipart coordinator.
+//! Multipart: the generic coordinator and the native route.
 //!
-//! Multipart is provided by the service layer over the driver's staged write,
-//! so it works for any writable namespace without native multipart support
-//! (spec §8). Sessions and staged parts live in a `MultipartStore` /
-//! `StagingStore` test implementation backed by memory with a configured quota.
+//! Which one serves an upload is decided by the namespace's capability plan,
+//! once, when the upload is created (spec §3.3): a namespace whose plan selects
+//! `Multipart = Native` keeps its session, its parts and its completion in the
+//! driver through [`MultipartNamespace`], and everything else is coordinated
+//! here over the driver's staged write (spec §8), so any writable namespace can
+//! serve multipart.
 //!
-//! This staging store is deliberately **not** durable: it survives neither a
-//! restart nor a crash, which is why multipart cannot be claimed "production
-//! ready" here (`INV-10`). The state machine, atomic completion, manifest
-//! validation and quota accounting are real.
+//! The coordinator's staging store is deliberately **not** durable: it survives
+//! neither a restart nor a crash, which is why the coordinator's multipart
+//! cannot be claimed "production ready" here (`INV-10`). The state machine,
+//! atomic completion, manifest validation and quota accounting are real.
+//!
+//! Both routes share this module's protocol semantics: the manifest is
+//! validated, the scheme is fixed for the upload's lifetime, and completion
+//! publishes exactly once. Only *where* the parts live and who assembles them
+//! differs, so the two routes can be compared on the same behaviour.
 
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 
 use crate::domain::{
     BeginWrite, Checksum, ChecksumAlgorithm, ChecksumType, CommitAttributes, CommitState,
-    ContentProperties, DriverContext, EntityTag, ObjectKey, ObjectMetadata, PartNumber,
-    Preconditions, UserMetadata, WriteId,
+    ContentProperties, DriverContext, DriverErrorKind, EntityTag, ObjectKey, ObjectMetadata,
+    PartNumber, Preconditions, RequestId, UserMetadata, WriteId,
 };
-use crate::driver::UploadId;
+use crate::driver::{
+    CompletedPart, CreateUploadRequest, MultipartChecksumScheme, MultipartNamespace, PartInfo,
+    UploadHandle, UploadId,
+};
 use crate::integrity::{StreamingDigest, composite_checksum, hex};
 
 pub use super::staging::PartChecksum;
@@ -150,6 +162,24 @@ pub struct UploadSession {
     /// an upload that is still being fed parts is never reclaimed under a
     /// client no matter how long it has been open.
     pub last_activity: SystemTime,
+    /// The driver-side upload handle when the namespace's plan selected the
+    /// native route, and `None` when the coordinator owns the parts.
+    ///
+    /// The decision is recorded on the session rather than re-derived per
+    /// operation, so a later call cannot route an upload differently from the
+    /// one that created it.
+    pub(crate) native: Option<UploadHandle>,
+}
+
+/// Where one upload's parts and completion live.
+enum UploadRoute {
+    /// The driver owns the session, its parts and the completion.
+    Native {
+        multipart: Arc<dyn MultipartNamespace>,
+        upload: UploadHandle,
+    },
+    /// The coordinator owns them over the driver's staged write.
+    Emulated,
 }
 
 /// The recorded outcome of one completion attempt.
@@ -338,9 +368,38 @@ impl ObjectService {
         self.inner.multipart.store()
     }
 
-    /// Creates a multipart upload without touching any existing object.
-    pub fn create_multipart(
+    /// Resolves where an existing upload's parts and completion live.
+    async fn upload_route(
         &self,
+        binding: &crate::catalog::BucketBinding,
+        ctx: &DriverContext,
+        session: &UploadSession,
+    ) -> Result<UploadRoute, ServiceError> {
+        let Some(upload) = session.native.clone() else {
+            return Ok(UploadRoute::Emulated);
+        };
+        let namespace = self.inner.handles.get(binding, ctx).await?;
+        let multipart = namespace.native_multipart().cloned().ok_or_else(|| {
+            ServiceError::Internal(format!(
+                "upload `{}` was created natively but bucket `{}` no longer offers native multipart",
+                upload.upload_id.as_str(),
+                binding.bucket
+            ))
+        })?;
+        Ok(UploadRoute::Native { multipart, upload })
+    }
+
+    /// Creates a multipart upload without touching any existing object.
+    ///
+    /// The namespace's capability plan decides where the upload lives: a native
+    /// namespace starts it in the driver and the driver's upload id is what the
+    /// client sees, otherwise the coordinator starts one here.
+    // Each argument is the upload's address, its owner or a distinct input the
+    // caller already has; grouping them would only relabel them.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_multipart(
+        &self,
+        ctx: &DriverContext,
         bucket: &str,
         key: &ObjectKey,
         principal: Option<&str>,
@@ -350,7 +409,31 @@ impl ObjectService {
     ) -> Result<UploadSession, ServiceError> {
         let binding = self.binding(bucket)?;
         self.require_writable(&binding)?;
-        let upload_id = UploadId::generate();
+        let namespace = self.inner.handles.get(&binding, ctx).await?;
+        let native = match namespace.native_multipart() {
+            Some(multipart) => Some(
+                multipart
+                    .create_upload(
+                        ctx,
+                        CreateUploadRequest {
+                            key: key.clone(),
+                            content: content.clone(),
+                            user_metadata: user_metadata.clone(),
+                            checksum: checksum.map(|scheme| MultipartChecksumScheme {
+                                algorithm: scheme.algorithm,
+                                checksum_type: scheme.checksum_type,
+                            }),
+                        },
+                    )
+                    .await
+                    .map_err(|e| ServiceError::from_driver(&e, true))?,
+            ),
+            None => None,
+        };
+        let upload_id = native
+            .as_ref()
+            .map(|upload| upload.upload_id.clone())
+            .unwrap_or_else(UploadId::generate);
         let session = UploadSession {
             upload_id: upload_id.clone(),
             bucket: bucket.to_string(),
@@ -362,6 +445,7 @@ impl ObjectService {
             checksum,
             initiated: SystemTime::now(),
             last_activity: SystemTime::now(),
+            native,
         };
         let mut state = self.multipart();
         state
@@ -416,9 +500,57 @@ impl ObjectService {
         // graceful drain waits for a part still in flight instead of exiting
         // under it. Admitting happens here, once for the whole operation;
         // `upload_part_copy` admits at its own entry instead of through this.
-        let (_binding, _slot) = self.binding_slot(bucket)?;
-        self.upload_part_in(ctx, bucket, key, upload_id, part_number, checksums, body)
-            .await
+        let (binding, _slot) = self.binding_slot(bucket)?;
+        self.route_upload_part(
+            ctx,
+            &binding,
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            checksums,
+            body,
+        )
+        .await
+    }
+
+    /// Stages one part on the route its upload was created with.
+    // Each argument is the part's address, its identity or a distinct input the
+    // caller already has; grouping them would only relabel them.
+    #[allow(clippy::too_many_arguments)]
+    async fn route_upload_part(
+        &self,
+        ctx: &DriverContext,
+        binding: &crate::catalog::BucketBinding,
+        bucket: &str,
+        key: &ObjectKey,
+        upload_id: &str,
+        part_number: u16,
+        checksums: PartChecksums,
+        body: crate::driver::ObjectByteStream,
+    ) -> Result<PartSummary, ServiceError> {
+        let session = {
+            let state = self.multipart();
+            self.require_session(&state, bucket, key, upload_id)?
+        };
+        match self.upload_route(binding, ctx, &session).await? {
+            UploadRoute::Native { multipart, upload } => {
+                self.upload_part_native(
+                    ctx,
+                    &session,
+                    multipart.as_ref(),
+                    &upload,
+                    part_number,
+                    checksums,
+                    body,
+                )
+                .await
+            }
+            UploadRoute::Emulated => {
+                self.upload_part_in(ctx, bucket, key, upload_id, part_number, checksums, body)
+                    .await
+            }
+        }
     }
 
     /// The staging itself, for a caller that already admitted the operation.
@@ -524,41 +656,7 @@ impl ObjectService {
         let mut md5_digest = [0u8; 16];
         md5_digest.copy_from_slice(&md5_bytes);
 
-        let checksum = match (digest, scheme) {
-            (Some(hasher), Some(scheme)) => {
-                let value = hasher.finalize();
-                // A value declared in a header, or in a trailer that only became
-                // readable once the body was consumed, must match the bytes
-                // received; a part is never staged when it does not. A trailer
-                // the client declared but never sent is a mismatch too. When a
-                // request carries both, the trailer is the declaration that was
-                // verified: it is the one the body framing carries, and the
-                // header value only selected the algorithm.
-                let declared = match &checksums.trailer {
-                    None => checksums.declared.clone(),
-                    Some(trailer) => match trailer.value() {
-                        Some(value) => Some((scheme.algorithm, value)),
-                        None => {
-                            return Err(ServiceError::BadDigest(
-                                "the checksum you declared in a trailer was not sent".into(),
-                            ));
-                        }
-                    },
-                };
-                if let Some((_, expected)) = &declared
-                    && value.as_ref() != expected.as_slice()
-                {
-                    return Err(ServiceError::BadDigest(
-                        "the checksum you specified did not match what we received".into(),
-                    ));
-                }
-                Some(PartChecksum {
-                    algorithm: scheme.algorithm,
-                    value,
-                })
-            }
-            _ => None,
-        };
+        let checksum = finish_part_checksum(digest, scheme, &checksums)?;
 
         let mut state = self.multipart();
         let session = self.require_session(&state, bucket, key, upload_id)?;
@@ -607,6 +705,179 @@ impl ObjectService {
         })
     }
 
+    /// Uploads one part on the native route: the driver owns the bytes.
+    ///
+    /// The service still digests the received bytes and refuses a part whose
+    /// declared checksum does not match *before* committing it, so a part the
+    /// client cannot vouch for never replaces a good one. The object-level
+    /// checksum is the driver's to compute at completion, where it assembles
+    /// the parts.
+    // Each argument is the part's address, its identity or a distinct input the
+    // caller already has; grouping them would only relabel them.
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_part_native(
+        &self,
+        ctx: &DriverContext,
+        session: &UploadSession,
+        multipart: &dyn MultipartNamespace,
+        upload: &UploadHandle,
+        part_number: u16,
+        checksums: PartChecksums,
+        mut body: crate::driver::ObjectByteStream,
+    ) -> Result<PartSummary, ServiceError> {
+        let number = PartNumber::new(part_number)
+            .map_err(|e| ServiceError::InvalidArgument(e.to_string()))?;
+
+        // Every algorithm the request names must agree with the upload's scheme;
+        // resolving before the body is consumed rejects a mismatch without
+        // reading a byte.
+        let part_algorithm = checksums
+            .algorithm
+            .or_else(|| checksums.declared.as_ref().map(|(algorithm, _)| *algorithm))
+            .or_else(|| {
+                checksums
+                    .trailer
+                    .as_ref()
+                    .map(|trailer| trailer.algorithm())
+            });
+        let scheme = match (session.checksum, part_algorithm) {
+            (Some(scheme), Some(algorithm)) if scheme.algorithm != algorithm => {
+                return Err(ServiceError::InvalidRequest(format!(
+                    "the part checksum algorithm `{}` does not match the upload's `{}`",
+                    algorithm.as_str(),
+                    scheme.algorithm.as_str()
+                )));
+            }
+            (Some(scheme), _) => Some(scheme),
+            (None, Some(algorithm)) => Some(MultipartChecksum::from_algorithm(algorithm)?),
+            (None, None) => None,
+        };
+
+        let limit = self.inner.limits.max_single_write_size;
+        // The part's length is not known before its body is received, so the
+        // driver is told to discover it; the maximum is enforced below, chunk by
+        // chunk, exactly as the coordinator enforces it while buffering.
+        let mut staged = multipart
+            .begin_part(ctx, upload, number, None)
+            .await
+            .map_err(|e| ServiceError::from_driver(&e, true))?;
+
+        let mut md5 = StreamingDigest::new(ChecksumAlgorithm::Md5);
+        let mut digest = scheme.map(|scheme| StreamingDigest::new(scheme.algorithm));
+        let mut length = 0u64;
+        loop {
+            if ctx.is_done() {
+                let _ = staged.abort(ctx).await;
+                return Err(ServiceError::InvalidRequest(
+                    "upload cancelled before the part was fully received".into(),
+                ));
+            }
+            match next_chunk(&mut body).await {
+                None => break,
+                Some(Ok(chunk)) => {
+                    if length + chunk.len() as u64 > limit {
+                        let _ = staged.abort(ctx).await;
+                        return Err(ServiceError::InvalidRequest(
+                            "part exceeds the configured maximum size".into(),
+                        ));
+                    }
+                    md5.update(&chunk);
+                    if let Some(hasher) = digest.as_mut() {
+                        hasher.update(&chunk);
+                    }
+                    length += chunk.len() as u64;
+                    // The part is streamed straight into the driver's staged
+                    // part: the coordinator's buffer and staging quota exist to
+                    // hold parts the service owns, which these are not.
+                    if let Err(e) = staged.write_chunk(ctx, chunk).await {
+                        let _ = staged.abort(ctx).await;
+                        return Err(ServiceError::from_driver(&e, true));
+                    }
+                }
+                Some(Err(e)) => {
+                    let _ = staged.abort(ctx).await;
+                    return Err(ServiceError::from_driver(&e, true));
+                }
+            }
+        }
+
+        let md5_bytes = md5.finalize();
+        let mut md5_digest = [0u8; 16];
+        md5_digest.copy_from_slice(&md5_bytes);
+        let checksum = match finish_part_checksum(digest, scheme, &checksums) {
+            Ok(checksum) => checksum,
+            // A part whose declared digest does not match the bytes is
+            // discarded rather than committed.
+            Err(e) => {
+                let _ = staged.abort(ctx).await;
+                return Err(e);
+            }
+        };
+
+        // A part that named an algorithm may have fixed the scheme while this
+        // body streamed; a concurrent part under a different one can no longer
+        // join this upload, and must not be committed.
+        if let Some(ours) = scheme {
+            // Read and release the lock before touching the driver again: a
+            // guard must not live across an await.
+            let existing = {
+                let state = self.multipart();
+                state
+                    .uploads
+                    .get(upload.upload_id.as_str())
+                    .and_then(|record| record.checksum)
+                    .or(session.checksum)
+            };
+            if let Some(existing) = existing
+                && existing.algorithm != ours.algorithm
+            {
+                let _ = staged.abort(ctx).await;
+                return Err(ServiceError::InvalidRequest(format!(
+                    "the part checksum algorithm `{}` does not match the upload's `{}`",
+                    ours.algorithm.as_str(),
+                    existing.algorithm.as_str()
+                )));
+            }
+        }
+
+        let etag = EntityTag::new(hex(&md5_digest)).expect("hex");
+        let meta = match staged
+            .commit(
+                ctx,
+                CommitAttributes {
+                    length,
+                    etag: Some(etag.clone()),
+                    checksums: Vec::new(),
+                },
+            )
+            .await
+        {
+            Ok(meta) => meta,
+            Err(e) => return Err(ServiceError::from_driver(&e, true)),
+        };
+
+        // The upload's reclaim lease resets on the activity the driver has now
+        // recorded, and an upload created without a scheme adopts the one this
+        // part named.
+        {
+            let mut state = self.multipart();
+            if let Some(record) = state.uploads.get_mut(upload.upload_id.as_str()) {
+                record.last_activity = SystemTime::now();
+                if let (None, Some(ours)) = (record.checksum, scheme) {
+                    record.checksum = Some(ours);
+                }
+            }
+        }
+
+        Ok(PartSummary {
+            number: part_number,
+            size: length,
+            etag: meta.etag.unwrap_or(etag),
+            checksum,
+            last_modified: SystemTime::now(),
+        })
+    }
+
     /// Charges `bytes` of a part body that is being received to the staging
     /// quota, refusing the chunk when the quota cannot hold it.
     ///
@@ -626,8 +897,75 @@ impl ObjectService {
         state.staging.release(bytes);
     }
 
-    /// Lists parts of an upload.
-    pub fn list_parts(
+    /// Lists parts of an upload on the route it was created with.
+    pub async fn list_parts(
+        &self,
+        ctx: &DriverContext,
+        bucket: &str,
+        key: &ObjectKey,
+        upload_id: &str,
+        marker: Option<u16>,
+        limit: u32,
+    ) -> Result<PartListPage, ServiceError> {
+        let binding = self.binding(bucket)?;
+        let session = {
+            let state = self.multipart();
+            self.require_session(&state, bucket, key, upload_id)?
+        };
+        match self.upload_route(&binding, ctx, &session).await? {
+            UploadRoute::Native { multipart, upload } => {
+                // `part-number-marker=0` is the client asking for the first
+                // page, which is how the coordinator reads it. Part numbers
+                // start at 1, so 0 is not a part to parse and reject.
+                let marker = marker
+                    .filter(|marker| *marker > 0)
+                    .map(PartNumber::new)
+                    .transpose()
+                    .map_err(|e| ServiceError::InvalidArgument(e.to_string()))?;
+                let limit = NonZeroU32::new(limit.max(1)).expect("part page limit is non-zero");
+                let page = multipart
+                    .list_parts(ctx, &upload, marker, limit)
+                    .await
+                    .map_err(|e| ServiceError::from_driver(&e, true))?;
+                let parts = page
+                    .parts
+                    .into_iter()
+                    .map(|part| {
+                        // A part the driver lists is an uploaded part, so a
+                        // missing ETag is a contract violation, not an empty
+                        // field to paper over.
+                        let Some(etag) = part.etag else {
+                            return Err(ServiceError::Internal(format!(
+                                "the driver listed part {} without an ETag",
+                                part.part_number.get()
+                            )));
+                        };
+                        Ok(PartSummary {
+                            number: part.part_number.get(),
+                            size: part.size,
+                            etag,
+                            checksum: part.checksum.map(|checksum| PartChecksum {
+                                algorithm: checksum.algorithm(),
+                                value: checksum.value().clone(),
+                            }),
+                            last_modified: part.last_modified,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ServiceError>>()?;
+                Ok(PartListPage {
+                    parts,
+                    next_marker: page.next_marker.map(PartNumber::get),
+                    is_truncated: page.is_truncated,
+                })
+            }
+            UploadRoute::Emulated => {
+                self.list_parts_emulated(bucket, key, upload_id, marker, limit)
+            }
+        }
+    }
+
+    /// Lists parts the coordinator holds.
+    fn list_parts_emulated(
         &self,
         bucket: &str,
         key: &ObjectKey,
@@ -663,13 +1001,97 @@ impl ObjectService {
         })
     }
 
-    /// Lists in-progress uploads for a bucket.
-    pub fn list_uploads(
+    /// Lists in-progress uploads for a bucket, on the route its namespace uses.
+    ///
+    /// A native namespace's uploads are the driver's to enumerate (it owns the
+    /// sessions), so the page comes from there. Everything the page reports must
+    /// be drivable, so a driver-reported upload the service has no record of is
+    /// *adopted* into the session table rather than returned as a session every
+    /// entry point would refuse (its checksum, content and metadata stay empty,
+    /// because the driver holds them for an upload the service did not create).
+    pub async fn list_uploads(
         &self,
+        ctx: &DriverContext,
         bucket: &str,
         prefix: Option<&str>,
         key_marker: Option<&str>,
         upload_id_marker: Option<&str>,
+        limit: u32,
+    ) -> Result<UploadListPage, ServiceError> {
+        let binding = self.binding(bucket)?;
+        // The marker is a pair and its meaning is the service's to fix, so both
+        // routes read it the same way before either page is produced.
+        let marker = upload_marker(key_marker, upload_id_marker)?;
+        let namespace = self.inner.handles.get(&binding, ctx).await?;
+        let Some(multipart) = namespace.native_multipart().cloned() else {
+            return self.list_uploads_emulated(bucket, prefix, marker, limit);
+        };
+
+        let (key_marker, upload_id_marker) = match marker {
+            Some((key, upload_id)) => (Some(key), Some(upload_id)),
+            None => (None, None),
+        };
+        let limit = NonZeroU32::new(limit.max(1)).expect("upload page limit is non-zero");
+        let page = multipart
+            .list_uploads(ctx, &binding.namespace, key_marker, upload_id_marker, limit)
+            .await
+            .map_err(|e| ServiceError::from_driver(&e, true))?;
+
+        let mut state = self.multipart();
+        let uploads = page
+            .uploads
+            .into_iter()
+            // The driver's page implements the marker semantics; the prefix is
+            // the service's to apply, because the driver contract does not carry
+            // one (`MultipartNamespace::list_uploads`).
+            .filter(|upload| prefix.is_none_or(|prefix| upload.key.as_str().starts_with(prefix)))
+            .map(
+                |upload| match state.uploads.get(upload.upload_id.as_str()).cloned() {
+                    Some(record) => record,
+                    None => {
+                        // Adopt the upload so the page it appeared on is a page of
+                        // uploads the client can drive. `last_activity` starts now
+                        // so the sweep does not immediately retire a record it just
+                        // learned about; the driver decides when the upload is gone.
+                        let session = UploadSession {
+                            upload_id: upload.upload_id.clone(),
+                            bucket: bucket.to_string(),
+                            key: upload.key.clone(),
+                            principal: None,
+                            generation: binding.generation,
+                            content: ContentProperties::default(),
+                            user_metadata: UserMetadata::default(),
+                            checksum: None,
+                            initiated: upload.initiated,
+                            last_activity: SystemTime::now(),
+                            native: Some(UploadHandle {
+                                upload_id: upload.upload_id.clone(),
+                                key: upload.key.clone(),
+                            }),
+                        };
+                        state
+                            .uploads
+                            .insert(upload.upload_id.as_str().to_string(), session.clone());
+                        session
+                    }
+                },
+            )
+            .collect();
+
+        Ok(UploadListPage {
+            uploads,
+            next_key_marker: page.next_key_marker,
+            next_upload_id_marker: page.next_upload_id_marker,
+            is_truncated: page.is_truncated,
+        })
+    }
+
+    /// Lists uploads the coordinator holds.
+    fn list_uploads_emulated(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        marker: Option<(ObjectKey, UploadId)>,
         limit: u32,
     ) -> Result<UploadListPage, ServiceError> {
         let binding = self.binding(bucket)?;
@@ -690,9 +1112,11 @@ impl ObjectService {
 
         let filtered: Vec<UploadSession> = all
             .into_iter()
-            .filter(|s| match (key_marker, upload_id_marker) {
-                (Some(km), Some(um)) => (s.key.as_str(), s.upload_id.as_str()) > (km, um),
-                _ => true,
+            .filter(|s| match &marker {
+                Some((key, upload_id)) => {
+                    (s.key.as_str(), s.upload_id.as_str()) > (key.as_str(), upload_id.as_str())
+                }
+                None => true,
             })
             .collect();
 
@@ -743,6 +1167,28 @@ impl ObjectService {
         self.require_writable(&binding)?;
         let manifest: Vec<CompletionPart> = manifest.iter().cloned().map(Into::into).collect();
 
+        // The route was decided when the upload was created: a native upload
+        // keeps its parts and its assembly in the driver.
+        let session = {
+            let state = self.multipart();
+            self.require_session(&state, bucket, key, upload_id)?
+        };
+        if let Some(upload) = session.native.clone() {
+            return self
+                .complete_multipart_native(
+                    ctx,
+                    &binding,
+                    key,
+                    upload_id,
+                    &session,
+                    &upload,
+                    &manifest,
+                    declared,
+                    preconditions,
+                )
+                .await;
+        }
+
         // Snapshot and validate the manifest while holding the lock, then
         // release it before the (awaiting) publish.
         let (session, ordered, etag, checksum, write_id) = {
@@ -751,108 +1197,23 @@ impl ObjectService {
             let empty = BTreeMap::new();
             let parts = state.staging.parts_of(&session.upload_id).unwrap_or(&empty);
 
-            if manifest.is_empty() {
-                return Err(ServiceError::MalformedXml(
-                    "the completion manifest must contain at least one part".into(),
-                ));
-            }
+            // Resolve the checksum scheme before the manifest is checked: it
+            // names the only algorithm a part digest is computed under, which
+            // the check below needs. The upload's own scheme, or one this
+            // completion request fixes for an upload created without one.
+            let scheme = resolve_completion_scheme(session.checksum, &declared)?;
 
-            let mut ordered: Vec<StoredPart> = Vec::with_capacity(manifest.len());
-            let mut seen = std::collections::HashSet::new();
-            for entry in &manifest {
-                let number = entry.number;
-                if !seen.insert(number) {
-                    return Err(ServiceError::MalformedXml(
-                        "the completion manifest contains duplicate part numbers".into(),
-                    ));
-                }
-                let part = parts.get(&number).ok_or_else(|| {
-                    ServiceError::InvalidArgument(format!(
-                        "part {number} was not uploaded for this upload"
-                    ))
-                })?;
-                if let Some(expected) = &entry.etag
-                    && part.etag() != *expected
-                {
-                    return Err(ServiceError::InvalidArgument(format!(
-                        "part {number} ETag does not match the uploaded part"
-                    )));
-                }
-                // A declared part checksum must match the received bytes; an
-                // unverified part is never assembled into the object.
-                if let Some((algorithm, expected)) = &entry.checksum
-                    && part_checksum(part, *algorithm).as_ref() != expected.as_slice()
-                {
-                    return Err(ServiceError::BadDigest(format!(
-                        "the checksum you specified for part {number} did not match what we received"
-                    )));
-                }
-                ordered.push(part.clone());
-            }
-
-            // Enforce ordering and the minimum size of every non-final part.
-            for window in ordered.windows(2) {
-                if window[0].number >= window[1].number {
-                    return Err(ServiceError::InvalidArgument(
-                        "parts must be listed in ascending part-number order".into(),
-                    ));
-                }
-            }
-            for part in &ordered[..ordered.len() - 1] {
-                if part.size < MIN_PART_SIZE {
-                    return Err(ServiceError::InvalidArgument(
-                        "each part except the last must be at least 5 MiB".into(),
-                    ));
-                }
-            }
+            // The manifest and the parts it names are checked by the code both
+            // routes run, so neither route accepts a manifest the other
+            // refuses. Staging keeps the parts afterwards, so the validated
+            // ones are cloned out here rather than borrowed past the lock.
+            let ordered: Vec<StoredPart> = validate_manifest(&manifest, scheme, parts)?
+                .into_iter()
+                .cloned()
+                .collect();
 
             let md5s: Vec<[u8; 16]> = ordered.iter().map(|p| p.md5).collect();
             let etag = crate::integrity::etag_for_multipart(&md5s);
-
-            // Resolve the checksum scheme: the upload's own, or one this
-            // completion request fixes for an upload created without one.
-            let scheme = match (session.checksum, &declared) {
-                (Some(scheme), Some(declared)) => {
-                    // A declaration constrains the upload's scheme: the value's
-                    // algorithm and any coverage must agree with it.
-                    if let Some(algorithm) = declared.algorithm
-                        && algorithm != scheme.algorithm
-                    {
-                        return Err(ServiceError::InvalidRequest(format!(
-                            "the completion checksum algorithm `{}` does not match the upload's `{}`",
-                            algorithm.as_str(),
-                            scheme.algorithm.as_str()
-                        )));
-                    }
-                    if let Some(declared_type) = declared.checksum_type
-                        && declared_type != scheme.checksum_type
-                    {
-                        return Err(ServiceError::InvalidRequest(format!(
-                            "the completion checksum type `{}` does not match the upload's `{}`",
-                            declared_type.as_str(),
-                            scheme.checksum_type.as_str()
-                        )));
-                    }
-                    Some(scheme)
-                }
-                (Some(scheme), None) => Some(scheme),
-                // An upload created without a scheme needs an algorithm to
-                // compute one; a coverage alone cannot supply it.
-                (None, Some(declared)) => {
-                    let Some(algorithm) = declared.algorithm else {
-                        return Err(ServiceError::InvalidRequest(
-                            "a completion checksum type requires a checksum algorithm".into(),
-                        ));
-                    };
-                    Some(MultipartChecksum::new(
-                        algorithm,
-                        declared
-                            .checksum_type
-                            .unwrap_or_else(|| algorithm.default_multipart_type()),
-                    )?)
-                }
-                (None, None) => None,
-            };
 
             let checksum = match scheme {
                 None => None,
@@ -931,7 +1292,7 @@ impl ObjectService {
                 return Err(e);
             }
         };
-        let Some(write) = handle.write.as_ref() else {
+        let Some(write) = handle.writer() else {
             self.release_claim(upload_id, &write_id);
             return Err(ServiceError::NotImplemented(
                 "bucket is not writable".into(),
@@ -1034,6 +1395,166 @@ impl ObjectService {
         Ok(meta)
     }
 
+    /// Completes an upload whose parts the driver owns.
+    ///
+    /// The service still owns the protocol semantics: it validates the manifest
+    /// against the parts the driver reports (existence, ETag, per-part digest,
+    /// ascending order and the minimum size of every non-final part), resolves
+    /// the checksum scheme, arbitrates the single completion, and hands the
+    /// declared object checksum to the driver. The driver assembles, verifies and
+    /// publishes atomically, so every rejection above happens before anything is
+    /// published.
+    // The arguments are the upload's address, the session, the driver handle
+    // and the manifest with its declared checksum and conditions.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_multipart_native(
+        &self,
+        ctx: &DriverContext,
+        binding: &crate::catalog::BucketBinding,
+        key: &ObjectKey,
+        upload_id: &str,
+        session: &UploadSession,
+        upload: &UploadHandle,
+        manifest: &[CompletionPart],
+        declared: Option<DeclaredCompletionChecksum>,
+        preconditions: Preconditions,
+    ) -> Result<ObjectMetadata, ServiceError> {
+        let namespace = self.inner.handles.get(binding, ctx).await?;
+        let multipart = namespace.native_multipart().cloned().ok_or_else(|| {
+            ServiceError::Internal(
+                "the upload's namespace no longer offers native multipart".into(),
+            )
+        })?;
+
+        let scheme = resolve_completion_scheme(session.checksum, &declared)?;
+
+        // What can be assembled is what the driver reports, so the manifest is
+        // checked against that, not against a service-side part table.
+        let mut parts: BTreeMap<u16, PartInfo> = BTreeMap::new();
+        let mut marker = None;
+        loop {
+            let limit = NonZeroU32::new(1000).expect("part page limit is non-zero");
+            let page = multipart
+                .list_parts(ctx, upload, marker, limit)
+                .await
+                .map_err(|e| ServiceError::from_driver(&e, true))?;
+            let truncated = page.is_truncated;
+            marker = page.next_marker;
+            for part in page.parts {
+                parts.insert(part.part_number.get(), part);
+            }
+            if !truncated || marker.is_none() {
+                break;
+            }
+        }
+
+        // The manifest checks the coordinator runs, over the parts the driver
+        // reports: the two routes cannot disagree about what a manifest means.
+        let ordered = validate_manifest(manifest, scheme, &parts)?;
+
+        // A declared composite checksum names the part count it covers; the
+        // manifest must be able to satisfy it, or the completion cannot be
+        // accepted at all.
+        if let Some(count) = declared.as_ref().and_then(|declared| declared.part_count)
+            && count != ordered.len() as u32
+        {
+            return Err(ServiceError::BadDigest(format!(
+                "the checksum you specified covers {count} parts but the manifest has {}",
+                ordered.len()
+            )));
+        }
+
+        // Claim the completion exactly once: a concurrent (or retried)
+        // completion of the same upload must not publish a second time.
+        let write_id = {
+            let mut state = self.multipart();
+            if state.claims.contains_key(upload_id) {
+                return Err(ServiceError::InvalidArgument(
+                    "this multipart upload is already being completed".into(),
+                ));
+            }
+            let write_id = WriteId::generate();
+            state.claims.insert(upload_id.to_string(), write_id.clone());
+            write_id
+        };
+
+        let driver_parts: Vec<CompletedPart> = manifest
+            .iter()
+            .map(|entry| CompletedPart {
+                part_number: PartNumber::new(entry.number)
+                    .expect("manifest part numbers were validated"),
+                etag: entry.etag.clone(),
+            })
+            .collect();
+        // The declared value is handed to the driver so it can verify the
+        // assembled object *before* publishing; reconstructing it as a typed
+        // checksum is what lets the driver compare like with like.
+        let expected: Vec<Checksum> = match (&declared, scheme) {
+            (Some(declared), Some(scheme)) => match declared.value.clone() {
+                None => Vec::new(),
+                Some(value) => {
+                    let coverage = declared.checksum_type.unwrap_or(scheme.checksum_type);
+                    let built = match coverage {
+                        ChecksumType::Composite => Checksum::composite(
+                            scheme.algorithm,
+                            value,
+                            declared.part_count.unwrap_or(manifest.len() as u32),
+                        ),
+                        ChecksumType::FullObject => {
+                            Checksum::new(scheme.algorithm, ChecksumType::FullObject, value)
+                        }
+                    };
+                    vec![built.map_err(|e| ServiceError::InvalidArgument(e.to_string()))?]
+                }
+            },
+            _ => Vec::new(),
+        };
+        let driver_scheme = scheme.map(|scheme| MultipartChecksumScheme {
+            algorithm: scheme.algorithm,
+            checksum_type: scheme.checksum_type,
+        });
+
+        let meta = match multipart
+            .complete(
+                ctx,
+                upload,
+                driver_parts,
+                driver_scheme,
+                expected,
+                preconditions,
+            )
+            .await
+        {
+            Ok(meta) => meta,
+            Err(e) => {
+                // An unresolved outcome must be reconciled with the driver's
+                // commit record before the attempt is judged.
+                let mut attempt_state = e.commit_state_or_infer();
+                if matches!(attempt_state, CommitState::Unknown | CommitState::InFlight)
+                    && let Some(recovery) = &namespace.recovery
+                    && let Ok(observed) = recovery.query(ctx, &write_id).await
+                {
+                    attempt_state = observed;
+                }
+                if attempt_state == CommitState::Committed {
+                    // The object was published; only the reply was lost.
+                    if let Ok(meta) = namespace.read.stat(ctx, key).await {
+                        self.finish_upload(&write_id, session, upload_id);
+                        return Ok(meta);
+                    }
+                }
+                if attempt_state.permits_replacement_attempt() {
+                    self.release_claim(upload_id, &write_id);
+                }
+                self.record_completion(&write_id, session, attempt_state, upload_id);
+                return Err(ServiceError::from_driver(&e, true));
+            }
+        };
+
+        self.finish_upload(&write_id, session, upload_id);
+        Ok(meta)
+    }
+
     /// Records a committed upload and reclaims its staging.
     fn finish_upload(&self, write_id: &WriteId, session: &UploadSession, upload_id: &str) {
         let mut state = self.multipart();
@@ -1125,35 +1646,79 @@ impl ObjectService {
     /// Parts of an upload with an in-flight or unknown completion attempt are
     /// kept: reclaiming them could destroy a part that a late publish still
     /// needs, and a published object is never touched by a sweep.
-    pub fn sweep_expired_uploads(&self, lease: Duration) -> SweepOutcome {
-        let mut state = self.multipart();
+    ///
+    /// A native upload's parts live in the driver, which owns its own session
+    /// lifetime, so its record here is retired only once the driver no longer
+    /// knows the upload: dropping it while the driver still holds it would take
+    /// away the record of an upload a client can still finish, while keeping it
+    /// forever would leak the session and never let the service go idle. The
+    /// driver's own store bounds such a session; the record is a binding check,
+    /// not a copy of the upload.
+    pub async fn sweep_expired_uploads(
+        &self,
+        ctx: &DriverContext,
+        lease: Duration,
+    ) -> SweepOutcome {
         let now = SystemTime::now();
+        // Pick the expired uploads under the lock, then release it: confirming a
+        // native upload awaits the driver, and a guard must not live across an
+        // await, so every mutation below re-checks the record it is about to
+        // retire.
+        let expired: Vec<(UploadId, String, Option<UploadHandle>)> = {
+            let state = self.multipart();
+            state
+                .uploads
+                .iter()
+                .filter(|(_, s)| {
+                    now.duration_since(s.last_activity)
+                        .is_ok_and(|age| age >= lease)
+                })
+                .map(|(id, s)| {
+                    (
+                        UploadId::from_raw(id.as_str()),
+                        s.bucket.clone(),
+                        s.native.clone(),
+                    )
+                })
+                .collect()
+        };
+
         let mut outcome = SweepOutcome::default();
-
-        let expired: Vec<UploadId> = state
-            .uploads
-            .iter()
-            .filter(|(_, s)| {
-                now.duration_since(s.last_activity)
-                    .is_ok_and(|age| age >= lease)
-            })
-            .map(|(id, _)| UploadId::from_raw(id.as_str()))
-            .collect();
-
-        for upload_id in expired {
-            if state.claims.contains_key(upload_id.as_str()) {
+        for (upload_id, bucket, native) in expired {
+            // The claim and unresolved-attempt gates, plus a re-check of the
+            // lease: a candidate awaited earlier may have gained a claim, an
+            // unresolved attempt or fresh activity meanwhile.
+            let (has_claim, unresolved, present_and_expired) = {
+                let state = self.multipart();
+                (
+                    state.claims.contains_key(upload_id.as_str()),
+                    state.completions.values().any(|r| {
+                        r.upload_id == upload_id.as_str() && r.state == CommitState::Unknown
+                    }),
+                    state.uploads.get(upload_id.as_str()).is_some_and(|s| {
+                        now.duration_since(s.last_activity)
+                            .is_ok_and(|age| age >= lease)
+                    }),
+                )
+            };
+            if has_claim || unresolved {
                 outcome.skipped_pending += 1;
                 continue;
             }
-            // An `Unknown` attempt on this upload must survive until recovery.
-            let unresolved = state
-                .completions
-                .values()
-                .any(|r| r.upload_id == upload_id.as_str() && r.state == CommitState::Unknown);
-            if unresolved {
-                outcome.skipped_pending += 1;
+            if !present_and_expired {
+                // Already retired, or the upload saw activity while an earlier
+                // candidate was awaited: nothing to reclaim.
                 continue;
             }
+            if let Some(upload) = native
+                && self.driver_still_holds(ctx, &bucket, &upload).await
+            {
+                // The driver is the authority on a native upload's lifetime:
+                // the record is kept until the driver forgets the upload.
+                continue;
+            }
+
+            let mut state = self.multipart();
             outcome.reclaimed_bytes += state.staging.take(&upload_id);
             state.uploads.remove(upload_id.as_str());
             state.claims.remove(upload_id.as_str());
@@ -1163,21 +1728,73 @@ impl ObjectService {
         outcome
     }
 
-    /// Aborts an upload and reclaims its staged parts.
-    pub fn abort_multipart(
+    /// Whether the driver still knows a native upload.
+    ///
+    /// The driver owns a native upload's lifetime, so the service retires its
+    /// record only once the driver reports the upload gone (`NotFound`). Any
+    /// other outcome — including a transient driver error — counts as "still
+    /// there", so a failed probe keeps the record for the next sweep rather
+    /// than orphaning an upload the driver can still complete.
+    async fn driver_still_holds(
         &self,
+        ctx: &DriverContext,
+        bucket: &str,
+        upload: &UploadHandle,
+    ) -> bool {
+        let Ok(binding) = self.binding(bucket) else {
+            return true;
+        };
+        let Ok(namespace) = self.inner.handles.get(&binding, ctx).await else {
+            return true;
+        };
+        let Some(multipart) = namespace.native_multipart().cloned() else {
+            // The namespace no longer offers native multipart, so the record can
+            // no longer drive anything: let it go.
+            return false;
+        };
+        let limit = NonZeroU32::new(1).expect("part page limit is non-zero");
+        !matches!(
+            multipart.list_parts(ctx, upload, None, limit).await,
+            Err(error) if error.kind() == DriverErrorKind::NotFound
+        )
+    }
+
+    /// Aborts an upload and reclaims its parts, on the route it was created
+    /// with.
+    pub async fn abort_multipart(
+        &self,
+        ctx: &DriverContext,
         bucket: &str,
         key: &ObjectKey,
         upload_id: &str,
     ) -> Result<(), ServiceError> {
-        let mut state = self.multipart();
-        let session = self.require_session(&state, bucket, key, upload_id)?;
-        // A completion that already claimed this upload wins the race.
-        if state.claims.contains_key(upload_id) {
+        let binding = self.binding(bucket)?;
+        let session = {
+            let state = self.multipart();
+            self.require_session(&state, bucket, key, upload_id)?
+        };
+        // A completion that already claimed this upload wins the race; checking
+        // before the driver is touched keeps an abort from racing a publish.
+        if self.multipart().claims.contains_key(upload_id) {
             return Err(ServiceError::InvalidArgument(
                 "this multipart upload is being completed".into(),
             ));
         }
+
+        if let Some(upload) = session.native.clone() {
+            let namespace = self.inner.handles.get(&binding, ctx).await?;
+            let multipart = namespace.native_multipart().cloned().ok_or_else(|| {
+                ServiceError::Internal(
+                    "the upload's namespace no longer offers native multipart".into(),
+                )
+            })?;
+            multipart
+                .abort(ctx, &upload)
+                .await
+                .map_err(|e| ServiceError::from_driver(&e, true))?;
+        }
+
+        let mut state = self.multipart();
         state.staging.take(&session.upload_id);
         state.uploads.remove(upload_id);
         Ok(())
@@ -1192,7 +1809,7 @@ impl ObjectService {
         // Like `copy_object`, one slot admits the whole copy-part: the source
         // read and the staging below must not each claim a share of the
         // destination's scope, or a limit of one would stall the operation.
-        let (_binding, _slot) = self.binding_slot(&copy.bucket)?;
+        let (binding, _slot) = self.binding_slot(&copy.bucket)?;
         let source_binding = self.binding(&copy.source_bucket)?;
         let source = self
             .get_object_in(
@@ -1205,8 +1822,9 @@ impl ObjectService {
             .await?;
         let metadata = source.metadata.clone();
         let summary = self
-            .upload_part_in(
+            .route_upload_part(
                 ctx,
+                &binding,
                 &copy.bucket,
                 &copy.key,
                 &copy.upload_id,
@@ -1248,10 +1866,133 @@ impl ObjectService {
         loop {
             tokio::select! {
                 _ = &mut shutdown => return,
-                _ = ticker.tick() => on_sweep(self.sweep_expired_uploads(lease)),
+                _ = ticker.tick() => {
+                    // The sweep asks the driver about native uploads, and a
+                    // driver that never answers must not hold the sweeper (and
+                    // its shutdown) open, so the probe is bounded by the sweep
+                    // interval. A probe that times out keeps the record for the
+                    // next tick rather than reclaiming under a live client.
+                    let ctx = DriverContext::new(RequestId::new("multipart-sweep"))
+                        .with_timeout(interval);
+                    on_sweep(self.sweep_expired_uploads(&ctx, lease).await);
+                }
             }
         }
     }
+}
+
+/// The `(key, upload id)` a `ListMultipartUploads` page continues from.
+///
+/// S3 defines the marker as a pair: the upload-id marker only means anything
+/// together with its key marker, and an empty value means "from the start".
+/// The service resolves that rule once, here, so the coordinated and native
+/// routes cannot disagree about what a partial or empty marker selects.
+fn upload_marker(
+    key_marker: Option<&str>,
+    upload_id_marker: Option<&str>,
+) -> Result<Option<(ObjectKey, UploadId)>, ServiceError> {
+    let (Some(key), Some(upload_id)) = (key_marker, upload_id_marker) else {
+        return Ok(None);
+    };
+    if key.is_empty() || upload_id.is_empty() {
+        return Ok(None);
+    }
+    let key = ObjectKey::parse(key).map_err(|e| ServiceError::InvalidArgument(e.to_string()))?;
+    Ok(Some((key, UploadId::from_raw(upload_id))))
+}
+
+/// Resolves the checksum scheme a completion publishes under.
+///
+/// The upload's own scheme, unless the upload was created without one and the
+/// completion request names an algorithm. A declaration can constrain the
+/// upload's scheme — its algorithm and coverage must agree — but never change
+/// it, and a coverage alone cannot supply an algorithm. Both routes resolve it
+/// here, so they accept and reject the same declarations.
+fn resolve_completion_scheme(
+    upload: Option<MultipartChecksum>,
+    declared: &Option<DeclaredCompletionChecksum>,
+) -> Result<Option<MultipartChecksum>, ServiceError> {
+    match (upload, declared) {
+        (Some(scheme), Some(declared)) => {
+            if let Some(algorithm) = declared.algorithm
+                && algorithm != scheme.algorithm
+            {
+                return Err(ServiceError::InvalidRequest(format!(
+                    "the completion checksum algorithm `{}` does not match the upload's `{}`",
+                    algorithm.as_str(),
+                    scheme.algorithm.as_str()
+                )));
+            }
+            if let Some(declared_type) = declared.checksum_type
+                && declared_type != scheme.checksum_type
+            {
+                return Err(ServiceError::InvalidRequest(format!(
+                    "the completion checksum type `{}` does not match the upload's `{}`",
+                    declared_type.as_str(),
+                    scheme.checksum_type.as_str()
+                )));
+            }
+            Ok(Some(scheme))
+        }
+        (Some(scheme), None) => Ok(Some(scheme)),
+        (None, Some(declared)) => {
+            let Some(algorithm) = declared.algorithm else {
+                return Err(ServiceError::InvalidRequest(
+                    "a completion checksum type requires a checksum algorithm".into(),
+                ));
+            };
+            Ok(Some(MultipartChecksum::new(
+                algorithm,
+                declared
+                    .checksum_type
+                    .unwrap_or_else(|| algorithm.default_multipart_type()),
+            )?))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// Finalises a part's digest under `scheme` and verifies any value the client
+/// declared for it.
+///
+/// A value declared in a header, or in a trailer that only became readable once
+/// the body was consumed, must match the bytes received; a part is never staged
+/// when it does not. A trailer the client declared but never sent is a mismatch
+/// too. When a request carries both, the trailer is the declaration that was
+/// verified: it is the one the body framing carries, and the header value only
+/// selected the algorithm. Both routes share this so a part cannot be verified
+/// one way natively and another through the coordinator.
+fn finish_part_checksum(
+    digest: Option<StreamingDigest>,
+    scheme: Option<MultipartChecksum>,
+    checksums: &PartChecksums,
+) -> Result<Option<PartChecksum>, ServiceError> {
+    let (Some(hasher), Some(scheme)) = (digest, scheme) else {
+        return Ok(None);
+    };
+    let value = hasher.finalize();
+    let declared = match &checksums.trailer {
+        None => checksums.declared.clone(),
+        Some(trailer) => match trailer.value() {
+            Some(value) => Some((scheme.algorithm, value)),
+            None => {
+                return Err(ServiceError::BadDigest(
+                    "the checksum you declared in a trailer was not sent".into(),
+                ));
+            }
+        },
+    };
+    if let Some((_, expected)) = &declared
+        && value.as_ref() != expected.as_slice()
+    {
+        return Err(ServiceError::BadDigest(
+            "the checksum you specified did not match what we received".into(),
+        ));
+    }
+    Ok(Some(PartChecksum {
+        algorithm: scheme.algorithm,
+        value,
+    }))
 }
 
 /// The checksum of one stored part for `algorithm`: the digest computed when
@@ -1262,4 +2003,157 @@ fn part_checksum(part: &StoredPart, algorithm: ChecksumAlgorithm) -> Bytes {
         Some(checksum) if checksum.algorithm == algorithm => checksum.value.clone(),
         _ => crate::integrity::compute_checksum(algorithm, &part.data),
     }
+}
+
+/// One part an upload holds, as a manifest check needs to see it.
+///
+/// The two routes keep their parts in different places — the coordinator's
+/// staging ledger, the driver's upload session — so the checks below read them
+/// through this view. Producing the map is the only thing a route has to do;
+/// the validation itself is shared, so a manifest cannot be accepted by one
+/// route and refused by the other.
+trait UploadedPart {
+    /// The number the upload stored the part under.
+    fn part_number(&self) -> u16;
+    /// The part's ETag, when the upload has one.
+    fn part_etag(&self) -> Option<EntityTag>;
+    /// The part's size in bytes.
+    fn part_size(&self) -> u64;
+    /// The digest of the part's bytes under `algorithm`, when this route can
+    /// produce one.
+    fn part_digest(&self, algorithm: ChecksumAlgorithm) -> Option<Bytes>;
+}
+
+impl UploadedPart for StoredPart {
+    fn part_number(&self) -> u16 {
+        self.number
+    }
+
+    fn part_etag(&self) -> Option<EntityTag> {
+        Some(StoredPart::etag(self))
+    }
+
+    fn part_size(&self) -> u64 {
+        self.size
+    }
+
+    fn part_digest(&self, algorithm: ChecksumAlgorithm) -> Option<Bytes> {
+        // Staging holds the bytes, so any algorithm can be answered: from the
+        // digest taken when the part was received, or by digesting those bytes
+        // now, which is what a part predating the upload's scheme needs.
+        Some(part_checksum(self, algorithm))
+    }
+}
+
+impl UploadedPart for PartInfo {
+    fn part_number(&self) -> u16 {
+        self.part_number.get()
+    }
+
+    fn part_etag(&self) -> Option<EntityTag> {
+        self.etag.clone()
+    }
+
+    fn part_size(&self) -> u64 {
+        self.size
+    }
+
+    fn part_digest(&self, algorithm: ChecksumAlgorithm) -> Option<Bytes> {
+        // A driver digests its parts under the upload's scheme, so that is the
+        // only algorithm it reports a digest for; any other leaves nothing to
+        // compare a declaration against.
+        self.checksum
+            .as_ref()
+            .filter(|checksum| checksum.algorithm() == algorithm)
+            .map(|checksum| checksum.value().clone())
+    }
+}
+
+/// Validates a completion manifest against the parts an upload actually holds,
+/// and returns those parts in manifest order.
+///
+/// This is the single manifest check both routes run before either assembles
+/// anything: every part the client named must exist and carry the ETag it named,
+/// no part may be listed twice, the list must be in ascending part-number order,
+/// every part but the last must meet [`MIN_PART_SIZE`], and a declared per-part
+/// checksum must match that part's digest. `scheme` is the algorithm the upload
+/// runs under — fixed when it was created, or by this completion — and a part
+/// digest is only ever computed under it, so a declaration under another
+/// algorithm (or on an upload with no scheme) is refused rather than checked
+/// against a value that is not the upload's.
+fn validate_manifest<'a, P: UploadedPart>(
+    manifest: &[CompletionPart],
+    scheme: Option<MultipartChecksum>,
+    parts: &'a BTreeMap<u16, P>,
+) -> Result<Vec<&'a P>, ServiceError> {
+    if manifest.is_empty() {
+        return Err(ServiceError::MalformedXml(
+            "the completion manifest must contain at least one part".into(),
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered: Vec<&P> = Vec::with_capacity(manifest.len());
+    for entry in manifest {
+        let number = entry.number;
+        if !seen.insert(number) {
+            return Err(ServiceError::MalformedXml(
+                "the completion manifest contains duplicate part numbers".into(),
+            ));
+        }
+        let part = parts.get(&number).ok_or_else(|| {
+            ServiceError::InvalidArgument(format!("part {number} was not uploaded for this upload"))
+        })?;
+        if let Some(expected) = &entry.etag
+            && part.part_etag().as_ref() != Some(expected)
+        {
+            return Err(ServiceError::InvalidArgument(format!(
+                "part {number} ETag does not match the uploaded part"
+            )));
+        }
+        if let Some((algorithm, expected)) = &entry.checksum {
+            if !scheme.is_some_and(|scheme| scheme.algorithm == *algorithm) {
+                return Err(ServiceError::InvalidRequest(format!(
+                    "the part checksum algorithm `{}` does not match the upload's",
+                    algorithm.as_str()
+                )));
+            }
+            match part.part_digest(*algorithm) {
+                // A declared value must match the bytes that were received; an
+                // unverified part is never assembled into the object.
+                Some(actual) if actual.as_ref() == expected.as_slice() => {}
+                Some(_) => {
+                    return Err(ServiceError::BadDigest(format!(
+                        "the checksum you specified for part {number} did not match what we received"
+                    )));
+                }
+                // Only a route that cannot digest the part reaches this: the
+                // driver is required to report each part's digest under the
+                // upload's scheme, so a missing one leaves nothing to verify.
+                None => {
+                    return Err(ServiceError::InvalidRequest(format!(
+                        "the driver reported no checksum for part {number}"
+                    )));
+                }
+            }
+        }
+        ordered.push(part);
+    }
+
+    for window in ordered.windows(2) {
+        if window[0].part_number() >= window[1].part_number() {
+            return Err(ServiceError::InvalidArgument(
+                "parts must be listed in ascending part-number order".into(),
+            ));
+        }
+    }
+    for part in &ordered[..ordered.len() - 1] {
+        if part.part_size() < MIN_PART_SIZE {
+            return Err(ServiceError::InvalidArgument(
+                "each part except the last must be at least 5 MiB".into(),
+            ));
+        }
+    }
+
+    Ok(ordered)
 }

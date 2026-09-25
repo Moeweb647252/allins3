@@ -10,6 +10,8 @@
 //! (see `docs/implementation-spec.md` §9.2).
 
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU32;
+use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -17,14 +19,17 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::domain::{
-    BeginWrite, CommitAttributes, CommitState, DeleteRequest, DeleteResult, DriverContext,
-    DriverError, DriverErrorKind, DriverInstanceId, ListCursor, ListPage, ListRequest, NamespaceId,
-    ObjectKey, ObjectMetadata, ObjectRevision, WriteId,
+    BeginWrite, Checksum, ChecksumAlgorithm, ChecksumType, CommitAttributes, CommitState,
+    ContentProperties, DeleteRequest, DeleteResult, DriverContext, DriverError, DriverErrorKind,
+    DriverInstanceId, EntityTag, ListCursor, ListPage, ListRequest, NamespaceId, ObjectKey,
+    ObjectMetadata, ObjectRevision, PartNumber, Preconditions, UserMetadata, WriteId,
 };
 use crate::driver::{
-    CommitRecovery, CopyRequest, DriverDescriptor, DriverFactory, DriverHealth, DriverKind,
-    MultipartNamespace, NamespaceCapabilities, NamespaceHandle, NativeCopy, ReadNamespace,
-    ReadRequest, ReadResult, SecretResolver, StagedWrite, StorageDriver, WriteNamespace,
+    CommitRecovery, CompletedPart, CopyRequest, CreateUploadRequest, DriverDescriptor,
+    DriverFactory, DriverHealth, DriverKind, MultipartChecksumScheme, MultipartNamespace,
+    MultipartUpload, NamespaceCapabilities, NamespaceHandle, NativeCopy, PartInfo, PartPage,
+    ReadNamespace, ReadRequest, ReadResult, SecretResolver, StagedWrite, StorageDriver,
+    UploadHandle, UploadId, UploadPage, WriteNamespace,
 };
 
 use super::support::one_shot_stream;
@@ -40,7 +45,28 @@ pub(crate) struct StoredObject {
 pub(crate) struct NamespaceState {
     pub(crate) objects: BTreeMap<String, StoredObject>,
     pub(crate) recovery: HashMap<String, CommitState>,
+    /// In-progress native multipart uploads, keyed by upload id.
+    pub(crate) uploads: BTreeMap<String, NativeUpload>,
     next_revision: u64,
+}
+
+/// One in-progress native multipart upload.
+#[derive(Clone)]
+pub(crate) struct NativeUpload {
+    key: ObjectKey,
+    content: ContentProperties,
+    user_metadata: UserMetadata,
+    checksum: Option<MultipartChecksumScheme>,
+    initiated: SystemTime,
+    parts: BTreeMap<u16, NativePart>,
+}
+
+/// One staged native part: its bytes and the identity of those bytes.
+#[derive(Clone)]
+struct NativePart {
+    data: Bytes,
+    etag: EntityTag,
+    checksum: Option<Checksum>,
 }
 
 impl NamespaceState {
@@ -187,12 +213,18 @@ impl StorageDriver for ReferenceDriver {
                 state: state.clone(),
             }) as Arc<dyn CommitRecovery>
         });
+        let multipart = caps.multipart.then(|| {
+            Arc::new(RefMultipart {
+                namespace: namespace.clone(),
+                state: state.clone(),
+            }) as Arc<dyn MultipartNamespace>
+        });
 
         let handle = NamespaceHandle {
             capabilities: caps,
             read,
             write,
-            multipart: None::<Arc<dyn MultipartNamespace>>,
+            multipart,
             native_copy,
             recovery,
         };
@@ -660,5 +692,447 @@ impl CommitRecovery for RefRecovery {
             .get(write_id.as_str())
             .copied()
             .unwrap_or(CommitState::Unknown))
+    }
+}
+
+/// The reference driver's native multipart.
+///
+/// The upload session, its parts and the assembly live here rather than in the
+/// service, so this is the implementation the native route is compared against:
+/// the coordinator route over a staged write must behave the same.
+struct RefMultipart {
+    namespace: NamespaceId,
+    state: Arc<Mutex<NamespaceState>>,
+}
+
+impl RefMultipart {
+    fn upload<'a>(
+        &self,
+        state: &'a NamespaceState,
+        id: &UploadId,
+    ) -> Result<&'a NativeUpload, DriverError> {
+        state
+            .uploads
+            .get(id.as_str())
+            .ok_or_else(|| DriverError::not_found(format!("upload `{}` not found", id.as_str())))
+    }
+}
+
+#[async_trait]
+impl MultipartNamespace for RefMultipart {
+    async fn create_upload(
+        &self,
+        ctx: &DriverContext,
+        req: CreateUploadRequest,
+    ) -> Result<UploadHandle, DriverError> {
+        check_ctx(ctx)?;
+        let mut state = self.state.lock().map_err(poisoned)?;
+        let upload_id = UploadId::generate();
+        state.uploads.insert(
+            upload_id.as_str().to_string(),
+            NativeUpload {
+                key: req.key.clone(),
+                content: req.content,
+                user_metadata: req.user_metadata,
+                checksum: req.checksum,
+                initiated: SystemTime::now(),
+                parts: BTreeMap::new(),
+            },
+        );
+        Ok(UploadHandle {
+            upload_id,
+            key: req.key,
+        })
+    }
+
+    async fn begin_part(
+        &self,
+        ctx: &DriverContext,
+        upload: &UploadHandle,
+        part_number: PartNumber,
+        expected_length: Option<u64>,
+    ) -> Result<Box<dyn StagedWrite>, DriverError> {
+        check_ctx(ctx)?;
+        // The upload must exist when the part starts; the part itself is staged
+        // off to the side and replaces the stored one only at commit.
+        let scheme = {
+            let state = self.state.lock().map_err(poisoned)?;
+            self.upload(&state, &upload.upload_id)?.checksum
+        };
+        Ok(Box::new(RefPartWrite {
+            state: self.state.clone(),
+            upload_id: upload.upload_id.clone(),
+            part_number: part_number.get(),
+            expected_length,
+            scheme,
+            buffer: Vec::new(),
+        }))
+    }
+
+    async fn list_parts(
+        &self,
+        ctx: &DriverContext,
+        upload: &UploadHandle,
+        marker: Option<PartNumber>,
+        limit: NonZeroU32,
+    ) -> Result<PartPage, DriverError> {
+        check_ctx(ctx)?;
+        let state = self.state.lock().map_err(poisoned)?;
+        let stored = self.upload(&state, &upload.upload_id)?;
+        let start = marker.map(|marker| marker.get()).unwrap_or(0);
+        let collected: Vec<(u16, NativePart)> = stored
+            .parts
+            .range((Bound::Excluded(start), Bound::Unbounded))
+            .map(|(number, part)| (*number, part.clone()))
+            .collect();
+
+        let limit = limit.get() as usize;
+        let is_truncated = collected.len() > limit;
+        let page: Vec<(u16, NativePart)> = collected.into_iter().take(limit).collect();
+        let next_marker = is_truncated
+            .then(|| page.last().map(|(number, _)| *number))
+            .flatten()
+            .map(|number| PartNumber::new(number).expect("stored part numbers are valid"));
+        let parts = page
+            .into_iter()
+            .map(|(number, part)| PartInfo {
+                part_number: PartNumber::new(number).expect("stored part numbers are valid"),
+                size: part.data.len() as u64,
+                etag: Some(part.etag),
+                checksum: part.checksum,
+                last_modified: SystemTime::now(),
+            })
+            .collect();
+        Ok(PartPage {
+            parts,
+            next_marker,
+            is_truncated,
+        })
+    }
+
+    async fn list_uploads(
+        &self,
+        ctx: &DriverContext,
+        namespace: &NamespaceId,
+        key_marker: Option<ObjectKey>,
+        upload_id_marker: Option<UploadId>,
+        limit: NonZeroU32,
+    ) -> Result<UploadPage, DriverError> {
+        check_ctx(ctx)?;
+        if namespace != &self.namespace {
+            return Err(DriverError::not_found("namespace is outside this instance"));
+        }
+        let state = self.state.lock().map_err(poisoned)?;
+        let mut uploads: Vec<(ObjectKey, UploadId, SystemTime)> = state
+            .uploads
+            .iter()
+            .map(|(id, upload)| {
+                (
+                    upload.key.clone(),
+                    UploadId::from_raw(id.as_str()),
+                    upload.initiated,
+                )
+            })
+            .collect();
+        uploads.sort_by(|a, b| {
+            a.0.as_str()
+                .cmp(b.0.as_str())
+                .then(a.1.as_str().cmp(b.1.as_str()))
+        });
+
+        let filtered: Vec<(ObjectKey, UploadId, SystemTime)> = uploads
+            .into_iter()
+            .filter(|(key, id, _)| match (&key_marker, &upload_id_marker) {
+                (Some(key_marker), Some(upload_id_marker)) => {
+                    (key.as_str(), id.as_str()) > (key_marker.as_str(), upload_id_marker.as_str())
+                }
+                _ => true,
+            })
+            .collect();
+
+        let limit = limit.get() as usize;
+        let is_truncated = filtered.len() > limit;
+        let page: Vec<(ObjectKey, UploadId, SystemTime)> =
+            filtered.into_iter().take(limit).collect();
+        let (next_key_marker, next_upload_id_marker) = if is_truncated {
+            page.last()
+                .map(|(key, id, _)| (Some(key.clone()), Some(id.clone())))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+        let uploads = page
+            .into_iter()
+            .map(|(key, upload_id, initiated)| MultipartUpload {
+                upload_id,
+                key,
+                initiated,
+            })
+            .collect();
+        Ok(UploadPage {
+            uploads,
+            next_key_marker,
+            next_upload_id_marker,
+            is_truncated,
+        })
+    }
+
+    async fn complete(
+        &self,
+        ctx: &DriverContext,
+        upload: &UploadHandle,
+        parts: Vec<CompletedPart>,
+        scheme: Option<MultipartChecksumScheme>,
+        expected: Vec<Checksum>,
+        preconditions: Preconditions,
+    ) -> Result<ObjectMetadata, DriverError> {
+        check_ctx(ctx)?;
+        let mut state = self.state.lock().map_err(poisoned)?;
+        let session = self.upload(&state, &upload.upload_id)?.clone();
+
+        // The manifest is validated against the stored parts before a byte is
+        // assembled, and the assembly itself is validated before anything is
+        // published.
+        let mut seen = std::collections::HashSet::new();
+        let mut ordered: Vec<(u16, NativePart)> = Vec::with_capacity(parts.len());
+        for entry in &parts {
+            let number = entry.part_number.get();
+            if !seen.insert(number) {
+                return Err(DriverError::invalid_argument(
+                    "the manifest contains duplicate part numbers",
+                ));
+            }
+            let part = session.parts.get(&number).ok_or_else(|| {
+                DriverError::invalid_argument(format!("part {number} was not uploaded"))
+            })?;
+            if let Some(tag) = &entry.etag
+                && &part.etag != tag
+            {
+                return Err(DriverError::invalid_argument(format!(
+                    "part {number} ETag does not match the uploaded part"
+                )));
+            }
+            ordered.push((number, part.clone()));
+        }
+        for window in ordered.windows(2) {
+            if window[0].0 >= window[1].0 {
+                return Err(DriverError::invalid_argument(
+                    "parts must be listed in ascending part-number order",
+                ));
+            }
+        }
+
+        let mut assembled: Vec<u8> =
+            Vec::with_capacity(ordered.iter().map(|(_, part)| part.data.len()).sum());
+        for (_, part) in &ordered {
+            assembled.extend_from_slice(&part.data);
+        }
+        let assembled = Bytes::from(assembled);
+
+        let effective = scheme.or(session.checksum);
+        let checksums = match effective {
+            None => Vec::new(),
+            Some(scheme) => {
+                let digest = match scheme.checksum_type {
+                    ChecksumType::FullObject => {
+                        crate::integrity::compute_checksum(scheme.algorithm, &assembled)
+                    }
+                    ChecksumType::Composite => {
+                        let digests: Vec<Bytes> = ordered
+                            .iter()
+                            .map(|(_, part)| {
+                                crate::integrity::compute_checksum(scheme.algorithm, &part.data)
+                            })
+                            .collect();
+                        crate::integrity::composite_checksum(scheme.algorithm, &digests)
+                    }
+                };
+                let checksum = match scheme.checksum_type {
+                    ChecksumType::FullObject => {
+                        Checksum::new(scheme.algorithm, ChecksumType::FullObject, digest)
+                    }
+                    ChecksumType::Composite => {
+                        Checksum::composite(scheme.algorithm, digest, ordered.len() as u32)
+                    }
+                }
+                .map_err(|e| DriverError::internal(e.to_string()))?;
+                vec![checksum]
+            }
+        };
+
+        // The client's declared checksum is verified here, before anything is
+        // published: a rejected completion does not consume the upload.
+        for declared in &expected {
+            let matches = checksums.iter().any(|actual| {
+                actual.algorithm() == declared.algorithm()
+                    && actual.checksum_type() == declared.checksum_type()
+                    && actual.value() == declared.value()
+                    && actual.part_count() == declared.part_count()
+            });
+            if !matches {
+                return Err(DriverError::payload_digest_mismatch(
+                    "the declared checksum did not match the assembled object",
+                ));
+            }
+        }
+
+        let existing_etag = state
+            .objects
+            .get(session.key.as_str())
+            .and_then(|object| object.metadata.etag.clone());
+        if let Some(tag) = &preconditions.if_match
+            && existing_etag.as_ref() != Some(tag)
+        {
+            return Err(DriverError::precondition_failed(
+                "If-Match did not match the current object",
+            ));
+        }
+        if preconditions.if_none_match && existing_etag.is_some() {
+            return Err(DriverError::precondition_failed(
+                "If-None-Match: * but the object exists",
+            ));
+        }
+
+        let md5s: Vec<[u8; 16]> = ordered
+            .iter()
+            .map(|(_, part)| {
+                let digest = crate::integrity::compute_checksum(ChecksumAlgorithm::Md5, &part.data);
+                let mut md5 = [0u8; 16];
+                md5.copy_from_slice(&digest);
+                md5
+            })
+            .collect();
+        let etag = crate::integrity::etag_for_multipart(&md5s);
+
+        let revision = state.next_revision();
+        let metadata = ObjectMetadata {
+            key: session.key.clone(),
+            size: assembled.len() as u64,
+            etag: Some(etag),
+            last_modified: SystemTime::now(),
+            content: session.content.clone(),
+            user_metadata: session.user_metadata.clone(),
+            checksums,
+            revision,
+        };
+        state.objects.insert(
+            session.key.to_string(),
+            StoredObject {
+                metadata: metadata.clone(),
+                content: assembled,
+            },
+        );
+        // The upload is consumed exactly once: a replay finds no session and
+        // cannot publish again.
+        state.uploads.remove(upload.upload_id.as_str());
+        Ok(metadata)
+    }
+
+    async fn abort(&self, ctx: &DriverContext, upload: &UploadHandle) -> Result<(), DriverError> {
+        check_ctx(ctx)?;
+        let mut state = self.state.lock().map_err(poisoned)?;
+        state
+            .uploads
+            .remove(upload.upload_id.as_str())
+            .map(|_| ())
+            .ok_or_else(|| {
+                DriverError::not_found(format!("upload `{}` not found", upload.upload_id.as_str()))
+            })
+    }
+}
+
+/// One staged native part, held outside the upload until it commits.
+struct RefPartWrite {
+    state: Arc<Mutex<NamespaceState>>,
+    upload_id: UploadId,
+    part_number: u16,
+    expected_length: Option<u64>,
+    scheme: Option<MultipartChecksumScheme>,
+    buffer: Vec<u8>,
+}
+
+#[async_trait]
+impl StagedWrite for RefPartWrite {
+    async fn write_chunk(&mut self, ctx: &DriverContext, bytes: Bytes) -> Result<(), DriverError> {
+        check_ctx(ctx)?;
+        if let Some(expected) = self.expected_length
+            && (self.buffer.len() + bytes.len()) as u64 > expected
+        {
+            return Err(DriverError::invalid_argument(
+                "payload exceeds the declared content length",
+            ));
+        }
+        self.buffer.extend_from_slice(&bytes);
+        Ok(())
+    }
+
+    async fn commit(
+        mut self: Box<Self>,
+        ctx: &DriverContext,
+        attrs: CommitAttributes,
+    ) -> Result<ObjectMetadata, DriverError> {
+        check_ctx(ctx)?;
+        let data = Bytes::from(std::mem::take(&mut self.buffer));
+        let length = data.len() as u64;
+        if let Some(expected) = self.expected_length
+            && attrs.length != expected
+        {
+            return Err(DriverError::invalid_argument(
+                "decoded length did not match the declared content length",
+            ));
+        }
+
+        let md5 = crate::integrity::compute_checksum(ChecksumAlgorithm::Md5, &data);
+        let mut md5_digest = [0u8; 16];
+        md5_digest.copy_from_slice(&md5);
+        let etag = attrs
+            .etag
+            .clone()
+            .unwrap_or_else(|| EntityTag::new(crate::integrity::hex(&md5_digest)).expect("hex"));
+        let checksum = match self.scheme {
+            Some(scheme) => Some(
+                Checksum::new(
+                    scheme.algorithm,
+                    scheme.checksum_type,
+                    crate::integrity::compute_checksum(scheme.algorithm, &data),
+                )
+                .map_err(|e| DriverError::internal(e.to_string()))?,
+            ),
+            None => None,
+        };
+
+        let mut state = self.state.lock().map_err(poisoned)?;
+        let revision = state.next_revision();
+        let upload = state
+            .uploads
+            .get_mut(self.upload_id.as_str())
+            .ok_or_else(|| {
+                DriverError::not_found(format!("upload `{}` not found", self.upload_id.as_str()))
+            })?;
+        // The stored part is replaced only now, so an aborted or failed part
+        // never disturbs the valid one.
+        upload.parts.insert(
+            self.part_number,
+            NativePart {
+                data,
+                etag: etag.clone(),
+                checksum: checksum.clone(),
+            },
+        );
+        Ok(ObjectMetadata {
+            key: upload.key.clone(),
+            size: length,
+            etag: Some(etag),
+            last_modified: SystemTime::now(),
+            content: upload.content.clone(),
+            user_metadata: upload.user_metadata.clone(),
+            checksums: checksum.into_iter().collect(),
+            revision,
+        })
+    }
+
+    async fn abort(self: Box<Self>, _ctx: &DriverContext) -> Result<(), DriverError> {
+        // Nothing was ever published, so dropping the buffer is the whole abort.
+        Ok(())
     }
 }

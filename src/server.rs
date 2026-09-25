@@ -2,8 +2,12 @@
 //!
 //! Startup order: parse/validate config → build driver instances → open and
 //! capability-check namespaces → readiness → accept traffic. Shutdown stops
-//! accepting, waits for in-flight requests up to a deadline, then exits
-//! (spec §7.2).
+//! accepting, waits for in-flight requests up to a deadline, closes every
+//! driver instance, then exits (spec §7.2).
+//!
+//! `/healthz` is liveness and `/readyz` is readiness: the latter reports one
+//! process draining flag *and* the health of every driver instance, so a
+//! replica whose backend is unreachable leaves the load balancer.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -19,8 +23,22 @@ use tokio::net::TcpListener;
 
 use crate::compose;
 use crate::config::{AppConfig, EnvSecretResolver};
+use crate::domain::{DriverContext, RequestId};
+use crate::driver::{DriverHealth, DriverRegistry};
 use crate::protocol::s3::{HttpError, HttpResponse, S3Body, S3Error, S3ErrorCode, S3Service};
 use crate::timeouts::IdleTimeoutBody;
+
+/// How long the process waits for in-flight operations to drain, and then for
+/// driver instances to close, before exiting anyway (spec §7.2).
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long a readiness probe waits for the driver instances to answer.
+///
+/// `/readyz` is polled by a load balancer and the probe has no request deadline
+/// of its own, so a driver that never answers would hold the probe (and the
+/// poller) open. The health call is bounded here, the way shutdown is bounded
+/// by [`SHUTDOWN_DEADLINE`].
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Starts the service and serves until a shutdown signal.
 pub async fn run(config: AppConfig) -> Result<(), String> {
@@ -31,12 +49,17 @@ pub async fn run(config: AppConfig) -> Result<(), String> {
     let mut registry = compose::build_registry(&config)?;
     let instances =
         compose::instances_from_config(&mut registry, &config, &EnvSecretResolver).await?;
+    // The instance table outlives composition: readiness probes every instance
+    // through it, and shutdown closes them through the same table, so both see
+    // exactly the instances that were created.
+    let registry = Arc::new(registry);
 
     let service = compose::object_service(
         config.catalog.clone(),
         instances,
         config.limits.clone(),
         config.access.clone(),
+        !config.development,
     )
     .await
     .map_err(|e| format!("startup capability check failed: {e}"))?;
@@ -51,6 +74,7 @@ pub async fn run(config: AppConfig) -> Result<(), String> {
     let http = HttpService {
         s3: s3_service,
         ready: ready.clone(),
+        registry: registry.clone(),
         health_endpoints: config.health_endpoints,
         metrics: Arc::new(Metrics::new()),
         body_idle_timeout: (config.limits.body_idle_timeout > Duration::ZERO)
@@ -143,11 +167,25 @@ pub async fn run(config: AppConfig) -> Result<(), String> {
     // Server-wide admission lives in the service (spec §9.3), so waiting for
     // every one of its slots is the same "no operation is still running"
     // signal the listener semaphore used to provide.
-    if tokio::time::timeout(Duration::from_secs(10), service.drain())
+    if tokio::time::timeout(SHUTDOWN_DEADLINE, service.drain())
         .await
         .is_err()
     {
         log("drain deadline exceeded; exiting with in-flight requests");
+    }
+    // Close every driver instance once no operation can reach it: an instance
+    // may hold a connection, a background queue or unflushed state, and the
+    // process is about to exit, so this is the last point at which it can be
+    // released. A failure is logged, never fatal — exiting with one driver
+    // still open beats hanging the process (spec §7.2).
+    let shutdown_ctx = DriverContext::new(RequestId::new("shutdown"));
+    match tokio::time::timeout(SHUTDOWN_DEADLINE, registry.shutdown_all(&shutdown_ctx)).await {
+        Ok(failures) => {
+            for (id, error) in failures {
+                log(&format!("driver `{id}` shutdown failed: {error}"));
+            }
+        }
+        Err(_) => log("driver shutdown deadline exceeded; exiting"),
     }
     log("shutdown complete");
     Ok(())
@@ -256,6 +294,8 @@ impl Drop for InflightGuard {
 struct HttpService {
     s3: S3Service,
     ready: Arc<AtomicBool>,
+    /// The live instances readiness probes and shutdown closes.
+    registry: Arc<DriverRegistry>,
     health_endpoints: bool,
     metrics: Arc<Metrics>,
     /// Body idle timeout, applied to every request body (spec §9.3).
@@ -279,12 +319,56 @@ impl hyper::service::Service<Request<Incoming>> for HttpService {
                 }
                 ("GET", "/readyz") => {
                     let ready = self.ready.load(Ordering::SeqCst);
+                    let registry = self.registry.clone();
                     return Box::pin(async move {
-                        if ready {
-                            Ok(text_response(StatusCode::OK, "ready"))
-                        } else {
-                            Ok(text_response(StatusCode::SERVICE_UNAVAILABLE, "draining"))
+                        if !ready {
+                            return Ok(text_response(StatusCode::SERVICE_UNAVAILABLE, "draining"));
                         }
+                        // Readiness is per instance, not one process flag: a
+                        // replica whose backend is unreachable must leave the
+                        // load balancer even while its listener still accepts,
+                        // and only the instance knows that (spec §7.2).
+                        let ctx = DriverContext::new(RequestId::new("readyz"))
+                            .with_timeout(HEALTH_PROBE_TIMEOUT);
+                        let health =
+                            match tokio::time::timeout(HEALTH_PROBE_TIMEOUT, registry.health(&ctx))
+                                .await
+                            {
+                                Ok(health) => health,
+                                Err(_) => {
+                                    log("readiness probe timed out waiting for drivers");
+                                    return Ok(text_response(
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        "readiness probe timed out",
+                                    ));
+                                }
+                            };
+                        let mut unhealthy: Vec<String> = health
+                            .into_iter()
+                            .filter(|(_, health)| !health.is_serving())
+                            .map(|(id, health)| {
+                                // The reason is written for an operator and may
+                                // name backend detail (a host, a connection
+                                // string). `/readyz` is unauthenticated, so the
+                                // body names only the instance and the reason
+                                // goes to the log.
+                                if let DriverHealth::Unhealthy { reason } = &health {
+                                    log(&format!(
+                                        "driver `{}` is unhealthy: {reason}",
+                                        id.as_str()
+                                    ));
+                                }
+                                id.as_str().to_string()
+                            })
+                            .collect();
+                        if unhealthy.is_empty() {
+                            return Ok(text_response(StatusCode::OK, "ready"));
+                        }
+                        unhealthy.sort();
+                        Ok(owned_text_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("unhealthy drivers: {}", unhealthy.join(", ")),
+                        ))
                     });
                 }
                 ("GET", "/metrics") => {

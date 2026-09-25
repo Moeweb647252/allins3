@@ -448,6 +448,7 @@ async fn staging_quota_backpressure_keeps_earlier_parts() {
     let key = object_key("limits/quota.bin");
     let upload_id = service
         .create_multipart(
+            &ctx(),
             BUCKET,
             &key,
             Some("tester"),
@@ -455,6 +456,7 @@ async fn staging_quota_backpressure_keeps_earlier_parts() {
             Default::default(),
             None,
         )
+        .await
         .expect("create upload")
         .upload_id
         .as_str()
@@ -491,7 +493,8 @@ async fn staging_quota_backpressure_keeps_earlier_parts() {
 
     // The rejected part must not destroy the accepted one.
     let parts = service
-        .list_parts(BUCKET, &key, &upload_id, None, 100)
+        .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+        .await
         .expect("list parts");
     assert_eq!(parts.parts.len(), 1);
     assert_eq!(parts.parts[0].number, 1);
@@ -519,6 +522,7 @@ async fn the_staging_quota_refuses_a_part_while_its_body_is_streaming() {
     let key = object_key("limits/streamed-quota.bin");
     let upload_id = service
         .create_multipart(
+            &ctx(),
             BUCKET,
             &key,
             Some("tester"),
@@ -526,6 +530,7 @@ async fn the_staging_quota_refuses_a_part_while_its_body_is_streaming() {
             Default::default(),
             None,
         )
+        .await
         .expect("create upload")
         .upload_id
         .as_str()
@@ -562,7 +567,8 @@ async fn the_staging_quota_refuses_a_part_while_its_body_is_streaming() {
 
     // Nothing was staged, and the refused part released the quota it charged.
     let parts = service
-        .list_parts(BUCKET, &key, &upload_id, None, 100)
+        .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+        .await
         .expect("list parts");
     assert!(parts.parts.is_empty(), "{:?}", parts.parts);
 
@@ -580,7 +586,8 @@ async fn the_staging_quota_refuses_a_part_while_its_body_is_streaming() {
         .await
         .expect("a refused part must return its reservation to the quota");
     let parts = service
-        .list_parts(BUCKET, &key, &upload_id, None, 100)
+        .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+        .await
         .expect("list parts");
     assert_eq!(parts.parts.len(), 1);
     assert_eq!(parts.parts[0].size, 3 * 1024 * 1024);
@@ -608,6 +615,7 @@ async fn a_part_cancelled_mid_body_stages_nothing_and_frees_the_quota() {
     let key = object_key("limits/cancelled-part.bin");
     let upload_id = service
         .create_multipart(
+            &ctx(),
             BUCKET,
             &key,
             Some("tester"),
@@ -615,6 +623,7 @@ async fn a_part_cancelled_mid_body_stages_nothing_and_frees_the_quota() {
             Default::default(),
             None,
         )
+        .await
         .expect("create upload")
         .upload_id
         .as_str()
@@ -644,7 +653,8 @@ async fn a_part_cancelled_mid_body_stages_nothing_and_frees_the_quota() {
     assert!(matches!(err, ServiceError::InvalidRequest(_)), "{err:?}");
 
     let parts = service
-        .list_parts(BUCKET, &key, &upload_id, None, 100)
+        .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+        .await
         .expect("list parts");
     assert!(parts.parts.is_empty(), "{:?}", parts.parts);
 
@@ -941,6 +951,7 @@ async fn a_part_upload_is_refused_when_the_global_scope_is_saturated() {
     let key = object_key("global/part.bin");
     let upload_id = service
         .create_multipart(
+            &ctx(),
             BUCKET,
             &key,
             Some("tester"),
@@ -948,6 +959,7 @@ async fn a_part_upload_is_refused_when_the_global_scope_is_saturated() {
             Default::default(),
             None,
         )
+        .await
         .expect("create upload")
         .upload_id
         .as_str()
@@ -993,7 +1005,8 @@ async fn a_part_upload_is_refused_when_the_global_scope_is_saturated() {
         .expect_err("a part upload must be admitted like any other operation");
     assert_eq!(err, ServiceError::SlowDown);
     let parts = service
-        .list_parts(BUCKET, &key, &upload_id, None, 100)
+        .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+        .await
         .expect("list parts");
     assert!(parts.parts.is_empty(), "{:?}", parts.parts);
 
@@ -1022,6 +1035,7 @@ async fn draining_waits_for_an_in_flight_part_upload() {
     let key = object_key("drain/part.bin");
     let upload_id = service
         .create_multipart(
+            &ctx(),
             BUCKET,
             &key,
             Some("tester"),
@@ -1029,6 +1043,7 @@ async fn draining_waits_for_an_in_flight_part_upload() {
             Default::default(),
             None,
         )
+        .await
         .expect("create upload")
         .upload_id
         .as_str()

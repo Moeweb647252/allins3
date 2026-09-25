@@ -122,14 +122,17 @@ pub async fn instance_from_factory(
 ///
 /// Readiness is part of composition, not an optional follow-up: a service that
 /// has not been checked must not be handed to a listener, so the check happens
-/// here rather than at each call site.
+/// here rather than at each call site. `production` comes from the resolved
+/// configuration and tightens that check for writable bindings, so the caller
+/// cannot forget to pass the deployment mode along with the limits.
 pub async fn object_service(
     catalog: BucketCatalog,
     instances: HashMap<String, Arc<dyn StorageDriver>>,
     limits: Limits,
     access: AccessPolicy,
+    production: bool,
 ) -> Result<ObjectService, ServiceError> {
-    let service = ObjectService::new(catalog, instances, limits, access);
+    let service = ObjectService::new(catalog, instances, limits, access, production);
     service.warmup(&startup_ctx()).await?;
     Ok(service)
 }

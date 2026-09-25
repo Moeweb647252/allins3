@@ -29,16 +29,16 @@ python3 scripts/e2e_timeouts.py  # 请求边界：header/body idle/总 deadline�
 ALLINS3_BENCH_FULL=1 cargo test --release --all-features --test resource_budget -- --nocapture
 ```
 
-服务器端点：`/healthz`（liveness）、`/readyz`（readiness，排空时 `503`）、`/metrics`（计数器），以及 path-style 的 S3 API。示例配置见 [`examples/dev-config.toml`](examples/dev-config.toml)。
+服务器端点：`/healthz`（liveness）、`/readyz`（readiness；排空时或任一 driver 实例不健康时 `503`）、`/metrics`（计数器），以及 path-style 的 S3 API。示例配置见 [`examples/dev-config.toml`](examples/dev-config.toml)。
 
 ## 当前能力
 
 - `src/domain/`：强类型 ID、`ObjectKey`（key 字节原样保留）、`ObjectMetadata`/`ObjectRevision`、checksum、`DriverError`（含 `CommitState` 四态）、`DriverContext`（超时与取消）、`ResolvedRange`、列举请求/游标。
 - `src/driver/`：`StorageDriver`、`ReadNamespace`、`WriteNamespace`、`StagedWrite`、`NativeCopy`、`MultipartNamespace`、`CommitRecovery`、工厂/注册表、能力与限制模型及 Native/Emulated/Unsupported 规划。
 - `src/config/` + `src/catalog.rs`：TOML 配置校验、secret 引用、bucket→namespace 不可变绑定、全局与每 principal、每 driver 并发限制、暂存配额。
-- `src/service/`：GET/HEAD/PUT/DELETE/LIST/COPY、条件与 Range 的 `stat → 条件 → 区间 → 携带 revision 读取` 流程、原子发布、列举 token 的作用域绑定、通用 multipart 协调器（单次发布、竞争仲裁、完成记录、过期暂存回收）。
+- `src/service/`：GET/HEAD/PUT/DELETE/LIST/COPY、条件与 Range 的 `stat → 条件 → 区间 → 携带 revision 读取` 流程、原子发布、列举 token 的作用域绑定；multipart 两条路径共用同一套语义（固定清单与 scheme、单次发布、竞争仲裁、完成记录、过期暂存回收）—— 原生 namespace 由驱动持有 part 与完成，其余由通用协调器在 staged write 上补齐。路由由 namespace 打开时物化的能力规划决定（`copy_route` / `native_multipart`，见 ADR-0010）。
 - `src/protocol/s3/`：基于 `s3s` 的 path-style HTTP/S3 适配、SigV4（header 与预签名 query）、默认拒绝的授权、请求 ID、错误映射、每 principal 准入控制。
-- `src/server.rs`：启动顺序（配置 → driver → namespace 能力校验 → readiness）、优雅退出、健康与指标端点。
+- `src/server.rs`：启动顺序（配置 → driver → namespace 能力校验 → readiness）、优雅退出（排空后逐个 `StorageDriver::shutdown`）、健康与指标端点（`/readyz` 汇总每 driver 实例健康）。
 - `src/testing/`（`testing` feature）：内存参考 driver、排序向量独立 driver、故障注入包装器、计数 sink（度量写入而不物化数据）、可复用契约 harness、服务级 fixture、进程内协议 harness（构建二进制同款 `S3Service`，由性质测试与三个模糊测试目标共用）。
 
 ## 构建与检查

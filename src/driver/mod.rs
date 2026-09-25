@@ -15,13 +15,14 @@ mod traits;
 
 pub use capabilities::{
     CapabilityError, CapabilityPlan, ConditionalSupport, Consistency, DriverLimits, FeatureSupport,
-    NamespaceCapabilities, Persistence, PlannedFeature, Profile, ProfileError, RangeSupport, plan,
-    support_for, validate_profile,
+    NamespaceCapabilities, Persistence, PlannedFeature, Profile, ProfileError, RangeSupport,
+    features_for_profile, plan, support_for, validate_profile,
 };
 pub use descriptor::{DriverDescriptor, DriverHealth, DriverKind};
 pub use extensions::{
-    CommitRecovery, CompletedPart, CopyRequest, CopySource, MetadataDirective, MultipartNamespace,
-    MultipartUpload, NativeCopy, PartInfo, UploadHandle, UploadId,
+    CommitRecovery, CompletedPart, CopyRequest, CopySource, CreateUploadRequest, MetadataDirective,
+    MultipartChecksumScheme, MultipartNamespace, MultipartUpload, NativeCopy, PartInfo, PartPage,
+    UploadHandle, UploadId, UploadPage,
 };
 pub use factory::{DriverFactory, FactoryConfig, Secret, SecretResolver};
 pub use registry::{DriverRegistry, RegistryError};

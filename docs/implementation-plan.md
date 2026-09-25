@@ -124,6 +124,8 @@ P1 模型稳定后，协议适配测试向量与 P2 可独立推进；不应在�
 - [x] P4-06 覆盖并发 Complete/Complete 与 Complete/Abort 仲裁、丢失完成回执、重试清单变化（manifests 变更后重试）、过期暂存清理与「未知结果不被清扫/不被重放」；注入“原提交仍在途但查无记录”以及“原尝试已隔离、重试成功后旧提交迟到”两种时序，验证不重复提交且旧尝试不能覆盖新对象。
 - [x] P4-07 SDK transfer manager 的 multipart 路径**已验证**（11 MiB → 3 part，ETag 用独立计算的组合值比对，`ListParts`/`UploadPartCopy`/`abort` 均通过）；高层 **CLI** 路径已验证（`scripts/e2e_cli.sh`：`aws s3 cp` 11 MiB 自动分片且 ETag 带 part 数、`aws s3 sync`/`ls`/`rm` 与往返字节一致）。
 
+- [x] P4-08 把能力规划接到路由上，并实现原生 multipart 路径（[ADR-0010](../docs/adr/0010-capability-plan-drives-routing.md)）。`NamespaceHandles` 打开 namespace 时用 `features_for_profile(profile)` 调用 `plan()` 并把结果与句柄一起缓存；`copy_object` 由 `copy_route()` 选择原生复制或读流补齐，`handle.multipart` 不再零消费者。multipart 的归宿在创建时记录在 session 上（原生走驱动，其余走协调器），两条路径共用清单校验、scheme 定案、part 摘要校验、单次完成声明与四态对账；驱动契约按 spec §3.4 补上 `CreateUploadRequest.checksum` 与 `MultipartNamespace::complete(scheme, expected)`，使声明值在发布前被校验。参考 driver 实现 `MultipartNamespace`，契约 harness 增加 `multipart_native_semantics`（INV-05），服务层测试含原生/协调器等价用例。→ `src/service/handles.rs`、`src/service/multipart.rs`、`src/driver/extensions.rs`、`src/testing/reference.rs`、`src/testing/contract.rs`、`tests/service_multipart.rs`、`tests/contract_reference.rs`。
+
 产物：可运行的 multipart 参考实现、恢复协议与故障测试。测试工具可以用可重建状态模拟崩溃窗口，但不能替代真实持久化系统的进程崩溃验证。
 
 验收门槛：完成前目标不变；完成后对象和元数据一致；终止不影响原对象；重复完成不会覆盖后续对象；执行中或未知的尝试不被重放，已判为终态未提交的旧尝试无法迟到发布；后台清理不删除活动 part 或已提交对象；不同 checksum 模式得到正确值。

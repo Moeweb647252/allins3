@@ -120,6 +120,22 @@ impl DriverRegistry {
         }
         out
     }
+
+    /// Stops every instance, returning the ones whose shutdown failed.
+    ///
+    /// A failing instance must not stop the others from closing, so failures
+    /// are collected rather than propagated — the same rule [`Self::health`]
+    /// follows for an unreachable instance. The caller owns the deadline: an
+    /// instance that will not close must not hold the process open.
+    pub async fn shutdown_all(&self, ctx: &DriverContext) -> Vec<(DriverInstanceId, DriverError)> {
+        let mut failures = Vec::new();
+        for (id, driver) in &self.instances {
+            if let Err(error) = driver.shutdown(ctx).await {
+                failures.push((id.clone(), error));
+            }
+        }
+        failures
+    }
 }
 
 #[cfg(test)]

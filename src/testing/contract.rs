@@ -15,13 +15,14 @@ use std::num::NonZeroU32;
 use bytes::Bytes;
 
 use crate::domain::{
-    BeginWrite, CommitAttributes, CommitState, ContentProperties, DriverContext, DriverError,
-    DriverErrorKind, ListCursor, ListRequest, NamespaceId, ObjectKey, Preconditions, RequestId,
-    UserMetadata, WriteId,
+    BeginWrite, Checksum, ChecksumAlgorithm, ChecksumType, CommitAttributes, CommitState,
+    ContentProperties, DriverContext, DriverError, DriverErrorKind, ListCursor, ListRequest,
+    NamespaceId, ObjectKey, PartNumber, Preconditions, RequestId, UserMetadata, WriteId,
 };
 use crate::driver::{
-    CommitRecovery, CopyRequest, CopySource, MetadataDirective, NamespaceHandle, PlannedFeature,
-    Profile, StorageDriver, support_for, validate_profile,
+    CommitRecovery, CompletedPart, CopyRequest, CopySource, CreateUploadRequest, MetadataDirective,
+    MultipartChecksumScheme, NamespaceHandle, PlannedFeature, Profile, StorageDriver, support_for,
+    validate_profile,
 };
 
 use super::support::{new_write_id, put_object, put_object_with_metadata, read_to_end};
@@ -215,6 +216,21 @@ pub async fn run_contract(
         ));
     }
 
+    // A namespace that declares native multipart must actually provide it, and
+    // the service routes uploads to it on that declaration alone.
+    if caps.multipart && caps.read && caps.write {
+        run(
+            "multipart_native_semantics",
+            check_native_multipart(&handle, &ctx).await,
+            &mut report,
+        )?;
+    } else {
+        report.skipped.push((
+            "multipart_native_semantics",
+            "requires native multipart plus read + write",
+        ));
+    }
+
     // The native optimised copy must be indistinguishable from the streaming
     // fallback; this is the equivalence entry point every driver shares.
     if caps.native_copy && caps.read && caps.write {
@@ -231,6 +247,232 @@ pub async fn run_contract(
     }
 
     Ok(report)
+}
+
+/// Proves the native multipart interface behaves the way the service assumes.
+///
+/// The service keeps the protocol semantics and lets the driver own the parts,
+/// so the driver must: hide an upload and its uncommitted parts, digest every
+/// part under the scheme fixed at `create_upload`, assemble the manifest in
+/// order, publish exactly once with the multipart ETag, and discard on abort.
+async fn check_native_multipart(
+    handle: &NamespaceHandle,
+    ctx: &DriverContext,
+) -> Result<(), String> {
+    let multipart = handle
+        .multipart
+        .as_ref()
+        .ok_or("namespace declares multipart without a handle")?;
+    let scheme = MultipartChecksumScheme {
+        algorithm: ChecksumAlgorithm::Crc32,
+        checksum_type: ChecksumType::FullObject,
+    };
+
+    let target = key("native/multipart.bin");
+    let upload = multipart
+        .create_upload(
+            ctx,
+            CreateUploadRequest {
+                key: target.clone(),
+                content: ContentProperties::default(),
+                user_metadata: UserMetadata::new(),
+                checksum: Some(scheme),
+            },
+        )
+        .await
+        .map_err(|e| err_detail(&e))?;
+
+    // Starting an upload must not touch the target.
+    let before = handle.read.stat(ctx, &target).await;
+    require(
+        matches!(before, Err(ref e) if e.kind() == DriverErrorKind::NotFound),
+        "an in-progress native upload is already visible as an object",
+    )?;
+
+    // A part that was written but not committed must not be listed.
+    let mut staged = multipart
+        .begin_part(ctx, &upload, PartNumber::new(1).expect("part"), None)
+        .await
+        .map_err(|e| err_detail(&e))?;
+    staged
+        .write_chunk(ctx, Bytes::from_static(b"first-"))
+        .await
+        .map_err(|e| err_detail(&e))?;
+    let listed = multipart
+        .list_parts(ctx, &upload, None, limit(10))
+        .await
+        .map_err(|e| err_detail(&e))?;
+    require(
+        listed.parts.is_empty(),
+        "an uncommitted part is listed as an uploaded part",
+    )?;
+    staged.abort(ctx).await.map_err(|e| err_detail(&e))?;
+
+    // A committed part is listed with the digest of its own bytes under the
+    // scheme fixed at create time, which is what a `ListParts` response needs.
+    let parts = [(1u16, b"first-".to_vec()), (2u16, b"second".to_vec())];
+    let mut manifest = Vec::new();
+    for (number, data) in &parts {
+        let mut staged = multipart
+            .begin_part(ctx, &upload, PartNumber::new(*number).expect("part"), None)
+            .await
+            .map_err(|e| err_detail(&e))?;
+        staged
+            .write_chunk(ctx, Bytes::from(data.clone()))
+            .await
+            .map_err(|e| err_detail(&e))?;
+        let meta = staged
+            .commit(
+                ctx,
+                CommitAttributes {
+                    length: data.len() as u64,
+                    etag: None,
+                    checksums: Vec::new(),
+                },
+            )
+            .await
+            .map_err(|e| err_detail(&e))?;
+        manifest.push(CompletedPart {
+            part_number: PartNumber::new(*number).expect("part"),
+            etag: meta.etag,
+        });
+    }
+
+    let listed = multipart
+        .list_parts(ctx, &upload, None, limit(10))
+        .await
+        .map_err(|e| err_detail(&e))?;
+    require(
+        listed.parts.len() == 2,
+        format!("expected 2 listed parts, got {}", listed.parts.len()),
+    )?;
+    let first = &listed.parts[0];
+    let expected_digest = crate::integrity::compute_checksum(ChecksumAlgorithm::Crc32, b"first-");
+    require(
+        first
+            .checksum
+            .as_ref()
+            .is_some_and(|checksum| checksum.value() == &expected_digest),
+        "the listed part is not digesting its bytes under the upload's scheme",
+    )?;
+
+    // A declared object checksum that does not match the assembled object must
+    // be refused *without* consuming the upload: the driver verifies before it
+    // publishes, so the client can correct the declaration and retry.
+    let declared_object_checksum =
+        crate::integrity::compute_checksum(ChecksumAlgorithm::Crc32, b"first-second");
+    let wrong = Checksum::new(
+        ChecksumAlgorithm::Crc32,
+        ChecksumType::FullObject,
+        vec![0u8; 4],
+    )
+    .expect("a four-byte CRC32 value");
+    let refused = multipart
+        .complete(
+            ctx,
+            &upload,
+            manifest.clone(),
+            Some(scheme),
+            vec![wrong],
+            Preconditions::none(),
+        )
+        .await;
+    require(
+        refused.is_err(),
+        "a completion whose declared checksum does not match was published",
+    )?;
+    let still_there = multipart
+        .list_parts(ctx, &upload, None, limit(10))
+        .await
+        .map_err(|e| err_detail(&e))?;
+    require(
+        still_there.parts.len() == 2,
+        "a refused completion consumed the upload",
+    )?;
+    let untouched = handle.read.stat(ctx, &target).await;
+    require(
+        matches!(untouched, Err(ref e) if e.kind() == DriverErrorKind::NotFound),
+        "a refused completion published an object",
+    )?;
+
+    // Completing publishes the assembled object once, with the multipart ETag
+    // and the object checksum the scheme asks for; the declared object checksum
+    // is verified against the assembly before anything is published.
+    let expected = Checksum::new(
+        ChecksumAlgorithm::Crc32,
+        ChecksumType::FullObject,
+        declared_object_checksum.clone(),
+    )
+    .expect("a CRC32 value");
+    let meta = multipart
+        .complete(
+            ctx,
+            &upload,
+            manifest.clone(),
+            Some(scheme),
+            vec![expected],
+            Preconditions::none(),
+        )
+        .await
+        .map_err(|e| err_detail(&e))?;
+    require(
+        meta.size == 12,
+        format!("assembled size {} != 12", meta.size),
+    )?;
+    require(
+        meta.etag
+            .as_ref()
+            .is_some_and(|tag| tag.as_str().ends_with("-2")),
+        "the multipart ETag does not carry the part count",
+    )?;
+    let assembled = read_key(handle, ctx, &target).await?;
+    require(assembled == b"first-second", "assembled bytes are wrong")?;
+    require(
+        meta.checksums
+            .first()
+            .is_some_and(|checksum| checksum.value() == &declared_object_checksum),
+        "the published object checksum does not cover the assembled bytes",
+    )?;
+
+    // The upload is consumed exactly once.
+    let replay = multipart
+        .complete(
+            ctx,
+            &upload,
+            manifest,
+            Some(scheme),
+            Vec::new(),
+            Preconditions::none(),
+        )
+        .await;
+    require(replay.is_err(), "a replayed completion published again")?;
+
+    // An aborted upload disappears and publishes nothing.
+    let aborted_target = key("native/aborted.bin");
+    let aborted = multipart
+        .create_upload(
+            ctx,
+            CreateUploadRequest {
+                key: aborted_target.clone(),
+                content: ContentProperties::default(),
+                user_metadata: UserMetadata::new(),
+                checksum: None,
+            },
+        )
+        .await
+        .map_err(|e| err_detail(&e))?;
+    multipart
+        .abort(ctx, &aborted)
+        .await
+        .map_err(|e| err_detail(&e))?;
+    let gone = multipart.list_parts(ctx, &aborted, None, limit(10)).await;
+    require(gone.is_err(), "an aborted upload is still listable")?;
+    let after = handle.read.stat(ctx, &aborted_target).await;
+    require(
+        matches!(after, Err(ref e) if e.kind() == DriverErrorKind::NotFound),
+        "an aborted upload published an object",
+    )?;
+    Ok(())
 }
 
 /// Proves a driver's native copy route and the streaming fallback produce the

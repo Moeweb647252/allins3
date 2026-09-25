@@ -30,10 +30,10 @@
 
 ### NamespaceHandles（句柄）
 
-- **持有**：driver 实例表、namespace 句柄缓存（键为 `bucket#generation`）、打开与能力校验。
-- **接口**：`get(binding, ctx) -> Arc<NamespaceHandle>`。
+- **持有**：driver 实例表、namespace 缓存（键为 `bucket#generation`）—— 每项是驱动句柄加一份由它声明物化出的 `CapabilityPlan`。
+- **接口**：`get(binding, ctx) -> Arc<Namespace>`（`Namespace` 对 `NamespaceHandle` 实现 `Deref`）；路由只读规划（`support` / `copy_route` / `native_multipart` / `writer`）。
 - **不负责**：权限（ADR-0004 §8）、准入、catalog 的查询本身。
-- **必须保持**：ADR-0004 §5 的绑定版本固定；能力校验失败映射为 `Internal`。
+- **必须保持**：ADR-0004 §5 的绑定版本固定；能力校验失败映射为 `Internal`；`plan()` 失败即启动失败；句柄的接口与声明不一致时打开即失败（`is_self_consistent`），因此路由读到的 `Native` 规划背后一定有接口（ADR-0010）。
 
 ### TokenStore（列举令牌）
 
@@ -45,8 +45,8 @@
 ### Multipart（multipart 状态所有者）
 
 - **持有**：`Mutex<MultipartState>` —— session、完成声明（claim）、完成记录，以及一个 `StagingLedger`。
-- **接口**：由用例层通过内部接口访问；对外仍是 S3 multipart 操作。
-- **不负责**：准入（由 Admission 提供槽位）、句柄缓存。
+- **接口**：由用例层通过内部接口访问；对外仍是 S3 multipart 操作。session 上记录了这个 upload 的归宿：原生 namespace 的 part 与完成在驱动里，其余由协调器持有（ADR-0010）。
+- **不负责**：准入（由 Admission 提供槽位）、句柄缓存；原生 upload 的字节与生命周期（归驱动——服务侧只保留绑定记录，并在驱动确认该 upload 已消失后由清理器退休它）。
 
 ### StagingLedger（暂存账本）
 
@@ -70,7 +70,7 @@
 
 ### 已实现的候选
 
-架构评审提出的三个候选现均已实现：**对象服务拆分**（Admission / NamespaceHandles / TokenStore / Multipart，见 ADR-0008）；ADR-0008 记为“未决”的两项后续 —— **Composition 组合根**（`src/compose.rs`）与 **StagingLedger**（`src/service/staging.rs`）—— 见 [ADR-0009](docs/adr/0009-service-decomposition-followups.md)。
+架构评审提出的三个候选现均已实现：**对象服务拆分**（Admission / NamespaceHandles / TokenStore / Multipart，见 ADR-0008）；ADR-0008 记为“未决”的两项后续 —— **Composition 组合根**（`src/compose.rs`）与 **StagingLedger**（`src/service/staging.rs`）—— 见 [ADR-0009](docs/adr/0009-service-decomposition-followups.md)。能力规划从「只做档位校验」变为**路由的唯一依据**（原生 copy、原生 multipart 或补齐），见 [ADR-0010](docs/adr/0010-capability-plan-drives-routing.md)。
 
 ## 进程级全局状态
 

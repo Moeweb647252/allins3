@@ -1450,6 +1450,7 @@ impl S3 for S3Handler {
         let session = self
             .service
             .create_multipart(
+                &scope.ctx,
                 input.bucket.as_str(),
                 &key,
                 scope.principal.as_deref(),
@@ -1457,6 +1458,7 @@ impl S3 for S3Handler {
                 to_user_metadata(&input.metadata, &scope.request_id)?,
                 checksum,
             )
+            .await
             .map_err(|e| map_error(e, &scope.request_id))?;
 
         let output = CreateMultipartUploadOutput {
@@ -1628,7 +1630,15 @@ impl S3 for S3Handler {
 
         let page = self
             .service
-            .list_parts(input.bucket.as_str(), &key, &input.upload_id, marker, limit)
+            .list_parts(
+                &scope.ctx,
+                input.bucket.as_str(),
+                &key,
+                &input.upload_id,
+                marker,
+                limit,
+            )
+            .await
             .map_err(|e| map_error(e, &scope.request_id))?;
 
         let parts = page
@@ -1684,12 +1694,14 @@ impl S3 for S3Handler {
         let page = self
             .service
             .list_uploads(
+                &scope.ctx,
                 input.bucket.as_str(),
                 input.prefix.as_deref(),
                 input.key_marker.as_deref(),
                 input.upload_id_marker.as_deref(),
                 limit,
             )
+            .await
             .map_err(|e| map_error(e, &scope.request_id))?;
 
         require_encodable(
@@ -1840,7 +1852,8 @@ impl S3 for S3Handler {
         let input = req.input;
         let key = parse_key(&input.key, &scope.request_id)?;
         self.service
-            .abort_multipart(input.bucket.as_str(), &key, &input.upload_id)
+            .abort_multipart(&scope.ctx, input.bucket.as_str(), &key, &input.upload_id)
+            .await
             .map_err(|e| map_error(e, &scope.request_id))?;
         Ok(attach_request_id(
             S3Response::new(AbortMultipartUploadOutput::default()),

@@ -11,8 +11,9 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 
 use crate::domain::{
-    Checksum, CommitState, ContentProperties, DriverContext, DriverError, EntityTag, NamespaceId,
-    ObjectKey, ObjectMetadata, ObjectRevision, PartNumber, Preconditions, UserMetadata, WriteId,
+    Checksum, ChecksumAlgorithm, ChecksumType, CommitState, ContentProperties, DriverContext,
+    DriverError, EntityTag, NamespaceId, ObjectKey, ObjectMetadata, ObjectRevision, PartNumber,
+    Preconditions, UserMetadata, WriteId,
 };
 
 use super::traits::StagedWrite;
@@ -132,6 +133,12 @@ pub struct CreateUploadRequest {
     pub content: ContentProperties,
     /// User metadata for the finished object.
     pub user_metadata: UserMetadata,
+    /// The checksum the upload runs under, when it was created with one.
+    ///
+    /// The scheme is fixed for the upload's lifetime, so the driver must digest
+    /// every part under it (and report those digests from `list_parts`) and
+    /// publish the finished object with the same algorithm and coverage.
+    pub checksum: Option<MultipartChecksumScheme>,
 }
 
 /// One part of a multipart upload.
@@ -178,6 +185,22 @@ pub struct MultipartUpload {
     pub key: ObjectKey,
     /// When the upload was initiated.
     pub initiated: SystemTime,
+}
+
+/// The checksum a multipart completion must compute and publish.
+///
+/// The service fixes the algorithm and the coverage when the upload is created
+/// (or when a completion request names one for an upload created without a
+/// scheme); the driver has the part bytes, so it computes the digest and
+/// returns it in the published metadata. The service validates the returned
+/// value against anything the client declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultipartChecksumScheme {
+    /// The digest algorithm every part and the finished object use.
+    pub algorithm: ChecksumAlgorithm,
+    /// Whether the digest covers the assembled object or the ordered part
+    /// digests.
+    pub checksum_type: ChecksumType,
 }
 
 /// One page of in-progress uploads.
@@ -235,12 +258,23 @@ pub trait MultipartNamespace: Send + Sync {
 
     /// Atomically completes an upload from an exact manifest. Nothing is
     /// published before final validation.
+    ///
+    /// `parts` is the client's fixed manifest. `scheme` is the checksum the
+    /// finished object must be published under, when the upload has one; the
+    /// driver computes that digest from the parts it holds and returns it in the
+    /// metadata. `expected` are object-level checksums the client declared: the
+    /// driver must verify the assembled object against them and fail *without
+    /// publishing* when one does not match, so a rejected completion never
+    /// consumes the upload. The published ETag is the driver's; a driver
+    /// completing a multipart upload publishes the multipart `md5(parts)-<count>`
+    /// form.
     async fn complete(
         &self,
         ctx: &DriverContext,
         upload: &UploadHandle,
         parts: Vec<CompletedPart>,
-        checksums: Vec<Checksum>,
+        scheme: Option<MultipartChecksumScheme>,
+        expected: Vec<Checksum>,
         preconditions: Preconditions,
     ) -> Result<ObjectMetadata, DriverError>;
 

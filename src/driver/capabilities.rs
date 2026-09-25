@@ -286,6 +286,34 @@ pub enum Profile {
     Multipart,
 }
 
+/// The features the service must be able to provide for a bucket profile.
+///
+/// This is the requirement set the service plans against when it opens a
+/// namespace: [`plan`] fails when one of them is unavailable, and the resulting
+/// [`CapabilityPlan`] is what routing consults. Stating the set once keeps
+/// "which features does this bucket need" from being re-derived at each call
+/// site, and makes the Native/Emulated choice a recorded decision rather than
+/// an ad-hoc `if let Some(handle)`.
+///
+/// `Range` and `Conditional` are deliberately absent: both have defined
+/// fallbacks (a full read, or `Unsupported` reported to the client), so they
+/// are not requirements of a profile.
+pub fn features_for_profile(profile: Profile) -> &'static [PlannedFeature] {
+    match profile {
+        Profile::CoreRead => &[PlannedFeature::Read, PlannedFeature::List],
+        // A writable bucket can always have copy and multipart provided by the
+        // service layer over the staged write, so those two are part of the
+        // plan even where the driver has them natively.
+        Profile::CoreWrite | Profile::Multipart => &[
+            PlannedFeature::Read,
+            PlannedFeature::List,
+            PlannedFeature::Write,
+            PlannedFeature::Copy,
+            PlannedFeature::Multipart,
+        ],
+    }
+}
+
 /// Computes the support level for each requested feature.
 pub fn plan(
     requested: &[PlannedFeature],

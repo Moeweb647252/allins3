@@ -74,6 +74,56 @@ pub struct BucketSpec<'a> {
     pub profile: Profile,
 }
 
+/// Builds two services sharing one driver instance, and returns that instance.
+///
+/// Both services see the same backend state — the driver's objects and its
+/// native upload sessions — but each keeps its own service-side tables, so a
+/// test can show what one service knows independently of the other, or act on
+/// the driver directly.
+pub async fn two_services_over_shared_drivers(
+    factory: Arc<dyn DriverFactory>,
+    spec: BucketSpec<'_>,
+    limits: Limits,
+    access: AccessPolicy,
+) -> (ObjectService, ObjectService, Arc<dyn StorageDriver>) {
+    let instance =
+        crate::compose::instance_from_factory(factory, spec.driver, &ctx("fixture"), &NoSecrets)
+            .await
+            .expect("create instance");
+    let mut drivers: HashMap<String, Arc<dyn StorageDriver>> = HashMap::new();
+    drivers.insert(spec.driver.to_string(), instance.clone());
+
+    let binding = || BucketBinding {
+        bucket: BucketId::parse(spec.bucket).expect("bucket id"),
+        driver: DriverInstanceId::parse(spec.driver).expect("instance id"),
+        namespace: NamespaceId::parse(spec.namespace).expect("namespace"),
+        generation: 1,
+        profile: spec.profile,
+        readonly: false,
+        region: "us-east-1".into(),
+    };
+
+    let first = crate::compose::object_service(
+        BucketCatalog::from_bindings(vec![binding()]).expect("catalog"),
+        drivers.clone(),
+        limits.clone(),
+        access.clone(),
+        false,
+    )
+    .await
+    .expect("warmup");
+    let second = crate::compose::object_service(
+        BucketCatalog::from_bindings(vec![binding()]).expect("catalog"),
+        drivers,
+        limits,
+        access,
+        false,
+    )
+    .await
+    .expect("warmup");
+    (first, second, instance)
+}
+
 /// Builds an `ObjectService` over driver instances created from `factories`.
 ///
 /// `factories` maps a driver instance id to the factory that builds it, so a
@@ -107,7 +157,9 @@ pub async fn service(
         .collect::<Vec<_>>();
 
     let catalog = BucketCatalog::from_bindings(bindings).expect("catalog");
-    crate::compose::object_service(catalog, drivers, limits, access)
+    // Test drivers are volatile and registered only in a development build, so
+    // the fixture is always a development deployment.
+    crate::compose::object_service(catalog, drivers, limits, access, false)
         .await
         .expect("warmup")
 }
