@@ -9,6 +9,7 @@ mod admission;
 pub mod error;
 mod handles;
 pub mod multipart;
+mod staging;
 mod tokens;
 
 pub(crate) use admission::OperationSlot;

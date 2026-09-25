@@ -44,10 +44,16 @@
 
 ### Multipart（multipart 状态所有者）
 
-- **持有**：`Mutex<MultipartState>` —— session、part、完成声明（claim）、完成记录、暂存配额与已用字节。
+- **持有**：`Mutex<MultipartState>` —— session、完成声明（claim）、完成记录，以及一个 `StagingLedger`。
 - **接口**：由用例层通过内部接口访问；对外仍是 S3 multipart 操作。
 - **不负责**：准入（由 Admission 提供槽位）、句柄缓存。
-- **待定**：`StagingLedger`（把配额、已暂存/在途字节与 part 表收进一个接口）是下一个候选，尚未实现。
+
+### StagingLedger（暂存账本）
+
+- **持有**：暂存配额、已暂存字节、在途（正在接收）字节与 part 表 —— 四者同属一个所有者。
+- **接口**：`reserve` / `release`（接收期计费）、`stage`（写入 part，含配额与 part 数上限）、`take`（整体回收并返回释放字节）、`part` / `parts_of`（只读）、`is_idle`。
+- **保证**：已暂存 + 在途永不超配额；丢弃 part 与归还字节在同一步完成（此前三处调用方各自手动相减，容易与表的改动脱节）。
+- **不负责**：session、claim、完成记录（留在 `MultipartState`）、准入与句柄。
 
 ### ObjectService（用例层）
 
@@ -62,9 +68,9 @@
 - **不负责**：监听、进程生命周期、后台任务（清理器的所有者仍是 `server`）。
 - **理由**：`server::run`、`fixture::service`、`ProtocolHarness::new` 曾各自维护一份略有差异的启动顺序，适配层标志可能与服务实际配置漂移。
 
-### 未实现的候选（记录以免重复提议）
+### 已实现的候选
 
-- **StagingLedger**：见上。
+架构评审提出的三个候选现均已实现：**对象服务拆分**（Admission / NamespaceHandles / TokenStore / Multipart，见 ADR-0008）、**Composition 组合根**（`src/compose.rs`）、**StagingLedger**（`src/service/staging.rs`）。
 
 ## 进程级全局状态
 

@@ -23,6 +23,8 @@ use crate::domain::{
 use crate::driver::UploadId;
 use crate::integrity::{StreamingDigest, composite_checksum, hex};
 
+pub use super::staging::PartChecksum;
+use super::staging::{StagingLedger, StoredPart};
 use super::{ObjectService, ServiceError, next_chunk};
 
 /// Minimum size of any part except the last.
@@ -65,15 +67,6 @@ impl MultipartChecksum {
     pub fn from_algorithm(algorithm: ChecksumAlgorithm) -> Result<Self, ServiceError> {
         Self::new(algorithm, algorithm.default_multipart_type())
     }
-}
-
-/// The checksum computed for one part under the upload's scheme.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PartChecksum {
-    /// The algorithm the value was computed with.
-    pub algorithm: ChecksumAlgorithm,
-    /// The raw digest bytes (never base64).
-    pub value: Bytes,
 }
 
 /// The checksums a part upload declares for its bytes.
@@ -159,28 +152,6 @@ pub struct UploadSession {
     pub last_activity: SystemTime,
 }
 
-/// A staged part.
-#[derive(Debug, Clone)]
-pub(crate) struct StoredPart {
-    /// The part number.
-    pub number: u16,
-    /// Size in bytes.
-    pub size: u64,
-    /// Part bytes (staged).
-    pub data: Bytes,
-    /// MD5 of the part.
-    pub md5: [u8; 16],
-    /// The part checksum under the upload's scheme, when it has one.
-    pub checksum: Option<PartChecksum>,
-}
-
-impl StoredPart {
-    /// The part ETag.
-    pub(crate) fn etag(&self) -> EntityTag {
-        EntityTag::new(hex(&self.md5)).expect("md5 hex is a valid tag")
-    }
-}
-
 /// The recorded outcome of one completion attempt.
 ///
 /// This is the multipart analogue of a driver's commit record: it exists so a
@@ -214,29 +185,27 @@ pub struct SweepOutcome {
     pub skipped_pending: usize,
 }
 
-/// Multipart state: sessions, staged parts, in-flight completion claims and
-/// completion records.
-#[derive(Default)]
+/// Multipart state: sessions, in-flight completion claims and completion
+/// records, plus the staging ledger that owns the part table and its quota.
 pub(crate) struct MultipartState {
     uploads: HashMap<String, UploadSession>,
-    parts: HashMap<String, BTreeMap<u16, StoredPart>>,
     /// Uploads with a completion attempt in flight (`upload_id -> write_id`).
     claims: HashMap<String, WriteId>,
     /// Completion records by attempt id, for recovery queries.
     completions: HashMap<String, CompletionRecord>,
-    staged_bytes: u64,
-    /// Bytes of part bodies currently being received, charged to the quota
-    /// before they are buffered.
-    reserved_bytes: u64,
-    quota: u64,
+    /// The part table and its byte accounting, together, so the two cannot
+    /// drift apart.
+    staging: StagingLedger,
 }
 
 impl MultipartState {
     /// Creates state with a staging quota in bytes.
     pub(crate) fn with_quota(quota: u64) -> Self {
         Self {
-            quota,
-            ..Self::default()
+            uploads: HashMap::new(),
+            claims: HashMap::new(),
+            completions: HashMap::new(),
+            staging: StagingLedger::new(quota),
         }
     }
 }
@@ -360,8 +329,6 @@ pub struct UploadListPage {
     /// Whether more uploads follow.
     pub is_truncated: bool,
 }
-
-const MAX_PARTS_PER_UPLOAD: u16 = 10_000;
 
 /// How many completion records are retained for recovery queries.
 const COMPLETION_RECORD_LIMIT: usize = 4096;
@@ -491,9 +458,8 @@ impl ObjectService {
             // copies at once: the staged one is released in the same step that
             // stages the new bytes, so the quota is charged for the difference.
             let replaced = state
-                .parts
-                .get(upload_id)
-                .and_then(|parts| parts.get(&part_number))
+                .staging
+                .part(&session.upload_id, part_number)
                 .map_or(0, |part| part.size);
             let scheme = match (session.checksum, part_algorithm) {
                 (Some(scheme), Some(algorithm)) if scheme.algorithm != algorithm => {
@@ -619,44 +585,18 @@ impl ObjectService {
             session.last_activity = SystemTime::now();
         }
 
-        // The part count is bounded; replacing an existing part is always allowed.
-        let staged = state.parts.get(upload_id);
-        let replacing = staged.is_some_and(|parts| parts.contains_key(&part_number));
-        let staged_count = staged.map_or(0, BTreeMap::len);
-        if !replacing && staged_count >= usize::from(MAX_PARTS_PER_UPLOAD) {
-            return Err(ServiceError::InvalidArgument(format!(
-                "a multipart upload may have at most {MAX_PARTS_PER_UPLOAD} parts"
-            )));
-        }
-
-        let previous = staged
-            .and_then(|parts| parts.get(&part_number))
-            .map(|p| p.size)
-            .unwrap_or(0);
-
-        let new_total = state
-            .staged_bytes
-            .saturating_sub(previous)
-            .saturating_add(data.len() as u64);
-        if new_total > state.quota {
-            return Err(ServiceError::SlowDown);
-        }
-
-        state.staged_bytes = new_total;
-        state
-            .parts
-            .entry(upload_id.to_string())
-            .or_default()
-            .insert(
-                part_number,
-                StoredPart {
-                    number: part_number,
-                    size,
-                    data,
-                    md5: md5_digest,
-                    checksum: checksum.clone(),
-                },
-            );
+        // The ledger enforces the part-count bound and the quota, releasing the
+        // replaced part in the same step it stages the new one.
+        state.staging.stage(
+            &session.upload_id,
+            StoredPart {
+                number: part_number,
+                size,
+                data,
+                md5: md5_digest,
+                checksum: checksum.clone(),
+            },
+        )?;
 
         Ok(PartSummary {
             number: part_number,
@@ -677,21 +617,13 @@ impl ObjectService {
     /// the old part in the same step, so only the difference is charged.
     fn reserve_staging(&self, bytes: u64, credit: u64) -> Result<(), ServiceError> {
         let mut state = self.multipart();
-        let used = state
-            .staged_bytes
-            .saturating_sub(credit)
-            .saturating_add(state.reserved_bytes);
-        if used.saturating_add(bytes) > state.quota {
-            return Err(ServiceError::SlowDown);
-        }
-        state.reserved_bytes = state.reserved_bytes.saturating_add(bytes);
-        Ok(())
+        state.staging.reserve(bytes, credit)
     }
 
     /// Returns bytes previously charged by [`ObjectService::reserve_staging`].
     fn release_staging(&self, bytes: u64) {
         let mut state = self.multipart();
-        state.reserved_bytes = state.reserved_bytes.saturating_sub(bytes);
+        state.staging.release(bytes);
     }
 
     /// Lists parts of an upload.
@@ -704,9 +636,9 @@ impl ObjectService {
         limit: u32,
     ) -> Result<PartListPage, ServiceError> {
         let state = self.multipart();
-        self.require_session(&state, bucket, key, upload_id)?;
+        let session = self.require_session(&state, bucket, key, upload_id)?;
         let empty = BTreeMap::new();
-        let parts = state.parts.get(upload_id).unwrap_or(&empty);
+        let parts = state.staging.parts_of(&session.upload_id).unwrap_or(&empty);
 
         let start = marker.unwrap_or(0);
         let collected: Vec<&StoredPart> = parts.values().filter(|p| p.number > start).collect();
@@ -817,7 +749,7 @@ impl ObjectService {
             let mut state = self.multipart();
             let session = self.require_session(&state, bucket, key, upload_id)?;
             let empty = BTreeMap::new();
-            let parts = state.parts.get(upload_id).unwrap_or(&empty);
+            let parts = state.staging.parts_of(&session.upload_id).unwrap_or(&empty);
 
             if manifest.is_empty() {
                 return Err(ServiceError::MalformedXml(
@@ -1113,10 +1045,7 @@ impl ObjectService {
             upload_id,
         );
         state.claims.remove(upload_id);
-        if let Some(parts) = state.parts.remove(upload_id) {
-            let freed: u64 = parts.values().map(|p| p.size).sum();
-            state.staged_bytes = state.staged_bytes.saturating_sub(freed);
-        }
+        state.staging.take(&session.upload_id);
         state.uploads.remove(upload_id);
     }
 
@@ -1201,18 +1130,18 @@ impl ObjectService {
         let now = SystemTime::now();
         let mut outcome = SweepOutcome::default();
 
-        let expired: Vec<String> = state
+        let expired: Vec<UploadId> = state
             .uploads
             .iter()
             .filter(|(_, s)| {
                 now.duration_since(s.last_activity)
                     .is_ok_and(|age| age >= lease)
             })
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| UploadId::from_raw(id.as_str()))
             .collect();
 
         for upload_id in expired {
-            if state.claims.contains_key(&upload_id) {
+            if state.claims.contains_key(upload_id.as_str()) {
                 outcome.skipped_pending += 1;
                 continue;
             }
@@ -1220,18 +1149,14 @@ impl ObjectService {
             let unresolved = state
                 .completions
                 .values()
-                .any(|r| r.upload_id == upload_id && r.state == CommitState::Unknown);
+                .any(|r| r.upload_id == upload_id.as_str() && r.state == CommitState::Unknown);
             if unresolved {
                 outcome.skipped_pending += 1;
                 continue;
             }
-            if let Some(parts) = state.parts.remove(&upload_id) {
-                let freed: u64 = parts.values().map(|p| p.size).sum();
-                state.staged_bytes = state.staged_bytes.saturating_sub(freed);
-                outcome.reclaimed_bytes += freed;
-            }
-            state.uploads.remove(&upload_id);
-            state.claims.remove(&upload_id);
+            outcome.reclaimed_bytes += state.staging.take(&upload_id);
+            state.uploads.remove(upload_id.as_str());
+            state.claims.remove(upload_id.as_str());
             outcome.reclaimed_uploads += 1;
         }
 
@@ -1246,17 +1171,14 @@ impl ObjectService {
         upload_id: &str,
     ) -> Result<(), ServiceError> {
         let mut state = self.multipart();
-        self.require_session(&state, bucket, key, upload_id)?;
+        let session = self.require_session(&state, bucket, key, upload_id)?;
         // A completion that already claimed this upload wins the race.
         if state.claims.contains_key(upload_id) {
             return Err(ServiceError::InvalidArgument(
                 "this multipart upload is being completed".into(),
             ));
         }
-        if let Some(parts) = state.parts.remove(upload_id) {
-            let freed: u64 = parts.values().map(|p| p.size).sum();
-            state.staged_bytes = state.staged_bytes.saturating_sub(freed);
-        }
+        state.staging.take(&session.upload_id);
         state.uploads.remove(upload_id);
         Ok(())
     }
@@ -1299,7 +1221,7 @@ impl ObjectService {
     /// Whether multipart state holds no sessions (used by tests).
     pub fn multipart_is_idle(&self) -> bool {
         let state = self.multipart();
-        state.uploads.is_empty() && state.staged_bytes == 0 && state.reserved_bytes == 0
+        state.uploads.is_empty() && state.staging.is_idle()
     }
 
     /// Reclaims expired multipart staging on a fixed interval until `shutdown`
