@@ -22,7 +22,9 @@ use crate::auth::{AccessPolicy, CredentialStore};
 use crate::catalog::BucketCatalog;
 use crate::config::{AppConfig, Limits};
 use crate::domain::{DriverContext, DriverInstanceId, RequestId};
-use crate::driver::{DriverFactory, DriverKind, DriverRegistry, SecretResolver, StorageDriver};
+#[cfg(feature = "testing")]
+use crate::driver::DriverFactory;
+use crate::driver::{DriverKind, DriverRegistry, SecretResolver, StorageDriver};
 use crate::protocol::s3::{PrincipalLimiter, S3Handler, S3Service, adapter_config, build_service};
 use crate::service::{ObjectService, ServiceError};
 
@@ -34,34 +36,50 @@ fn startup_ctx() -> DriverContext {
 }
 
 /// Registers the driver kinds this build supports.
+///
+/// The kinds a build can construct are data ([`crate::driver::builtins`]), not a
+/// `match` arm per kind: this function only looks each configured kind up in
+/// that table, so adding a driver never touches the composition root and no
+/// build carries an arm it cannot reach.
 pub fn build_registry(config: &AppConfig) -> Result<DriverRegistry, String> {
-    let mut registry = DriverRegistry::new();
-    let kinds: Vec<String> = {
-        let mut kinds: Vec<String> = config.drivers.iter().map(|d| d.kind.clone()).collect();
-        kinds.sort();
+    let builtins = crate::driver::builtins::builtins();
+    let kinds: Vec<&str> = {
+        let mut kinds: Vec<&str> = config.drivers.iter().map(|d| d.kind.as_str()).collect();
+        kinds.sort_unstable();
         kinds.dedup();
         kinds
     };
 
+    let mut registry = DriverRegistry::new();
     for kind in kinds {
-        let factory: Arc<dyn DriverFactory> = match kind.as_str() {
-            #[cfg(feature = "testing")]
-            "test-reference" => Arc::new(crate::testing::reference::ReferenceDriverFactory::new(
-                kind.clone(),
-            )),
-            #[cfg(feature = "testing")]
-            "test-vec" => Arc::new(crate::testing::second::VecDriverFactory::new(kind.clone())),
-            other => {
-                return Err(format!(
-                    "driver kind `{other}` is not registered in this build"
-                ));
-            }
-        };
+        let builtin = builtins
+            .iter()
+            .find(|builtin| builtin.name == kind)
+            .ok_or_else(|| unregistered_kind(kind))?;
         registry
-            .register(factory)
+            .register((builtin.ctor)(kind))
             .map_err(|e| format!("failed to register driver kind `{kind}`: {e}"))?;
     }
     Ok(registry)
+}
+
+/// The error for a kind no registered factory can construct.
+///
+/// It names the kinds the build *does* have, so the common cause — a test kind
+/// in a build without the `testing` feature — is visible without reading the
+/// source.
+fn unregistered_kind(kind: &str) -> String {
+    let available = crate::driver::builtins::registered_kinds();
+    if available.is_empty() {
+        format!(
+            "driver kind `{kind}` is not registered in this build (this build registers no driver kinds)"
+        )
+    } else {
+        format!(
+            "driver kind `{kind}` is not registered in this build (available: {})",
+            available.join(", ")
+        )
+    }
 }
 
 /// Creates every driver instance the config names, keyed by instance id.
@@ -99,6 +117,7 @@ pub async fn instances_from_config(
 /// factory in its own registry, because tests legitimately hand in two
 /// factories of the same kind (two instances of one backend) — something a
 /// single registry rejects as a duplicate kind.
+#[cfg(feature = "testing")]
 pub async fn instance_from_factory(
     factory: Arc<dyn DriverFactory>,
     id: &str,

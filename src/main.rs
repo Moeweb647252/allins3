@@ -37,9 +37,15 @@ async fn main() {
         }
     };
 
-    // `check-config` proves the file parses and every bucket binds to a
-    // namespace a driver supports, without opening a listener.
+    // `check-config` proves the file parses, every bucket binds to a namespace
+    // a driver supports, and every kind is one this build registers — without
+    // opening a listener. The kind check is part of the preflight so a config
+    // that can never start fails here, not at `run`.
     if check_only {
+        if let Err(e) = allins3::server::preflight(&config) {
+            eprintln!("allins3: configuration error: {e}");
+            std::process::exit(2);
+        }
         eprintln!("allins3: config ok ({})", config.redacted_summary());
         return;
     }

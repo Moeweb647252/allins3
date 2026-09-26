@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to the dated nightly recorded in ADR-0005, not a floating
+      # `stable`: the toolchain a green run proves is then the toolchain a
+      # contributor is asked to reproduce. Bumping it is an ADR-0005 change.
+      - uses: dtolnay/rust-toolchain@nightly-2026-09-15
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # One entry point, so CI and a contributor run the same commands: fmt,
+      # clippy for both feature sets, tests for both feature sets, and the
+      # protocol spike.
+      - run: bash scripts/check.sh

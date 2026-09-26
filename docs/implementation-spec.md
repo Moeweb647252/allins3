@@ -463,7 +463,7 @@ prefix = ""
 
 `example-b` 未配置授权，默认拒绝。样例不携带真实凭据；生产模式必须拒绝测试 driver/易失状态用于持久写入。
 
-配置还须覆盖每实例 options/secret_refs、每 bucket 扩展、body/metadata/XML 上限、超时、并发、缓冲、暂存配额、日志与指标。未知公共字段、重复 ID、无注册 kind、缺失 secret、无效 bucket 名称、能力不匹配均在启动前失败。配置输出必须脱敏。
+配置还须覆盖每实例 options/secret_refs、每 bucket 扩展、body/metadata/XML 上限、超时、并发、缓冲、暂存配额、日志与指标。未知公共字段、重复 ID、无注册 kind、缺失 secret、无效 bucket 名称、能力不匹配均在启动前失败；`check-config` 以 `server::preflight` 执行同一套启动前校验（含 kind 是否被本构建注册），不打开监听即可失败。配置输出必须脱敏。
 
 ### 7.2 生命周期
 
@@ -595,6 +595,10 @@ tests/
 测试 driver 放在测试支持模块或显式 development feature 中。后续生产 driver 可以独立 crate，但不得要求核心层反向依赖其 SDK 类型。
 
 公共接口变更必须更新规范、契约测试与所有实现。持久化记录、token、binding 和配置均有 schema/version；不兼容数据必须拒绝启动或执行可验证迁移，不能静默按新格式解释。
+
+驱动注册是数据，不是组合根里的 `match`：一个构建能构造哪些 `kind` 由 `driver::builtins` 的表声明，该表同时标记哪些是测试 driver。组合根只查表；配置校验以表的标记判定测试 driver（不再靠 `test-` 名字前缀）；`server::preflight` 让 `check-config` 对未注册 `kind` 在启动前失败。新增一个 driver 即新增一条表项，不改组合根，也不因 feature 组合产生死代码。
+
+面向嵌入者与测试的公共入口保持最小：生产为 `server::run`（前置校验为 `server::preflight`），测试为 `testing::fixture::service` 与 `testing::protocol::ProtocolHarness`（后者提供 `new` 与 `new_native_multipart` 两种 harness），契约 harness 为 `testing::contract::run_contract`。`ReferenceDriverFactory` 提供 `new`、`with_capabilities` 与 `native_multipart` 三种构造，分别对应仅内存、自定义能力与内置 `test-native`。
 
 编码约束：
 

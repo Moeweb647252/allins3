@@ -15,6 +15,24 @@
 | `MultipartNamespace`（可选） | `src/driver/extensions.rs` | 后端原生 multipart；声明 `multipart = true` 就会被服务层路由到这里（ADR-0010），不声明则由协调器用 staged write 补齐 |
 | `DriverFactory` + `SecretResolver` | `src/driver/factory.rs` | 注册 kind、解析 `env:NAME` 之类引用；secret 值不得进入日志或错误消息 |
 
+## 1.5 注册 kind（不改组合根）
+
+本构建可构造的 kind 是一张数据表，不是组合根里的 `match`：在 `src/driver/builtins.rs` 的 `builtins()` 里加一条 `Builtin` 条目即可。`compose::build_registry` 只按配置里的 kind 查表，未知 kind 的报错会列出本构建可用的 kind；`check-config` 也会在启动前拒绝未注册的 kind。
+
+```rust
+// src/driver/builtins.rs
+#[cfg(feature = "my-backend")]
+table.push(Builtin {
+    name: "my-backend",
+    test: false,
+    ctor: |kind| Arc::new(my_backend::MyBackendFactory::new(kind)),
+});
+```
+
+- 构造函数收到配置里的 kind 字符串，不要在同一处再硬写一遍。
+- 若 driver 在独立 feature 下，用 `#[cfg(feature = "...")]` 包住表项；表为空时默认构建仍然干净（ADR-0011）。
+- `test` 标记（不是名字前缀）决定配置校验是否把它当作测试 driver：`test: true` 的 kind 只在 `development = true` 下放行，因此真实后端把 `test` 写 `false` 即可，即便名字碰巧以 `test-` 开头也不会被误判。
+
 ## 2. 能力声明必须与句柄一致
 
 `NamespaceCapabilities` 中的每个能力都必须与实际提供的句柄一致。`NamespaceHandle::is_self_consistent()` 在契约测试里检查，**服务层打开 namespace 时也会检查**——不一致的驱动在启动/打开时即失败，而不是被路由静默降级：
@@ -25,7 +43,7 @@
 
 档位（bucket 配置的 `profile`）在启动时校验并在 `warmup` 阶段对每个 namespace 实际打开一次：能力不足会让服务器启动失败，而不是运行时降级。
 
-生产模式（`development = false`）下这条线更严：任何非 `CoreRead` 的 bucket 在打开 namespace 时都必须通过 `is_production_write_capable()`，否则服务器启动失败并给出具体缺失项。测试 driver 的 kind 前缀 `test-` 只能在 `development = true` 下注册（`config` 校验），而 `is_production_write_capable()` 覆盖真实 driver 声明易失存储或非排他写入的情况。
+生产模式（`development = false`）下这条线更严：任何非 `CoreRead` 的 bucket 在打开 namespace 时都必须通过 `is_production_write_capable()`，否则服务器启动失败并给出具体缺失项。标记为 `test: true` 的 kind 只能在 `development = true` 下通过配置校验（`config` 校验），而 `is_production_write_capable()` 覆盖真实 driver 声明易失存储或非排他写入的情况。
 
 打开 namespace 时服务层还会用 `features_for_profile(profile)` 调用 `plan()` 并把结果缓存下来，之后的路由（原生 copy、原生 multipart、补齐）只读这份规划。因此**声明即路由**：声明了 `multipart = true` 就必须真的能用原生 multipart 完成一次上传（契约 harness 的 `multipart_native_semantics` 会验证），否则应在声明里写 `false` 并让服务层协调器兜底。
 
@@ -62,6 +80,8 @@ cargo test --all-features
 cargo run --features <你的 feature> -- examples/your-config.toml
 python3 scripts/e2e_boto3.py
 ```
+
+`scripts/e2e_cli.sh` / `e2e_drain.sh` / `e2e_timeouts.py` 会自建服务器；未用 `ALLINS3_BIN` 指定二进制时它们先 `cargo build --features testing`，因此不要用默认构建的二进制去跑它们（测试 driver 只在 `testing` 下注册）。声明了 `multipart = true` 的后端可参照 `examples/dev-config.toml` 里的 `test-native`（`example-c`）。
 
 契约 harness 会验证：CRUD、暂存不可见、原子发布与 abort、revision 稳定读、元数据更新产生新 revision、有序分页、delimiter 折叠、条件写、namespace 隔离、提交恢复四态，以及**原生复制与流式补齐的等价性**（`copy_native_matches_emulation`）。能力不足的检查会被跳过并在报告中列出原因，不会静默通过。
 

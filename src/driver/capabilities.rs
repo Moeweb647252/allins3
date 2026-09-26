@@ -185,6 +185,24 @@ impl std::fmt::Display for PlannedFeature {
 }
 
 impl PlannedFeature {
+    /// Every feature, in declaration order. A [`CapabilityPlan`] stores one
+    /// entry per feature, indexed by [`PlannedFeature::index`], so this fixes
+    /// the slot count and the order those slots are laid out in.
+    pub const ALL: [PlannedFeature; 7] = [
+        Self::Read,
+        Self::List,
+        Self::Write,
+        Self::Range,
+        Self::Conditional,
+        Self::Copy,
+        Self::Multipart,
+    ];
+
+    /// The slot this feature occupies in a plan.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
     /// A stable label.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -211,31 +229,27 @@ pub enum FeatureSupport {
 }
 
 /// The resolved plan for a set of features.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// A plan has one slot per [`PlannedFeature`], so `support` is a direct index
+/// rather than a scan, and an unplanned feature reads as `Unsupported` without
+/// a separate lookup failure mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityPlan {
-    entries: Vec<(PlannedFeature, FeatureSupport)>,
+    entries: [FeatureSupport; PlannedFeature::ALL.len()],
+}
+
+impl Default for CapabilityPlan {
+    fn default() -> Self {
+        Self {
+            entries: [FeatureSupport::Unsupported; PlannedFeature::ALL.len()],
+        }
+    }
 }
 
 impl CapabilityPlan {
     /// The support level for a feature.
     pub fn support(&self, feature: PlannedFeature) -> FeatureSupport {
-        self.entries
-            .iter()
-            .find(|(f, _)| *f == feature)
-            .map(|(_, s)| *s)
-            .unwrap_or(FeatureSupport::Unsupported)
-    }
-
-    /// Whether every planned feature is provided.
-    pub fn all_provided(&self) -> bool {
-        self.entries
-            .iter()
-            .all(|(_, s)| *s != FeatureSupport::Unsupported)
-    }
-
-    /// Iterates over the plan entries.
-    pub fn iter(&self) -> impl Iterator<Item = (PlannedFeature, FeatureSupport)> + '_ {
-        self.entries.iter().copied()
+        self.entries[feature.index()]
     }
 }
 
@@ -319,15 +333,15 @@ pub fn plan(
     requested: &[PlannedFeature],
     caps: &NamespaceCapabilities,
 ) -> Result<CapabilityPlan, CapabilityError> {
-    let mut entries = Vec::with_capacity(requested.len());
+    let mut plan = CapabilityPlan::default();
     for &feature in requested {
         let support = support_for(feature, caps);
         if support == FeatureSupport::Unsupported {
             return Err(CapabilityError::Unsupported { feature });
         }
-        entries.push((feature, support));
+        plan.entries[feature.index()] = support;
     }
-    Ok(CapabilityPlan { entries })
+    Ok(plan)
 }
 
 /// The support level for a single feature.

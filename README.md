@@ -34,18 +34,24 @@ ALLINS3_BENCH_FULL=1 cargo test --release --all-features --test resource_budget 
 ## 当前能力
 
 - `src/domain/`：强类型 ID、`ObjectKey`（key 字节原样保留）、`ObjectMetadata`/`ObjectRevision`、checksum、`DriverError`（含 `CommitState` 四态）、`DriverContext`（超时与取消）、`ResolvedRange`、列举请求/游标。
-- `src/driver/`：`StorageDriver`、`ReadNamespace`、`WriteNamespace`、`StagedWrite`、`NativeCopy`、`MultipartNamespace`、`CommitRecovery`、工厂/注册表、能力与限制模型及 Native/Emulated/Unsupported 规划。
+- `src/driver/`：`StorageDriver`、`ReadNamespace`、`WriteNamespace`、`StagedWrite`、`NativeCopy`、`MultipartNamespace`、`CommitRecovery`、工厂/注册表、能力与限制模型及 Native/Emulated/Unsupported 规划；本构建可构造的 kind 由 `driver/builtins.rs` 的数据表声明，组合根只查表（新增 driver 不改组合根，见 ADR-0011）。
 - `src/config/` + `src/catalog.rs`：TOML 配置校验、secret 引用、bucket→namespace 不可变绑定、全局与每 principal、每 driver 并发限制、暂存配额。
-- `src/service/`：GET/HEAD/PUT/DELETE/LIST/COPY、条件与 Range 的 `stat → 条件 → 区间 → 携带 revision 读取` 流程、原子发布、列举 token 的作用域绑定；multipart 两条路径共用同一套语义（固定清单与 scheme、单次发布、竞争仲裁、完成记录、过期暂存回收）—— 原生 namespace 由驱动持有 part 与完成，其余由通用协调器在 staged write 上补齐。路由由 namespace 打开时物化的能力规划决定（`copy_route` / `native_multipart`，见 ADR-0010）。
-- `src/protocol/s3/`：基于 `s3s` 的 path-style HTTP/S3 适配、SigV4（header 与预签名 query）、默认拒绝的授权、请求 ID、错误映射、每 principal 准入控制。
+- `src/service/`：GET/HEAD/PUT/DELETE/LIST/COPY、条件与 Range 的 `stat → 条件 → 区间 → 携带 revision 读取` 流程、原子发布、列举 token 的作用域绑定；multipart 两条路径共用同一套语义（固定清单与 scheme、单次发布、竞争仲裁、完成记录、过期暂存回收）—— 原生 namespace 由驱动持有 part 与完成，其余由通用协调器在 staged write 上补齐；两条路径共用的 marker 解析、scheme 定案与清单校验在 `service/multipart/rules.rs`。路由由 namespace 打开时物化的能力规划决定（`copy_route` / `native_multipart`，见 ADR-0010）。
+- `src/protocol/s3/`：基于 `s3s` 的 path-style HTTP/S3 适配、SigV4（header 与预签名 query）、默认拒绝的授权、请求 ID、错误映射、每 principal 准入控制。`mod.rs` 是 handler 与操作实现，字节流桥接（`body.rs`）、校验和头（`checksum.rs`）与 DTO 转换（`convert.rs`）各自独立成模块。
 - `src/server.rs`：启动顺序（配置 → driver → namespace 能力校验 → readiness）、优雅退出（排空后逐个 `StorageDriver::shutdown`）、健康与指标端点（`/readyz` 汇总每 driver 实例健康）。
-- `src/testing/`（`testing` feature）：内存参考 driver、排序向量独立 driver、故障注入包装器、计数 sink（度量写入而不物化数据）、可复用契约 harness、服务级 fixture、进程内协议 harness（构建二进制同款 `S3Service`，由性质测试与三个模糊测试目标共用）。
+- `src/testing/`（`testing` feature）：内存参考 driver（`test-reference`，协调器 multipart）、排序向量独立 driver（`test-vec`）、声明原生 multipart 的参考 driver（`test-native`）、故障注入包装器、计数 sink（度量写入而不物化数据）、可复用契约 harness、服务级 fixture、进程内协议 harness（构建二进制同款 `S3Service`，可由性质测试、协议用例与三个模糊测试目标共用，并含原生 multipart 变体）。
 
 ## 构建与检查
 
 ```bash
+# 一个入口，同时检查默认与 testing 两种 feature 组合（CI 也调用它）
+scripts/check.sh
+
+# 等价的手工命令
 cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
+cargo test
 cargo test --all-features
 
 # P0 协议适配 spike（独立 workspace，不影响主 crate 依赖图）
@@ -63,4 +69,4 @@ scripts/fuzz.sh
 - multipart 暂存由后台租约清理器回收（`multipart_lease_secs`，默认 3600 秒无 part 活动；`multipart_sweep_interval_secs = 0` 可禁用），在途完成、结果未知以及仍在收 part 的上传不会被误清。
 - `aws-chunked` 请求体、checksum trailer 与签名分块（`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`）已由运行中的服务器验证（含 trailer 值不匹配、声明未送达、算法与 upload scheme 不符、单块或 trailer 签名被改，`PutObject` 与 `UploadPart` 两条入口）；CLI 与 botocore 1.42 对 HTTP endpoint 不发出这些形式，因此该路径只有手工构造请求的证据。
 - 主要兼容证据：boto3/botocore 1.42.97（`scripts/e2e_boto3.py` 67/67）、AWS CLI 1.44.87（`scripts/e2e_cli.sh` 29/29）、手工 `aws-chunked` 请求（`scripts/e2e_streaming_trailer.py` 34/34，含签名分块与 trailer 签名被改的拒绝）、请求边界（`scripts/e2e_timeouts.py` 21/21）、内存预算基准（`tests/resource_budget.rs`）。
-- 内置 driver 均为内存实现，重启数据丢失；生产准入见 [driver 接入指南](docs/driver-guide.md)。
+- 内置 driver 均为内存实现，重启数据丢失；生产准入见 [driver 接入指南](docs/driver-guide.md)。示例配置含三个内存 driver（`test-reference`、`test-vec`、`test-native`），其中 `test-native`（bucket `example-c`）声明原生 multipart，`test-reference` / `test-vec` 由服务层协调器补齐 multipart。

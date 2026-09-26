@@ -147,6 +147,31 @@ async fn a_namespace_that_declares_native_multipart_must_provide_it() {
 }
 
 #[tokio::test]
+async fn the_native_multipart_factory_declares_and_provides_native_multipart() {
+    // The built-in `test-native` kind is exactly this constructor, so it is the
+    // constructor the contract suite must prove: it declares native multipart
+    // and then satisfies the native multipart checks, not merely the emulated
+    // route.
+    let (driver, _) = build(
+        Arc::new(ReferenceDriverFactory::native_multipart("reference-native")),
+        "ref-native-factory",
+    )
+    .await;
+
+    let report = run_for(driver.as_ref()).await;
+    assert!(
+        report.passed.contains(&"multipart_native_semantics"),
+        "the native multipart factory must declare native multipart: {report:?}"
+    );
+    for check in ["crud", "ordering_and_pagination", "namespace_isolation"] {
+        assert!(
+            report.passed.contains(&check),
+            "expected `{check}` to pass, got {report:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn vec_driver_routes_copy_to_emulation() {
     let (driver, _) = build(Arc::new(VecDriverFactory::new("vec")), "vec-cap").await;
     let handle = driver

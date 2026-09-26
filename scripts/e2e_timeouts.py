@@ -61,6 +61,22 @@ PASS = 0
 FAIL = 0
 
 
+def ensure_testing_binary():
+    """Builds the binary with the `testing` feature unless one was supplied.
+
+    The in-memory test drivers are compiled in only under `testing`. A stale
+    default-feature binary still starts and then exits with
+    "driver kind `test-*` is not registered in this build", which surfaces here
+    as an unexplained "server never became ready"; building the right binary up
+    front makes that dependency explicit.
+    """
+    if os.environ.get("ALLINS3_BIN"):
+        return
+    subprocess.run(
+        ["cargo", "build", "--features", "testing", "--quiet"], cwd=ROOT, check=True
+    )
+
+
 def check(name, ok, detail=""):
     global PASS, FAIL
     if ok:
@@ -98,6 +114,14 @@ class Server:
             [BIN, self.path], cwd=ROOT, env=env, stdout=self.log, stderr=self.log
         )
         self.ready = self._wait_ready()
+        if not self.ready:
+            # The reason a server did not become ready (an unregistered driver
+            # kind, a bind failure) is in its log, which the per-case check
+            # cannot show; print it while the failure is still fresh.
+            print("[info] %s did not become ready; log tail:" % self.label, file=sys.stderr)
+            with open(self.log_path) as handle:
+                for line in handle.read().splitlines()[-20:]:
+                    print("    %s" % line, file=sys.stderr)
 
     def _wait_ready(self):
         for _ in range(60):
@@ -347,6 +371,7 @@ def total_deadline_case():
 
 
 def main():
+    ensure_testing_binary()
     print("allins3 request bounds (spec §9.3) against the running binary")
     print("endpoint: %s\n" % ENDPOINT)
     header_case()

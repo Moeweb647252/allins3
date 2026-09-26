@@ -50,6 +50,14 @@ if [ "$PORT" != "9000" ]; then
   sed "s|^listen = .*|listen = \"127.0.0.1:$PORT\"|" "$ROOT/examples/dev-config.toml" >"$CONFIG"
 fi
 
+# The test drivers are compiled in only under the `testing` feature. Build the
+# binary this script will run (unless the caller supplied one), so a stale
+# default-feature build fails here with cargo's message rather than as a server
+# that starts and immediately exits with an unregistered driver kind.
+if [ -z "${ALLINS3_BIN:-}" ]; then
+  cargo build --features testing --quiet || exit 2
+fi
+
 PASS=0
 FAIL=0
 SERVER_PID=""
@@ -150,7 +158,8 @@ drain_case() { # label signal size chunk pause secs-before-signal expect-deadlin
 
   if ! start_server "$log"; then
     FAIL=$((FAIL + 1))
-    printf '[FAIL] %s: server never became ready\n' "$label"
+    printf '[FAIL] %s: server never became ready; last log lines:\n' "$label"
+    tail -n 20 "$log" | sed 's/^/    /'
     return
   fi
 

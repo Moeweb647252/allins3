@@ -468,10 +468,13 @@ impl AppConfig {
             });
         }
 
-        // Development guard: persistent writes with volatile test drivers.
+        // Development guard: durable writes must not be backed by a volatile
+        // test driver. Which kinds are test drivers is registry data
+        // (`driver::builtins`), not a name convention, so this guard cannot
+        // drift from what is registered.
         if !raw.server.development {
             for driver in &raw.drivers {
-                if driver.kind.starts_with("test-") {
+                if crate::driver::builtins::is_test_kind(&driver.kind) {
                     return Err(ConfigError::TestDriverInProduction(driver.id.clone()));
                 }
             }
@@ -902,6 +905,9 @@ prefix = ""
         ));
     }
 
+    // Test kinds are only registered under the `testing` feature, so this guard
+    // can only be exercised where those kinds exist.
+    #[cfg(feature = "testing")]
     #[test]
     fn rejects_test_driver_in_production() {
         let toml = base_toml().replace("development = true", "development = false");

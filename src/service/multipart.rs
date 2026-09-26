@@ -35,9 +35,17 @@ use crate::driver::{
 };
 use crate::integrity::{StreamingDigest, composite_checksum, hex};
 
+use super::handles::Namespace;
 pub use super::staging::PartChecksum;
 use super::staging::{StagingLedger, StoredPart};
 use super::{ObjectService, ServiceError, next_chunk};
+
+mod rules;
+
+use rules::{
+    finish_part_checksum, part_checksum, resolve_completion_scheme, upload_marker,
+    validate_manifest,
+};
 
 /// Minimum size of any part except the last.
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
@@ -175,6 +183,9 @@ pub struct UploadSession {
 enum UploadRoute {
     /// The driver owns the session, its parts and the completion.
     Native {
+        /// The open namespace, for the read/recovery handles the native
+        /// completion needs when it reconciles a lost reply.
+        namespace: Arc<Namespace>,
         multipart: Arc<dyn MultipartNamespace>,
         upload: UploadHandle,
     },
@@ -369,6 +380,11 @@ impl ObjectService {
     }
 
     /// Resolves where an existing upload's parts and completion live.
+    ///
+    /// This is the single place the "a native upload's namespace no longer
+    /// offers native multipart" condition is turned into an error: every
+    /// operation on an existing upload routes through here, so none of them can
+    /// re-derive the rule differently.
     async fn upload_route(
         &self,
         binding: &crate::catalog::BucketBinding,
@@ -386,7 +402,11 @@ impl ObjectService {
                 binding.bucket
             ))
         })?;
-        Ok(UploadRoute::Native { multipart, upload })
+        Ok(UploadRoute::Native {
+            namespace,
+            multipart,
+            upload,
+        })
     }
 
     /// Creates a multipart upload without touching any existing object.
@@ -435,7 +455,7 @@ impl ObjectService {
             .map(|upload| upload.upload_id.clone())
             .unwrap_or_else(UploadId::generate);
         let session = UploadSession {
-            upload_id: upload_id.clone(),
+            upload_id,
             bucket: bucket.to_string(),
             key: key.clone(),
             principal: principal.map(str::to_string),
@@ -450,7 +470,7 @@ impl ObjectService {
         let mut state = self.multipart();
         state
             .uploads
-            .insert(upload_id.as_str().to_string(), session.clone());
+            .insert(session.upload_id.as_str().to_string(), session.clone());
         Ok(session)
     }
 
@@ -534,7 +554,9 @@ impl ObjectService {
             self.require_session(&state, bucket, key, upload_id)?
         };
         match self.upload_route(binding, ctx, &session).await? {
-            UploadRoute::Native { multipart, upload } => {
+            UploadRoute::Native {
+                multipart, upload, ..
+            } => {
                 self.upload_part_native(
                     ctx,
                     &session,
@@ -913,7 +935,9 @@ impl ObjectService {
             self.require_session(&state, bucket, key, upload_id)?
         };
         match self.upload_route(&binding, ctx, &session).await? {
-            UploadRoute::Native { multipart, upload } => {
+            UploadRoute::Native {
+                multipart, upload, ..
+            } => {
                 // `part-number-marker=0` is the client asking for the first
                 // page, which is how the coordinator reads it. Part numbers
                 // start at 1, so 0 is not a part to parse and reject.
@@ -1173,14 +1197,20 @@ impl ObjectService {
             let state = self.multipart();
             self.require_session(&state, bucket, key, upload_id)?
         };
-        if let Some(upload) = session.native.clone() {
+        if let UploadRoute::Native {
+            namespace,
+            multipart,
+            upload,
+        } = self.upload_route(&binding, ctx, &session).await?
+        {
             return self
                 .complete_multipart_native(
                     ctx,
-                    &binding,
                     key,
                     upload_id,
                     &session,
+                    &namespace,
+                    &multipart,
                     &upload,
                     &manifest,
                     declared,
@@ -1410,22 +1440,16 @@ impl ObjectService {
     async fn complete_multipart_native(
         &self,
         ctx: &DriverContext,
-        binding: &crate::catalog::BucketBinding,
         key: &ObjectKey,
         upload_id: &str,
         session: &UploadSession,
+        namespace: &Arc<Namespace>,
+        multipart: &Arc<dyn MultipartNamespace>,
         upload: &UploadHandle,
         manifest: &[CompletionPart],
         declared: Option<DeclaredCompletionChecksum>,
         preconditions: Preconditions,
     ) -> Result<ObjectMetadata, ServiceError> {
-        let namespace = self.inner.handles.get(binding, ctx).await?;
-        let multipart = namespace.native_multipart().cloned().ok_or_else(|| {
-            ServiceError::Internal(
-                "the upload's namespace no longer offers native multipart".into(),
-            )
-        })?;
-
         let scheme = resolve_completion_scheme(session.checksum, &declared)?;
 
         // What can be assembled is what the driver reports, so the manifest is
@@ -1781,13 +1805,10 @@ impl ObjectService {
             ));
         }
 
-        if let Some(upload) = session.native.clone() {
-            let namespace = self.inner.handles.get(&binding, ctx).await?;
-            let multipart = namespace.native_multipart().cloned().ok_or_else(|| {
-                ServiceError::Internal(
-                    "the upload's namespace no longer offers native multipart".into(),
-                )
-            })?;
+        if let UploadRoute::Native {
+            multipart, upload, ..
+        } = self.upload_route(&binding, ctx, &session).await?
+        {
             multipart
                 .abort(ctx, &upload)
                 .await
@@ -1842,6 +1863,20 @@ impl ObjectService {
         state.uploads.is_empty() && state.staging.is_idle()
     }
 
+    /// Whether an in-progress upload was created on the native route.
+    ///
+    /// The route is recorded on the session when the upload is created and is
+    /// never re-derived, so this is the decision a later operation follows.
+    /// `None` means the upload is not held here (completed, aborted or unknown),
+    /// which is not the same as "coordinated".
+    pub fn upload_is_native(&self, upload_id: &str) -> Option<bool> {
+        let state = self.multipart();
+        state
+            .uploads
+            .get(upload_id)
+            .map(|session| session.native.is_some())
+    }
+
     /// Reclaims expired multipart staging on a fixed interval until `shutdown`
     /// resolves.
     ///
@@ -1879,281 +1914,4 @@ impl ObjectService {
             }
         }
     }
-}
-
-/// The `(key, upload id)` a `ListMultipartUploads` page continues from.
-///
-/// S3 defines the marker as a pair: the upload-id marker only means anything
-/// together with its key marker, and an empty value means "from the start".
-/// The service resolves that rule once, here, so the coordinated and native
-/// routes cannot disagree about what a partial or empty marker selects.
-fn upload_marker(
-    key_marker: Option<&str>,
-    upload_id_marker: Option<&str>,
-) -> Result<Option<(ObjectKey, UploadId)>, ServiceError> {
-    let (Some(key), Some(upload_id)) = (key_marker, upload_id_marker) else {
-        return Ok(None);
-    };
-    if key.is_empty() || upload_id.is_empty() {
-        return Ok(None);
-    }
-    let key = ObjectKey::parse(key).map_err(|e| ServiceError::InvalidArgument(e.to_string()))?;
-    Ok(Some((key, UploadId::from_raw(upload_id))))
-}
-
-/// Resolves the checksum scheme a completion publishes under.
-///
-/// The upload's own scheme, unless the upload was created without one and the
-/// completion request names an algorithm. A declaration can constrain the
-/// upload's scheme — its algorithm and coverage must agree — but never change
-/// it, and a coverage alone cannot supply an algorithm. Both routes resolve it
-/// here, so they accept and reject the same declarations.
-fn resolve_completion_scheme(
-    upload: Option<MultipartChecksum>,
-    declared: &Option<DeclaredCompletionChecksum>,
-) -> Result<Option<MultipartChecksum>, ServiceError> {
-    match (upload, declared) {
-        (Some(scheme), Some(declared)) => {
-            if let Some(algorithm) = declared.algorithm
-                && algorithm != scheme.algorithm
-            {
-                return Err(ServiceError::InvalidRequest(format!(
-                    "the completion checksum algorithm `{}` does not match the upload's `{}`",
-                    algorithm.as_str(),
-                    scheme.algorithm.as_str()
-                )));
-            }
-            if let Some(declared_type) = declared.checksum_type
-                && declared_type != scheme.checksum_type
-            {
-                return Err(ServiceError::InvalidRequest(format!(
-                    "the completion checksum type `{}` does not match the upload's `{}`",
-                    declared_type.as_str(),
-                    scheme.checksum_type.as_str()
-                )));
-            }
-            Ok(Some(scheme))
-        }
-        (Some(scheme), None) => Ok(Some(scheme)),
-        (None, Some(declared)) => {
-            let Some(algorithm) = declared.algorithm else {
-                return Err(ServiceError::InvalidRequest(
-                    "a completion checksum type requires a checksum algorithm".into(),
-                ));
-            };
-            Ok(Some(MultipartChecksum::new(
-                algorithm,
-                declared
-                    .checksum_type
-                    .unwrap_or_else(|| algorithm.default_multipart_type()),
-            )?))
-        }
-        (None, None) => Ok(None),
-    }
-}
-
-/// Finalises a part's digest under `scheme` and verifies any value the client
-/// declared for it.
-///
-/// A value declared in a header, or in a trailer that only became readable once
-/// the body was consumed, must match the bytes received; a part is never staged
-/// when it does not. A trailer the client declared but never sent is a mismatch
-/// too. When a request carries both, the trailer is the declaration that was
-/// verified: it is the one the body framing carries, and the header value only
-/// selected the algorithm. Both routes share this so a part cannot be verified
-/// one way natively and another through the coordinator.
-fn finish_part_checksum(
-    digest: Option<StreamingDigest>,
-    scheme: Option<MultipartChecksum>,
-    checksums: &PartChecksums,
-) -> Result<Option<PartChecksum>, ServiceError> {
-    let (Some(hasher), Some(scheme)) = (digest, scheme) else {
-        return Ok(None);
-    };
-    let value = hasher.finalize();
-    let declared = match &checksums.trailer {
-        None => checksums.declared.clone(),
-        Some(trailer) => match trailer.value() {
-            Some(value) => Some((scheme.algorithm, value)),
-            None => {
-                return Err(ServiceError::BadDigest(
-                    "the checksum you declared in a trailer was not sent".into(),
-                ));
-            }
-        },
-    };
-    if let Some((_, expected)) = &declared
-        && value.as_ref() != expected.as_slice()
-    {
-        return Err(ServiceError::BadDigest(
-            "the checksum you specified did not match what we received".into(),
-        ));
-    }
-    Ok(Some(PartChecksum {
-        algorithm: scheme.algorithm,
-        value,
-    }))
-}
-
-/// The checksum of one stored part for `algorithm`: the digest computed when
-/// the part was uploaded, or a freshly computed one for a part that predates the
-/// upload's scheme (or was replaced under a different one).
-fn part_checksum(part: &StoredPart, algorithm: ChecksumAlgorithm) -> Bytes {
-    match &part.checksum {
-        Some(checksum) if checksum.algorithm == algorithm => checksum.value.clone(),
-        _ => crate::integrity::compute_checksum(algorithm, &part.data),
-    }
-}
-
-/// One part an upload holds, as a manifest check needs to see it.
-///
-/// The two routes keep their parts in different places — the coordinator's
-/// staging ledger, the driver's upload session — so the checks below read them
-/// through this view. Producing the map is the only thing a route has to do;
-/// the validation itself is shared, so a manifest cannot be accepted by one
-/// route and refused by the other.
-trait UploadedPart {
-    /// The number the upload stored the part under.
-    fn part_number(&self) -> u16;
-    /// The part's ETag, when the upload has one.
-    fn part_etag(&self) -> Option<EntityTag>;
-    /// The part's size in bytes.
-    fn part_size(&self) -> u64;
-    /// The digest of the part's bytes under `algorithm`, when this route can
-    /// produce one.
-    fn part_digest(&self, algorithm: ChecksumAlgorithm) -> Option<Bytes>;
-}
-
-impl UploadedPart for StoredPart {
-    fn part_number(&self) -> u16 {
-        self.number
-    }
-
-    fn part_etag(&self) -> Option<EntityTag> {
-        Some(StoredPart::etag(self))
-    }
-
-    fn part_size(&self) -> u64 {
-        self.size
-    }
-
-    fn part_digest(&self, algorithm: ChecksumAlgorithm) -> Option<Bytes> {
-        // Staging holds the bytes, so any algorithm can be answered: from the
-        // digest taken when the part was received, or by digesting those bytes
-        // now, which is what a part predating the upload's scheme needs.
-        Some(part_checksum(self, algorithm))
-    }
-}
-
-impl UploadedPart for PartInfo {
-    fn part_number(&self) -> u16 {
-        self.part_number.get()
-    }
-
-    fn part_etag(&self) -> Option<EntityTag> {
-        self.etag.clone()
-    }
-
-    fn part_size(&self) -> u64 {
-        self.size
-    }
-
-    fn part_digest(&self, algorithm: ChecksumAlgorithm) -> Option<Bytes> {
-        // A driver digests its parts under the upload's scheme, so that is the
-        // only algorithm it reports a digest for; any other leaves nothing to
-        // compare a declaration against.
-        self.checksum
-            .as_ref()
-            .filter(|checksum| checksum.algorithm() == algorithm)
-            .map(|checksum| checksum.value().clone())
-    }
-}
-
-/// Validates a completion manifest against the parts an upload actually holds,
-/// and returns those parts in manifest order.
-///
-/// This is the single manifest check both routes run before either assembles
-/// anything: every part the client named must exist and carry the ETag it named,
-/// no part may be listed twice, the list must be in ascending part-number order,
-/// every part but the last must meet [`MIN_PART_SIZE`], and a declared per-part
-/// checksum must match that part's digest. `scheme` is the algorithm the upload
-/// runs under — fixed when it was created, or by this completion — and a part
-/// digest is only ever computed under it, so a declaration under another
-/// algorithm (or on an upload with no scheme) is refused rather than checked
-/// against a value that is not the upload's.
-fn validate_manifest<'a, P: UploadedPart>(
-    manifest: &[CompletionPart],
-    scheme: Option<MultipartChecksum>,
-    parts: &'a BTreeMap<u16, P>,
-) -> Result<Vec<&'a P>, ServiceError> {
-    if manifest.is_empty() {
-        return Err(ServiceError::MalformedXml(
-            "the completion manifest must contain at least one part".into(),
-        ));
-    }
-
-    let mut seen = std::collections::HashSet::new();
-    let mut ordered: Vec<&P> = Vec::with_capacity(manifest.len());
-    for entry in manifest {
-        let number = entry.number;
-        if !seen.insert(number) {
-            return Err(ServiceError::MalformedXml(
-                "the completion manifest contains duplicate part numbers".into(),
-            ));
-        }
-        let part = parts.get(&number).ok_or_else(|| {
-            ServiceError::InvalidArgument(format!("part {number} was not uploaded for this upload"))
-        })?;
-        if let Some(expected) = &entry.etag
-            && part.part_etag().as_ref() != Some(expected)
-        {
-            return Err(ServiceError::InvalidArgument(format!(
-                "part {number} ETag does not match the uploaded part"
-            )));
-        }
-        if let Some((algorithm, expected)) = &entry.checksum {
-            if !scheme.is_some_and(|scheme| scheme.algorithm == *algorithm) {
-                return Err(ServiceError::InvalidRequest(format!(
-                    "the part checksum algorithm `{}` does not match the upload's",
-                    algorithm.as_str()
-                )));
-            }
-            match part.part_digest(*algorithm) {
-                // A declared value must match the bytes that were received; an
-                // unverified part is never assembled into the object.
-                Some(actual) if actual.as_ref() == expected.as_slice() => {}
-                Some(_) => {
-                    return Err(ServiceError::BadDigest(format!(
-                        "the checksum you specified for part {number} did not match what we received"
-                    )));
-                }
-                // Only a route that cannot digest the part reaches this: the
-                // driver is required to report each part's digest under the
-                // upload's scheme, so a missing one leaves nothing to verify.
-                None => {
-                    return Err(ServiceError::InvalidRequest(format!(
-                        "the driver reported no checksum for part {number}"
-                    )));
-                }
-            }
-        }
-        ordered.push(part);
-    }
-
-    for window in ordered.windows(2) {
-        if window[0].part_number() >= window[1].part_number() {
-            return Err(ServiceError::InvalidArgument(
-                "parts must be listed in ascending part-number order".into(),
-            ));
-        }
-    }
-    for part in &ordered[..ordered.len() - 1] {
-        if part.part_size() < MIN_PART_SIZE {
-            return Err(ServiceError::InvalidArgument(
-                "each part except the last must be at least 5 MiB".into(),
-            ));
-        }
-    }
-
-    Ok(ordered)
 }

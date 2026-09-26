@@ -40,6 +40,17 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 /// by [`SHUTDOWN_DEADLINE`].
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Proves a configuration can actually start in this build, without serving.
+///
+/// Validation rejects a structurally invalid file, but whether a driver `kind`
+/// exists is a property of the build, not the file: a kind that is not
+/// registered here can never be constructed. `check-config` calls this so an
+/// operator finds that out from the preflight rather than from the listener
+/// failing to bind, which is what spec §7.1 means by failing before startup.
+pub fn preflight(config: &AppConfig) -> Result<(), String> {
+    compose::build_registry(config).map(|_| ())
+}
+
 /// Starts the service and serves until a shutdown signal.
 pub async fn run(config: AppConfig) -> Result<(), String> {
     log(&format!("config: {}", config.redacted_summary()));

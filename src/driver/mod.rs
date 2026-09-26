@@ -6,6 +6,7 @@
 //!
 //! See `docs/implementation-spec.md` §2, §3.
 
+pub(crate) mod builtins;
 mod capabilities;
 mod descriptor;
 mod extensions;

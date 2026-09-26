@@ -1,7 +1,10 @@
 # Development configuration for the interface engineering preview.
 #
-# The `test-reference` / `test-vec` drivers are in-memory test tools, not a
-# production backend. `development = true` is required to register them.
+# The `test-reference` / `test-vec` / `test-native` drivers are in-memory test
+# tools, not a production backend. `development = true` is required to register
+# them. `test-native` is the reference driver with native multipart declared, so
+# the native multipart route can be exercised against a running server;
+# `test-reference` and `test-vec` emulate multipart with the service coordinator.
 # Secrets are read from the environment; nothing secret is written here.
 
 [server]
@@ -19,6 +22,10 @@ kind = "test-reference"
 id = "instance-b"
 kind = "test-vec"
 
+[[drivers]]
+id = "instance-c"
+kind = "test-native"
+
 [[buckets]]
 name = "example-a"
 driver = "instance-a"
@@ -29,6 +36,12 @@ profile = "core-write"
 name = "example-b"
 driver = "instance-b"
 namespace = "namespace-b"
+profile = "core-write"
+
+[[buckets]]
+name = "example-c"
+driver = "instance-c"
+namespace = "namespace-c"
 profile = "core-write"
 
 [[credentials]]
@@ -45,6 +58,12 @@ prefix = ""
 [[grants]]
 principal = "example-user"
 bucket = "example-b"
+actions = ["list", "read", "write", "delete"]
+prefix = ""
+
+[[grants]]
+principal = "example-user"
+bucket = "example-c"
 actions = ["list", "read", "write", "delete"]
 prefix = ""
 

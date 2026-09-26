@@ -77,17 +77,37 @@ print(value)
 }
 
 if [ -z "${ALLINS3_ENDPOINT:-}" ]; then
+  BIN="${ALLINS3_BIN:-$ROOT/target/debug/allins3}"
+  SERVER_LOG="${ALLINS3_SERVER_LOG:-/tmp/allins3-cli-server.log}"
+  # The test drivers are compiled in only under the `testing` feature. Build the
+  # binary (unless the caller supplied one) so a stale default-feature build
+  # fails here with cargo's message instead of a server that exits at startup
+  # and leaves the CLI failing with an unexplained connection error.
+  if [ -z "${ALLINS3_BIN:-}" ]; then
+    cargo build --features testing --quiet || exit 2
+  fi
   ALLINS3_DEV_SECRET="${ALLINS3_DEV_SECRET:-devsecret}" \
-    "$ROOT/target/debug/allins3" "$ROOT/examples/dev-config.toml" \
-    >"${ALLINS3_SERVER_LOG:-/tmp/allins3-cli-server.log}" 2>&1 &
+    "$BIN" "$ROOT/examples/dev-config.toml" >"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
-  for _ in $(seq 1 50); do
-    "$PYTHON" - "$ENDPOINT/readyz" <<'PY' >/dev/null 2>&1 && break
+  ready() {
+    "$PYTHON" - "$ENDPOINT/readyz" <<'PY' >/dev/null 2>&1
 import sys, urllib.request
 urllib.request.urlopen(sys.argv[1], timeout=1).read()
 PY
+  }
+  READY=""
+  for _ in $(seq 1 50); do
+    if ready; then
+      READY=1
+      break
+    fi
     sleep 0.2
   done
+  if [ -z "$READY" ]; then
+    echo "server never became ready; last log lines:" >&2
+    tail -n 20 "$SERVER_LOG" >&2
+    exit 2
+  fi
 fi
 
 trap 'cleanup; rm -rf "$WORK"' EXIT

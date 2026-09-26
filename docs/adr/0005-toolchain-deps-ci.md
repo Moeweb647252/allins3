@@ -18,18 +18,21 @@
    - `tokio-util = 0.7.19`
    - dev：`futures-util = 0.3.34`、`tokio`（`full`）
 3. **许可证**：直接依赖需为 `Apache-2.0`/`MIT`/`MIT-0`/`ISC`/`BSD-*` 等宽松许可；`s3s` 为 `Apache-2.0`。CI 需加入 `cargo deny`（或等价）做许可证与重复依赖检查（工具引入见 P0 后续）。当前仓库暂无该工具。
-4. **CI 命令**（所有任务完成条件）：
+4. **CI 命令**（所有任务完成条件，由 `scripts/check.sh` 作为唯一入口执行）：
    - `cargo fmt --check`
+   - `cargo clippy --all-targets -- -D warnings`（默认 feature）
    - `cargo clippy --all-targets --all-features -- -D warnings`
+   - `cargo test`（默认 feature 的单元测试）
    - `cargo test --all-features`
    - 独立 spike：`cd spikes/protocol-adapter && cargo test`
+   两种 feature 组合都跑是有意的：默认构建没有 test driver、契约 harness 与协议 harness，只跑 `--all-features` 会漏掉那里独有的未使用项、不可达分支或编译错误（反之亦然）。
 5. **协议 profile 字节上限**（服务配置取协议、服务配置、driver 限制的交集）：
    - 单对象 key：1–1024 UTF-8 字节
    - 单次非分片写：≤5 GiB
    - 单个对象（首期目标上限）：≤48.8 TiB（协议层，用 `u64`；不得把旧 5 TiB 写成永久上限）
    - part number：1–10000；非最后 part 最小 5 MiB，最大 5 GiB；单页最多 1000
    - XML body：默认 10 MiB（`s3s` 默认）；用户元数据：≤100 条、≤8 KiB（见 `domain::metadata`）
-6. **Toolchain 固定状态**：当前工作环境为 `nightly-aarch64-apple-darwin`，`rustc 1.100.0-nightly (215a8af4b 2026-09-15)`。本仓库暂**不**添加 `rust-toolchain.toml`，以免在未安装该日期工具链的机器上触发自动下载；CI 必须固定一个带日期的 nightly（或稳定版 ≥1.96）并回填本文件的哈希。
+6. **Toolchain 固定状态**：当前工作环境为 `nightly-aarch64-apple-darwin`，`rustc 1.100.0-nightly (215a8af4b 2026-09-15)`。本仓库暂**不**添加 `rust-toolchain.toml`，以免在未安装该日期工具链的机器上触发自动下载；CI 固定该日期：`.github/workflows/ci.yml` 使用 `dtolnay/rust-toolchain@nightly-2026-09-15`，与本地已验证的 `nightly-2026-09-15` 一致。升级工具链属于本 ADR 的变更，须重跑契约测试与兼容矩阵。
 
 ## 后果
 
@@ -38,5 +41,5 @@
 
 ## 未决项
 
-- `cargo deny`/许可证扫描尚未接入。
-- 具体 CI 平台的运行时版本需在 P0 收尾时固定并回填。
+- `cargo deny`/许可证扫描尚未接入（见决策 3）；`scripts/check.sh` 是测试与 lint 入口，尚不含该检查。
+- 具体 CI 平台的运行时版本已在决策 6 固定为 `nightly-2026-09-15`；升级工具链时需同步更新本文件。

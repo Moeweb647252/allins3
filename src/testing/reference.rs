@@ -130,6 +130,18 @@ impl ReferenceDriverFactory {
             capabilities,
         }
     }
+
+    /// A factory whose namespace provides native multipart.
+    ///
+    /// [`NamespaceCapabilities::full_memory`] emulates multipart with the
+    /// service coordinator; declaring it native lets the native route be driven
+    /// end to end — including over HTTP, where the demonstrator otherwise never
+    /// reaches it.
+    pub fn native_multipart(kind: impl Into<String>) -> Self {
+        let mut capabilities = NamespaceCapabilities::full_memory();
+        capabilities.multipart = true;
+        Self::with_capabilities(kind, capabilities)
+    }
 }
 
 #[async_trait]

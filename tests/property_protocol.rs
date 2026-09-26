@@ -693,6 +693,72 @@ async fn a_valid_manifest_through_the_wire_publishes_exactly_that_manifest() {
     assert_eq!(read.body.as_ref(), body.as_slice());
 }
 
+/// The text between the first `<name>` and its closing tag.
+fn xml_tag(xml: &[u8], name: &str) -> Option<String> {
+    let text = std::str::from_utf8(xml).ok()?;
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    Some(text[start..end].to_string())
+}
+
+#[tokio::test]
+async fn the_native_multipart_route_is_reached_through_the_signed_wire() {
+    // The reference driver's default capabilities emulate multipart with the
+    // service coordinator; this harness declares it native, so the whole round
+    // trip — create, part, complete — is dispatched natively through the real
+    // signature-verifying adapter, the one surface the native route otherwise
+    // never crosses.
+    let harness = ProtocolHarness::new_native_multipart().await;
+    let key = "xml/native.bin";
+    let body = b"native multipart through the wire";
+
+    let created = harness
+        .call("POST", &format!("{}?uploads", target(key)), Vec::new(), &[])
+        .await;
+    assert_eq!(created.status.as_u16(), 200, "{}", created.text());
+    let upload_id = xml_tag(&created.body, "UploadId").expect("create returns an UploadId");
+    assert_eq!(
+        harness.objects().upload_is_native(&upload_id),
+        Some(true),
+        "a namespace declaring native multipart must create the upload natively"
+    );
+
+    let part = harness
+        .call(
+            "PUT",
+            &format!("{}?partNumber=1&uploadId={upload_id}", target(key)),
+            body.to_vec(),
+            &[],
+        )
+        .await;
+    assert_eq!(part.status.as_u16(), 200, "{}", part.text());
+    let etag = part.header("etag").expect("upload_part returns an ETag");
+
+    let manifest = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let response = harness
+        .call(
+            "POST",
+            &format!("{}?uploadId={upload_id}", target(key)),
+            manifest,
+            &[],
+        )
+        .await;
+    assert_eq!(response.status.as_u16(), 200, "{}", response.text());
+
+    let read = harness.call("GET", &target(key), Vec::new(), &[]).await;
+    assert_eq!(read.status.as_u16(), 200, "{}", read.text());
+    assert_eq!(read.body.as_ref(), body.as_slice());
+    assert_eq!(
+        harness.objects().upload_is_native(&upload_id),
+        None,
+        "a completed upload is retired on either route"
+    );
+}
+
 // --- Part manifests --------------------------------------------------------
 
 #[tokio::test]

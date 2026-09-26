@@ -52,7 +52,7 @@ P1 模型稳定后，协议适配测试向量与 P2 可独立推进；不应在�
 - [x] P0-02 评估 `s3s` → `docs/p0-protocol-adapter-assessment.md`。
 - [x] P0-03 用真实 SDK 请求验证四条风险路径。已完成：①签名不破坏原始 key（`a//b`、`+`、空格的原样往返）；②请求体无需整体缓冲（`src/service/mod.rs` 流式管线 + `a_generated_multi_megabyte_body_streams_through_unchanged` 的 12 MiB 生成流）；③提交前校验（`Content-MD5`/声明 checksum 不匹配即 abort，`a_body_shorter_or_longer_than_declared_is_a_bad_digest`）；④错误映射（`docs/compatibility-matrix.md` 第 4 节）。**未完成的部分**：官方固定签名向量未内置（原因与替代证据见兼容矩阵第 6 节），仅此一项。trailer 运行时校验与 AWS CLI 已不再属于未完成项：`ALLINS3_SECRET_KEY=devsecret .venv/bin/python scripts/e2e_streaming_trailer.py` 用裸 HTTP 构造 `aws-chunked` 请求并逐项校验 trailer（签名 trailer 块、声明缺失、值不匹配、`400 BadDigest` 后不留对象），34/34；`bash scripts/e2e_cli.sh` 用 aws-cli 1.44.87 对同一服务做 CLI 级往返，29/29。
 - [x] P0-04 记录适配补齐/更换适配层影响 → ADR-0007。
-- [x] P0-05 固定直接依赖版本与 CI 命令、字节上限 → ADR-0005。toolchain 与许可证扫描仍有未决项。
+- [x] P0-05 固定直接依赖版本与 CI 命令、字节上限 → ADR-0005。CI 工具链已固定为 `nightly-2026-09-15`（ADR-0005 决策 6）；许可证扫描（`cargo deny` 或等价）仍有未决项。
 - [x] P0-06 记录 ADR → `docs/adr/`。
 
 产物：技术验证程序、首版兼容矩阵、ADR、可复现的依赖和测试向量。`s3s` 仅是候选，不能把它的 API 覆盖范围直接当作本项目已通过的兼容范围。[官方项目说明](https://github.com/s3s-project/s3s)
@@ -204,11 +204,10 @@ P1 模型稳定后，协议适配测试向量与 P2 可独立推进；不应在�
 
 P0 与 P1 已按本节的顺序完成（协议风险验证 → 领域类型 / driver API / 能力模型 / 契约测试 → 配置路由 → HTTP），P2–P5 也已落地并以真实 SDK 验证。当前实现顺序与证据：
 
-1. `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all-features`（128 个单元测试 + 64 个集成测试）。
-2. `cd spikes/protocol-adapter && cargo test`（`s3s` 候选行为断言）。
-3. `scripts/fuzz.sh`（P5-05 的三个模糊测试目标，默认每个 20000 轮；`fuzz/` 是独立 workspace，因此根目录的 fmt/clippy/test 不会编译它，必须由本脚本或显式命令执行）。
-4. `./target/debug/allins3 check-config examples/dev-config.toml`，再启动并用 `scripts/e2e_boto3.py` 跑 67 项真实 SDK 检查。
-5. `scripts/e2e_drain.sh`（P5-03 的排空时序：真实 `SIGINT`/`SIGTERM` × 真实慢速上传，20 项检查；与 `scripts/e2e_cli.sh` 一样自管服务器，因此这两个脚本需串行执行）。
-6. `.venv/bin/python scripts/e2e_timeouts.py`（P5-01 的四个请求边界：header timeout、body idle、总 deadline 与不受影响的普通流量，21 项检查；同样自管服务器，需串行执行）。
+1. `scripts/check.sh`（唯一入口：fmt、默认与 `--all-features` 两种 feature 的 clippy `-D warnings` 与测试，以及独立的协议 spike `cd spikes/protocol-adapter && cargo test`；CI 调用同一脚本）。当前 132 个单元测试 + 78 个集成测试。
+2. `scripts/fuzz.sh`（P5-05 的三个模糊测试目标，默认每个 20000 轮；`fuzz/` 是独立 workspace，因此根目录的 fmt/clippy/test 不会编译它，必须由本脚本或显式命令执行）。
+3. `cargo run --features testing -- check-config examples/dev-config.toml`（含 kind 注册预检），再启动并用 `scripts/e2e_boto3.py` 跑 67 项真实 SDK 检查。
+4. `scripts/e2e_drain.sh`（P5-03 的排空时序：真实 `SIGINT`/`SIGTERM` × 真实慢速上传，20 项检查；与 `scripts/e2e_cli.sh` 一样自管服务器，因此这两个脚本需串行执行）。
+5. `.venv/bin/python scripts/e2e_timeouts.py`（P5-01 的四个请求边界：header timeout、body idle、总 deadline 与不受影响的普通流量，21 项检查；同样自管服务器，需串行执行）。
 
 **仍未完成（不得当作通过）**：P6 的生产准入（持久化暂存、崩溃恢复、备份、基准）全部未开始，必须在选定真实后端后单独排期，且文档自身已把它界定为「不是当前文档任务要实施的内容」（见 P6 一节的 not-required 标记与引文）；在此之前本仓库只能声明为工程预览。此外，`aws-chunked` trailer 的运行时校验只能用本仓库手工构造的请求验证（CLI/botocore 1.42 对 HTTP endpoint 不发出 trailer 形式），因此该路径没有第三方客户端证据。

@@ -64,13 +64,13 @@
 ### Composition（组合根）
 
 - **持有**：启动接线 —— 注册 driver kind、按配置创建实例、建服务并 warmup、把 S3 适配层包在服务外。
-- **接口**：`src/compose.rs` 内的一组函数；对 crate 内其余部分可见（`pub(crate)`），对外仍是 `server::run` 与测试装置。
+- **接口**：`src/compose.rs` 内的一组函数；对 crate 内其余部分可见（`pub(crate)`），对外仍是 `server::run` 与测试装置。本构建的 kind 表在 `src/driver/builtins.rs`（数据表而非 `match`），组合根只查表；新增 driver 不改组合根（ADR-0011）。
 - **不负责**：监听、进程生命周期、后台任务（清理器的所有者仍是 `server`）。
 - **理由**：`server::run`、`fixture::service`、`ProtocolHarness::new` 曾各自维护一份略有差异的启动顺序，适配层标志可能与服务实际配置漂移。
 
 ### 已实现的候选
 
-架构评审提出的三个候选现均已实现：**对象服务拆分**（Admission / NamespaceHandles / TokenStore / Multipart，见 ADR-0008）；ADR-0008 记为“未决”的两项后续 —— **Composition 组合根**（`src/compose.rs`）与 **StagingLedger**（`src/service/staging.rs`）—— 见 [ADR-0009](docs/adr/0009-service-decomposition-followups.md)。能力规划从「只做档位校验」变为**路由的唯一依据**（原生 copy、原生 multipart 或补齐），见 [ADR-0010](docs/adr/0010-capability-plan-drives-routing.md)。
+架构评审提出的三个候选现均已实现：**对象服务拆分**（Admission / NamespaceHandles / TokenStore / Multipart，见 ADR-0008）；ADR-0008 记为“未决”的两项后续 —— **Composition 组合根**（`src/compose.rs`）与 **StagingLedger**（`src/service/staging.rs`）—— 见 [ADR-0009](docs/adr/0009-service-decomposition-followups.md)。能力规划从「只做档位校验」变为**路由的唯一依据**（原生 copy、原生 multipart 或补齐），见 [ADR-0010](docs/adr/0010-capability-plan-drives-routing.md)。driver kind 注册改为数据表、原生 multipart 增加配置入口与 HTTP/SigV4 覆盖、双 feature 构建由 `scripts/check.sh` 与 CI 守住，见 [ADR-0011](docs/adr/0011-driver-registration-and-native-route-coverage.md)。
 
 ## 进程级全局状态
 

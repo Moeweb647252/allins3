@@ -85,7 +85,24 @@ pub struct ProtocolHarness {
 impl ProtocolHarness {
     /// Builds the service over the in-memory reference driver.
     pub async fn new() -> Self {
-        let factory: Arc<dyn DriverFactory> = Arc::new(ReferenceDriverFactory::new("reference"));
+        Self::build(Arc::new(ReferenceDriverFactory::new("reference"))).await
+    }
+
+    /// Builds the same service over a reference driver that declares native
+    /// multipart.
+    ///
+    /// The native route is otherwise never reached through real dispatch, so
+    /// signature verification, XML encoding and the adapter's flags for
+    /// multipart would be proven only on the coordinator. This harness closes
+    /// that gap without a listener.
+    pub async fn new_native_multipart() -> Self {
+        Self::build(Arc::new(ReferenceDriverFactory::native_multipart(
+            "reference",
+        )))
+        .await
+    }
+
+    async fn build(factory: Arc<dyn DriverFactory>) -> Self {
         let objects = fixture::service(
             vec![("inst-1", factory)],
             vec![BucketSpec {

@@ -14,5 +14,6 @@
 | [0008](0008-object-service-decomposition.md) | 对象服务的四个协作者拆分与缝隙保持内部 | Accepted |
 | [0009](0009-service-decomposition-followups.md) | 对象服务拆分的两项后续：组合根与暂存账本 | Accepted |
 | [0010](0010-capability-plan-drives-routing.md) | 能力规划驱动路由，并接入原生 multipart | Accepted |
+| [0011](0011-driver-registration-and-native-route-coverage.md) | driver 注册以数据表表达，原生路由跨 HTTP 验证，双 feature 构建门 | Accepted |
 
 格式：每条 ADR 记录背景、决策、后果与替代方案。修改已接受决策需新增 ADR 并在旧条目标注 Superseded。
