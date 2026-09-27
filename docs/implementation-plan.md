@@ -223,7 +223,7 @@ P1 模型稳定后，协议适配测试向量与 P2 可独立推进；不应在�
 
 P0 与 P1 已按本节的顺序完成（协议风险验证 → 领域类型 / driver API / 能力模型 / 契约测试 → 配置路由 → HTTP），P2–P5 也已落地并以真实 SDK 验证。当前实现顺序与证据：
 
-1. `scripts/check.sh`（唯一入口：fmt、默认与 `--all-features` 两种 feature 的 clippy `-D warnings` 与测试，以及独立的协议 spike `cd spikes/protocol-adapter && cargo test`；CI 调用同一脚本）。当前 165 个单元测试 + 92 个集成测试。
+1. `scripts/check.sh`（唯一入口：fmt、默认与 `--all-features` 两种 feature 的 clippy `-D warnings` 与测试，以及独立的协议 spike `cd spikes/protocol-adapter && cargo test`；CI 调用同一脚本）。当前 165 个单元测试 + 93 个集成测试。
 2. `scripts/fuzz.sh`（P5-05 的三个模糊测试目标，默认每个 20000 轮；`fuzz/` 是独立 workspace，因此根目录的 fmt/clippy/test 不会编译它，必须由本脚本或显式命令执行）。
 3. `cargo run --features testing -- check-config examples/dev-config.toml`（含 kind 注册预检），再启动并用 `scripts/e2e_boto3.py` 跑 67 项真实 SDK 检查。
 4. `scripts/e2e_drain.sh`（P5-03 的排空时序：真实 `SIGINT`/`SIGTERM` × 真实慢速上传，20 项检查；与 `scripts/e2e_cli.sh` 一样自管服务器，因此这两个脚本需串行执行）。

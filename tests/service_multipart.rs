@@ -15,6 +15,7 @@ use allins3::domain::{
     EntityTag, NamespaceId, ObjectKey, Preconditions, UserMetadata,
 };
 use allins3::driver::{DriverFactory, NamespaceCapabilities, Profile, UploadHandle, UploadId};
+use allins3::drivers::fs::FsDriverFactory;
 use allins3::integrity::{base64, compute_checksum};
 use allins3::service::multipart::{
     CompletionPart, DeclaredCompletionChecksum, MIN_PART_SIZE, MultipartChecksum, PartChecksums,
@@ -599,6 +600,139 @@ async fn an_unresolvable_commit_outcome_blocks_replay_and_is_never_swept() {
         .await
         .expect("list uploads");
     assert_eq!(uploads.uploads.len(), 1);
+}
+
+/// The conservative read of a non-final record is only a proof when the target
+/// object carries exactly the ETag this completion would produce. When the key
+/// already holds a *different* object, nothing is proven, so the attempt must
+/// stay pending and the existing object must not be touched (`INV-09`).
+///
+/// The pre-existing object has to survive across two service instances, which
+/// is why this uses the on-disk filesystem backend: one instance publishes the
+/// object, a second (whose namespace cannot answer recovery queries) attempts
+/// the completion.
+#[tokio::test]
+async fn an_unresolvable_attempt_never_overwrites_a_different_object() {
+    let scratch = std::env::temp_dir().join(format!(
+        "allins3-unresolved-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    let mut options = toml::Table::new();
+    options.insert(
+        "root".into(),
+        toml::Value::String(scratch.display().to_string()),
+    );
+    let buckets = || {
+        vec![BucketSpec {
+            bucket: BUCKET,
+            driver: DRIVER,
+            namespace: "ns-a",
+            profile: Profile::CoreWrite,
+        }]
+    };
+
+    // The key first holds a different object, published by an ordinary,
+    // fault-free instance.
+    let fs: Arc<dyn DriverFactory> = Arc::new(FsDriverFactory::new("fs"));
+    let publisher = fixture::service_configured(
+        vec![(DRIVER, fs.clone(), options.clone())],
+        buckets(),
+        fixture::default_limits(),
+        fixture::full_access(),
+        false,
+    )
+    .await;
+    let key = object_key("multi/occupied.bin");
+    let first = start_upload(&publisher, &key).await;
+    let first_etag = upload_part(
+        &publisher,
+        &key,
+        &first,
+        1,
+        b"the object that is already there",
+    )
+    .await;
+    publisher
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &first,
+            &[(1u16, Some(first_etag))],
+            None,
+            Preconditions::none(),
+        )
+        .await
+        .expect("the first completion publishes");
+
+    // A second instance over the same root: its record cannot be read and its
+    // attempt is fenced before publish, and the key holds an object whose ETag
+    // is not the one this completion would produce.
+    let faulted: Arc<dyn DriverFactory> = Arc::new(FaultDriverFactory::new(
+        fs,
+        FaultPlan {
+            hide_recovery: true,
+            commit: allins3::testing::fault::CommitFault::FencedBeforePublish,
+            ..FaultPlan::none()
+        },
+    ));
+    let service = fixture::service_configured(
+        vec![(DRIVER, faulted, options)],
+        buckets(),
+        fixture::default_limits(),
+        fixture::full_access(),
+        false,
+    )
+    .await;
+
+    let upload_id = start_upload(&service, &key).await;
+    let etag = upload_part(&service, &key, &upload_id, 1, b"a different body entirely").await;
+    let manifest = [(1u16, Some(etag))];
+
+    service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            None,
+            Preconditions::none(),
+        )
+        .await
+        .expect_err("an unprovable outcome cannot be reported as published");
+    assert_eq!(
+        service.pending_completions().len(),
+        1,
+        "the attempt stays pending"
+    );
+
+    // A retry is refused, not replayed, and the object already on the key is
+    // still exactly what the first completion published.
+    service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            None,
+            Preconditions::none(),
+        )
+        .await
+        .expect_err("an unprovable attempt must not be replayed");
+    assert_eq!(
+        read_object(&publisher, &key).await,
+        b"the object that is already there".to_vec(),
+        "the unresolved attempt must not overwrite a different object"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[tokio::test]
