@@ -14,11 +14,19 @@ http-body-util = "=0.1.5"
 hyper = { version = "=1.11.1", features = ["http1", "server"] }
 hyper-util = { version = "=0.1.20", features = ["server", "tokio", "http1"] }
 md-5 = "=0.10.6"
+# Only behind the `yun139` feature: the 139 cloud-drive driver needs an outbound
+# HTTPS client. Rustls with the platform verifier is reqwest 0.13's default TLS
+# trust source (system roots); `json`/`stream` cover the signed JSON API and the
+# presigned-URL downloads. Recorded in ADR-0005.
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls", "stream"], optional = true }
 s3s = { version = "=0.16.1", default-features = false }
 # Only behind the `testing` feature: the in-process protocol harness signs its
 # own requests with the same crate the server verifies them with.
 s3s-sigv4 = { version = "=0.16.1", optional = true }
 serde = { version = "=1.0.229", features = ["derive"] }
+# Only behind the `yun139` feature, alongside `reqwest`: the drive API returns
+# untyped JSON envelopes whose payload shape varies per endpoint.
+serde_json = { version = "=1.0.151", optional = true }
 sha1 = "=0.10.7"
 sha2 = "=0.10.9"
 thiserror = "=2.0.20"
@@ -48,6 +56,8 @@ default = []
 # Enables the test-support drivers, fault injector, reusable contract-test
 # harness and the in-process protocol harness from the `allins3::testing` module.
 testing = ["dep:s3s-sigv4"]
+# The read-only 139 cloud-drive driver and its outbound HTTPS client (ADR-0017).
+yun139 = ["dep:reqwest", "dep:serde_json"]
 
 [[test]]
 name = "contract_reference"
@@ -56,6 +66,10 @@ required-features = ["testing"]
 [[test]]
 name = "contract_fs"
 required-features = ["testing"]
+
+[[test]]
+name = "contract_yun139"
+required-features = ["testing", "yun139"]
 
 [[test]]
 name = "contract_fault"

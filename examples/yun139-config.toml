@@ -1,0 +1,63 @@
+# Read-only configuration backed by a 139 (China Mobile) cloud drive folder.
+#
+# This backend exposes a drive folder as an S3-compatible, read-only namespace:
+# every file below `folder_id` becomes an object whose key is its path relative
+# to that folder, and nested folders become key prefixes. It is deliberately
+# read-only — the drive offers no hidden staging, no atomic publish, no
+# conditional write, and other clients write the same folder — so a bucket on it
+# must use `profile = "core-read"`. See
+# `docs/adr/0017-read-only-yun139-driver.md`.
+#
+# The session credentials live in `options` (the operator's choice for this
+# backend). Because they are secrets in a file:
+#
+#   * keep this file, once filled in, out of version control — the tracked
+#     example here carries placeholders only, and `.gitignore` ignores
+#     `examples/yun139-local.toml`;
+#   * only the `Authorization` header is required (`phone` + `auth_token`); the
+#     `cookie` option is optional and only needed when the service rejects the
+#     non-browser session.
+#
+# Run `allins3 check-config examples/yun139-config.toml` first: it proves the
+# kind is registered, the private options parse, and it makes no network call.
+#
+# Requires a build with the `yun139` feature:
+#   cargo run --features yun139 -- examples/yun139-config.toml
+
+[server]
+listen = "127.0.0.1:9000"
+region = "us-east-1"
+addressing = "path"
+development = false
+health_endpoints = true
+
+[[drivers]]
+id = "instance-yun139"
+kind = "yun139"
+# `folder_id` is the drive folder backing every namespace. Use `namespaces` to
+# map individual namespaces to their own folders instead:
+#   namespaces = { photos = "Ft...", docs = "Fp..." }
+options = { phone = "19800000000", auth_token = "REPLACE_WITH_SESSION_TOKEN", folder_id = "REPLACE_WITH_FOLDER_ID" }
+
+[[buckets]]
+name = "example-yun139"
+driver = "instance-yun139"
+namespace = "yun139"
+profile = "core-read"
+# The deployment policy flag: nothing on this backend can be written, so a
+# production deployment needs no multipart `state_dir` (ADR-0014).
+readonly = true
+
+[[credentials]]
+access_key_id = "EXAMPLEACCESSKEY"
+secret_ref = "env:ALLINS3_YUN139_SECRET"
+principal = "example-user"
+
+[[grants]]
+principal = "example-user"
+bucket = "example-yun139"
+actions = ["list", "read"]
+prefix = ""
+
+[limits]
+multipart_sweep_interval_secs = 0

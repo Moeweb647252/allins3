@@ -10,3 +10,9 @@
 //! `service` (`INV-01`).
 
 pub mod fs;
+
+// The read-only 139 cloud-drive backend, and with it the only outbound HTTPS
+// client in the build. Behind a feature so the default build stays free of the
+// extra dependencies (ADR-0017).
+#[cfg(feature = "yun139")]
+pub mod yun139;

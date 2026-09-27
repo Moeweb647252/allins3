@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-状态：生效中。对应任务 P0-06。更新日期：2026-09-26。
+状态：生效中。对应任务 P0-06。更新日期：2026-09-27。
 
 | 编号 | 标题 | 状态 |
 | --- | --- | --- |
@@ -20,5 +20,6 @@
 | [0014](0014-durable-multipart-coordinator-state.md) | multipart 协调器的 session/staging 持久化 | Accepted（取代 P4-01 偏离） |
 | [0015](0015-local-filesystem-production-driver.md) | 本地文件系统作为第一个生产 driver | Accepted |
 | [0016](0016-online-pending-completion-resolution.md) | 未决完成的在线解决 | Accepted |
+| [0017](0017-read-only-yun139-driver.md) | 只读的 139 云盘 driver | Accepted |
 
 格式：每条 ADR 记录背景、决策、后果与替代方案。修改已接受决策需新增 ADR 并在旧条目标注 Superseded。

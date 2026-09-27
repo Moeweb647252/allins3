@@ -32,7 +32,7 @@ table.push(Builtin {
 - 构造函数收到配置里的 kind 字符串，不要在同一处再硬写一遍。
 - 若 driver 在独立 feature 下，用 `#[cfg(feature = "...")]` 包住表项；表为空时默认构建仍然干净（ADR-0011）。
 - `test` 标记（不是名字前缀）决定配置校验是否把它当作测试 driver：`test: true` 的 kind 只在 `development = true` 下放行，因此真实后端把 `test` 写 `false` 即可，即便名字碰巧以 `test-` 开头也不会被误判。
-- 真实后端的现成例子见 `src/drivers/fs/`（kind `"fs"`，`test: false`，每个构建均注册）与其配置 `examples/fs-config.toml`。
+- 真实后端的现成例子见 `src/drivers/fs/`（kind `"fs"`，`test: false`，每个构建均注册）与其配置 `examples/fs-config.toml`；只读的真实后端见 `src/drivers/yun139/`（kind `"yun139"`，在 `yun139` feature 下注册，`examples/yun139-config.toml`）。
 
 ## 1.6 每实例私有配置（`options`）与 secret 引用
 
@@ -42,6 +42,7 @@ table.push(Builtin {
 - **`validate` 必须无副作用**：不得写用户数据，也不得创建目录（`check-config` 会在只读环境下被调用）。创建连接/目录放到 `create`。
 - **`secret_refs` 是引用，不是值**。用 `config.secret_refs` 与自己 `options` 里的约定决定解析哪个引用（`secrets.resolve(reference)`）；secret 值不得进入日志或错误消息。
 - `src/drivers/fs/mod.rs` 的 `FsOptions::parse` 是一个可参照的最小实现（必填 `root`，拒绝未知键）。
+- **并非所有后端都用 `env:` 引用**：`yun139`（ADR-0017）按操作者选择把会话凭据直接放在 `options` 里，以 `Secret` 持有（`Debug` 打码），因此部署文件必须排除版本控制。凭据值不得进入日志或错误消息这一条仍然适用。
 
 ## 1.7 阻塞 I/O
 
@@ -103,6 +104,8 @@ python3 scripts/e2e_boto3.py
 
 `scripts/e2e_cli.sh` / `e2e_drain.sh` / `e2e_timeouts.py` 会自建服务器；未用 `ALLINS3_BIN` 指定二进制时它们先 `cargo build --features testing`，因此不要用默认构建的二进制去跑它们（测试 driver 只在 `testing` 下注册）。声明了 `multipart = true` 的后端可参照 `examples/dev-config.toml` 里的 `test-native`（`example-c`）。
 
+需要外部凭据的后端把契约测试放在自己的 feature 下，并用环境变量提供会话、缺失即打印原因跳过：见 `tests/contract_yun139.rs`（`yun139`，ADR-0017）。因此 `cargo test --all-features` 在没有凭据时仍然通过，而真实校验由可选运行的 `scripts/e2e_yun139.sh` 承担。
+
 契约 harness 会验证：CRUD、暂存不可见、原子发布与 abort、revision 稳定读、元数据更新产生新 revision、有序分页、delimiter 折叠、条件写、namespace 隔离、提交恢复四态，以及**原生复制与流式补齐的等价性**（`copy_native_matches_emulation`）。能力不足的检查会被跳过并在报告中列出原因，不会静默通过。
 
 ## 5. 生产准入（P6 清单）
@@ -110,6 +113,8 @@ python3 scripts/e2e_boto3.py
 运行时已就位的部分：生产模式下可写 binding 必须 `is_production_write_capable()`（启动即拒绝）；退出时对每个 driver 实例调用 `StorageDriver::shutdown`（有 bounded deadline，失败只记日志）；`/readyz` 汇总每实例 `health`，任一实例不服务即返回 `503`。
 
 本地文件系统 driver（`fs`）已完成的运行时部分：真实（跨重启）对象存储、每实例配置缝、受限阻塞执行器、提交结果记录与围栏、`descriptors()` 暴露每实例身份；证据为 `tests/contract_fs.rs` 与 `scripts/e2e_fs.sh`（含 SIGKILL 重启后读回）。
+
+只读后端可进生产而无需 `state_dir`：`yun139`（ADR-0017）声明 `write = false`，bucket 配 `profile = "core-read"` 且 `readonly = true`，因此既不触发 `is_production_write_capable()`，也不要求协调器状态目录；证据为 `tests/contract_yun139.rs`（需真实会话）与 `scripts/e2e_yun139.sh`（4/4，含 range 读取与 PUT 被拒）。
 
 两个与 driver 直接相关的后端义务：
 

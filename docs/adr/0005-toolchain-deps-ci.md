@@ -17,7 +17,8 @@
    - `tokio = 1.53.1`
    - `tokio-util = 0.7.19`
    - dev：`futures-util = 0.3.34`、`tokio`（`full`）
-3. **许可证**：直接依赖需为 `Apache-2.0`/`MIT`/`MIT-0`/`ISC`/`BSD-*` 等宽松许可；`s3s` 为 `Apache-2.0`。CI 需加入 `cargo deny`（或等价）做许可证与重复依赖检查（工具引入见 P0 后续）。当前仓库暂无该工具。
+   - **仅 `yun139` feature**（[ADR-0017](0017-read-only-yun139-driver.md)）：`reqwest = 0.13.5`（`default-features = false`，features `json`/`rustls`/`stream`；rustls 用平台证书验证）与 `serde_json = 1.0.151`。这是本仓库第一个出站 HTTPS 客户端；置于 feature 下，默认构建不引入任何新依赖。
+3. **许可证**：直接依赖需为 `Apache-2.0`/`MIT`/`MIT-0`/`ISC`/`BSD-*` 等宽松许可；`s3s` 为 `Apache-2.0`，`reqwest`/`serde_json` 为 `Apache-2.0`/`MIT`。注意 `yun139` 的**传递**依赖里含 MPL-2.0 组件（rustls 的根证书/平台验证链），本条款只约束直接依赖，但 `cargo deny` 接入时需一并纳入评估。CI 需加入 `cargo deny`（或等价）做许可证与重复依赖检查（工具引入见 P0 后续）。当前仓库暂无该工具。
 4. **CI 命令**（所有任务完成条件，由 `scripts/check.sh` 作为唯一入口执行）：
    - `cargo fmt --check`
    - `cargo clippy --all-targets -- -D warnings`（默认 feature）

@@ -1,13 +1,29 @@
 #!/usr/bin/env bash
-# Start a long-lived allins3 instance backed by the local filesystem driver.
+# Start a long-lived allins3 instance backed by a real driver.
 #
 #   scripts/dev_instance.sh start     # build if needed, generate config, launch detached
 #   scripts/dev_instance.sh status    # show pid/listener/readiness
-#   scripts/dev_instance.sh stop      # graceful shutdown  #   scripts/dev_instance.sh env       # print AWS_* exports for this instance
-  #   scripts/dev_instance.sh logs      # follow the server log
+#   scripts/dev_instance.sh stop      # graceful shutdown
+#   scripts/dev_instance.sh env       # print AWS_* exports for this instance
+#   scripts/dev_instance.sh logs      # follow the server log
+#
+# Two drivers are supported, selected by ALLINS3_DRIVER:
+#
+#   fs      (default)  a writable bucket backed by a local directory
+#   yun139             a read-only bucket backed by a 139 cloud-drive folder
 #
 # Everything lives outside the repository (default /tmp/allins3-instance).
-# Override with INSTANCE_DIR=/some/dir, ALLINS3_PORT=9100, ALLINS3_FS_SECRET=...
+# Override with INSTANCE_DIR=/some/dir, ALLINS3_PORT=9100, ALLINS3_SECRET=...
+#
+# The yun139 driver needs a live account session; credentials are read from a
+# file and never passed on the command line:
+#
+#   ALLINS3_DRIVER=yun139 \
+#     ALLINS3_YUN139_SESSION_FILE=/tmp/allins3-yun139/session.json \
+#     ALLINS3_YUN139_FOLDER_ID='Ft…' \
+#     scripts/dev_instance.sh start
+#
+# The session file is JSON: { "phone": "...", "auth_token": "..." }.
 #
 # The process is started in its own session (setsid) so it survives the shell
 # that launched it; a plain `... &` is reaped when that shell's group exits.
@@ -15,13 +31,25 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 INSTANCE_DIR="${INSTANCE_DIR:-/tmp/allins3-instance}"
+DRIVER="${ALLINS3_DRIVER:-fs}"
 # Not "PORT": that name is already set (to 0) in some shell environments.
 PORT="${ALLINS3_PORT:-9000}"
-SECRET="${ALLINS3_FS_SECRET:-devsecret}"
+# The S3 surface secret. ALLINS3_FS_SECRET is the historical name; both are
+# accepted and both are exported to the child so either config reference works.
+SECRET="${ALLINS3_SECRET:-${ALLINS3_FS_SECRET:-devsecret}}"
 ACCESS_KEY="${ALLINS3_ACCESS_KEY:-EXAMPLEACCESSKEY}"
-BUCKET="${ALLINS3_BUCKET:-example-fs}"
+if [ "$DRIVER" = yun139 ]; then
+  BUCKET="${ALLINS3_BUCKET:-example-yun139}"
+else
+  BUCKET="${ALLINS3_BUCKET:-example-fs}"
+fi
 BIN="${ALLINS3_BIN:-$ROOT/target/debug/allins3}"
+# A caller-supplied binary is trusted as-is; otherwise we always build, because
+# the cached binary may lack the feature set the selected driver needs.
+BIN_PROVIDED="${ALLINS3_BIN:+1}"
 PYTHON="${PYTHON:-$(command -v python3 || echo /usr/bin/python3)}"
+SESSION_FILE="${ALLINS3_YUN139_SESSION_FILE:-/tmp/allins3-yun139/session.json}"
+FOLDER="${ALLINS3_YUN139_FOLDER_ID:-}"
 
 # Prefer an explicit CLI, then the repository venv (as scripts/e2e_fs.sh does),
 # then whatever is on PATH.
@@ -33,7 +61,7 @@ else
   AWS_CLI="$(command -v aws || true)"
 fi
 
-CONFIG="$INSTANCE_DIR/fs-config.toml"
+CONFIG="$INSTANCE_DIR/$DRIVER-config.toml"
 STATE_DIR="$INSTANCE_DIR/state"
 DATA_DIR="$INSTANCE_DIR/data"
 LOG="$INSTANCE_DIR/server.log"
@@ -58,8 +86,10 @@ alive() {
 }
 
 write_config() {
-  mkdir -p "$STATE_DIR" "$DATA_DIR"
-  cat >"$CONFIG" <<EOF
+  case "$DRIVER" in
+    fs)
+      mkdir -p "$STATE_DIR" "$DATA_DIR"
+      cat >"$CONFIG" <<EOF
 [server]
 listen = "127.0.0.1:$PORT"
 region = "us-east-1"
@@ -81,7 +111,7 @@ profile = "multipart"
 
 [[credentials]]
 access_key_id = "$ACCESS_KEY"
-secret_ref = "env:ALLINS3_FS_SECRET"
+secret_ref = "env:ALLINS3_SECRET"
 principal = "example-user"
 
 [[grants]]
@@ -93,6 +123,89 @@ prefix = ""
 [limits]
 multipart_sweep_interval_secs = 30
 EOF
+      ;;
+    yun139)
+      [ -n "$FOLDER" ] || {
+        echo "yun139: ALLINS3_YUN139_FOLDER_ID is required" >&2
+        return 1
+      }
+      local phone token
+      phone="$(session_field phone)" || return 1
+      token="$(session_field auth_token)" || return 1
+      # TOML literal strings cannot represent a single quote; refuse rather
+      # than silently write a config that will not parse.
+      reject_quote "$phone" phone || return 1
+      reject_quote "$token" auth_token || return 1
+      reject_quote "$FOLDER" folder_id || return 1
+      mkdir -p "$INSTANCE_DIR"
+      cat >"$CONFIG" <<EOF
+[server]
+listen = "127.0.0.1:$PORT"
+region = "us-east-1"
+addressing = "path"
+development = false
+health_endpoints = true
+
+[[drivers]]
+id = "instance-yun139"
+kind = "yun139"
+options = { phone = '$phone', auth_token = '$token', folder_id = '$FOLDER' }
+
+[[buckets]]
+name = "$BUCKET"
+driver = "instance-yun139"
+namespace = "yun139"
+profile = "core-read"
+readonly = true
+
+[[credentials]]
+access_key_id = "$ACCESS_KEY"
+secret_ref = "env:ALLINS3_SECRET"
+principal = "example-user"
+
+[[grants]]
+principal = "example-user"
+bucket = "$BUCKET"
+actions = ["list", "read"]
+prefix = ""
+
+[limits]
+multipart_sweep_interval_secs = 0
+EOF
+      ;;
+    *)
+      echo "unknown ALLINS3_DRIVER: $DRIVER (expected fs or yun139)" >&2
+      return 2
+      ;;
+  esac
+}
+
+# Reads one field from the JSON session file without ever echoing the whole
+# file; the value goes to stdout for the caller to place in the config.
+session_field() {
+  if [ ! -f "$SESSION_FILE" ]; then
+    echo "yun139: session file not found: $SESSION_FILE" >&2
+    return 1
+  fi
+  "$PYTHON" - "$SESSION_FILE" "$1" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+value = data.get(sys.argv[2])
+if not value:
+    print(f"yun139: session file has no `{sys.argv[2]}`", file=sys.stderr)
+    raise SystemExit(1)
+print(value)
+PY
+}
+
+reject_quote() {
+  case "$1" in
+    *"'"*)
+      echo "yun139: $2 must not contain a single quote (TOML literal string)" >&2
+      return 1
+      ;;
+  esac
 }
 
 ready() {
@@ -107,9 +220,13 @@ cmd_start() {
     echo "already running (pid $(cat "$PIDFILE")) on $ENDPOINT"
     return 0
   fi
-  if [ ! -x "$BIN" ]; then
+  if [ -z "$BIN_PROVIDED" ]; then
     echo "building $BIN"
-    (cd "$ROOT" && cargo build --quiet) || return 1
+    if [ "$DRIVER" = yun139 ]; then
+      (cd "$ROOT" && cargo build --quiet --features yun139) || return 1
+    else
+      (cd "$ROOT" && cargo build --quiet) || return 1
+    fi
   fi
   write_config
   rm -f "$LOG"
@@ -119,6 +236,7 @@ cmd_start() {
 import os, subprocess, sys
 binary, config, log, pidfile, binfile, secret = sys.argv[1:7]
 env = dict(os.environ)
+env["ALLINS3_SECRET"] = secret
 env["ALLINS3_FS_SECRET"] = secret
 with open(log, "ab") as out:
     proc = subprocess.Popen(
@@ -179,10 +297,15 @@ cmd_status() {
     echo "pid:      not running"
     return 1
   fi
+  echo "driver:   $DRIVER"
   echo "endpoint: $ENDPOINT"
   echo "log:      $LOG"
-  echo "data:     $DATA_DIR"
-  echo "state:    $STATE_DIR"
+  if [ "$DRIVER" = fs ]; then
+    echo "data:     $DATA_DIR"
+    echo "state:    $STATE_DIR"
+  else
+    echo "folder:   $FOLDER"
+  fi
   if ready; then echo "readyz:   200"; else echo "readyz:   unreachable"; fi
 }
 
@@ -191,9 +314,10 @@ cmd_env() {
 
 --- connection info -------------------------------------------------
 endpoint:   $ENDPOINT
+driver:     $DRIVER
 bucket:     $BUCKET
 access key: $ACCESS_KEY
-secret key: (env:ALLINS3_FS_SECRET, value "$SECRET")
+secret key: (env:ALLINS3_SECRET, value "$SECRET")
 
 export AWS_ACCESS_KEY_ID=$ACCESS_KEY
 export AWS_SECRET_ACCESS_KEY=$SECRET

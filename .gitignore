@@ -1,6 +1,10 @@
 target/
 spikes/protocol-adapter/target/
 
+# A real 139 cloud-drive session belongs in a local file beside the placeholder
+# example, never in a tracked one.
+examples/yun139-local.toml
+
 # Local Python environment used only by scripts/e2e_boto3.py
 .venv/
 __pycache__/

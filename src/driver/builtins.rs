@@ -47,6 +47,19 @@ pub(crate) fn builtins() -> Vec<Builtin> {
         ctor: |kind| Arc::new(crate::drivers::fs::FsDriverFactory::new(kind)),
     }];
 
+    // A real backend, but read-only: registered in every build that enables the
+    // feature, and `test: false` so `check-config` admits it in production (a
+    // writable bucket on it is refused by the profile check, not by the test
+    // flag). See ADR-0017.
+    #[cfg(feature = "yun139")]
+    {
+        table.push(Builtin {
+            name: crate::drivers::yun139::KIND,
+            test: false,
+            ctor: |kind| Arc::new(crate::drivers::yun139::Yun139DriverFactory::new(kind)),
+        });
+    }
+
     #[cfg(feature = "testing")]
     {
         table.push(Builtin {

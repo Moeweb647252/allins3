@@ -20,6 +20,7 @@
 | secret reference（`secret_refs`） | 每实例可解析的密钥引用（如 `env:NAME`）；核心只证明可解析，值从不进日志 | ADR-0012 · spec §7.1 |
 | blocking executor | 组合根独占的受限阻塞执行器；同步后端在此跑阻塞 I/O，不占用运行时工作线程 | ADR-0012 · spec §10 |
 | filesystem driver（`fs`） | 第一个真实（跨重启）后端，kind `fs`，在每个构建中注册 | ADR-0015 |
+| yun139 driver（`yun139`） | 只读的 139 云盘后端，kind `yun139`，在 `yun139` feature 下注册；凭据在 `options` 里 | ADR-0017 |
 | single-node persistence claim | `fs` 的持久性声明边界：单节点、磁盘即持久域、本进程为唯一写入者 | ADR-0015 · spec §5.2 |
 
 ## 模块与接缝
@@ -99,7 +100,7 @@
 
 ### Drivers（具体后端）
 
-- **持有**：每个真实后端的状态。当前只有 `drivers::fs`。
+- **持有**：每个真实后端的状态（`drivers::fs` 与 feature 下的 `drivers::yun139`）。
 - **接口**：实现 `driver` 的接口，并在 `driver::builtins` 注册一条 `Builtin`（`test: false`）；新增后端不改协议层或服务层（`INV-01`）。
 - **不负责**：S3 语义、能力规划、路由——那些归服务层；后端只声明能力并实现契约。
 - **理由**：真实后端必须能独立演进与单独验证（契约 harness）；放在 `drivers` 而非 `testing` 是为了区分「生产后端」与「测试替身」。
