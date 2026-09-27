@@ -1,7 +1,8 @@
 //! HTTP server and process lifecycle.
 //!
 //! Startup order: parse/validate config → build driver instances → open and
-//! capability-check namespaces → readiness → accept traffic. Shutdown stops
+//! capability-check namespaces → recover state and clean up → readiness →
+//! accept traffic. Shutdown stops
 //! accepting, waits for in-flight requests up to a deadline, closes every
 //! driver instance, then exits (spec §7.2).
 //!
@@ -87,15 +88,35 @@ pub async fn run(config: AppConfig) -> Result<(), String> {
         }
     }
 
-    let service = compose::object_service(
+    // `object_service_with_state` ends with recovery, so this returning is what
+    // "recovered" means: the readiness flag below is only ever set after it, so
+    // a replica never serves traffic before it has reconciled what its
+    // predecessor left behind (`ADR-0013`).
+    let service = compose::object_service_with_state(
         config.catalog.clone(),
         instances,
         config.limits.clone(),
         config.access.clone(),
         !config.development,
+        config.state_dir.clone(),
     )
     .await
     .map_err(|e| format!("startup capability check failed: {e}"))?;
+
+    // Report what recovery restored and reconciled. A non-zero `pending` is the
+    // one an operator must act on: an upload whose completion outcome could not
+    // be proven is retained, never replayed.
+    if let Some(report) = service.recovery_report() {
+        log(&format!(
+            "multipart recovery: sessions={} parts={} committed={} retryable={} pending={} reclaimed={}",
+            report.sessions_restored,
+            report.parts_restored,
+            report.committed,
+            report.retryable,
+            report.pending,
+            report.reclaimed_uploads,
+        ));
+    }
 
     let ready = Arc::new(AtomicBool::new(true));
     let credentials = Arc::new(config.credentials.clone());

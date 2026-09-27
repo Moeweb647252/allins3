@@ -530,7 +530,10 @@ async fn an_unresolvable_commit_outcome_blocks_replay_and_is_never_swept() {
         Arc::new(ReferenceDriverFactory::new("reference")),
         FaultPlan {
             hide_recovery: true,
-            commit: allins3::testing::fault::CommitFault::LostAck,
+            // The attempt is fenced before it can publish and the namespace
+            // cannot answer recovery queries, so nothing — not the record, not
+            // the target object — can prove the outcome either way.
+            commit: allins3::testing::fault::CommitFault::FencedBeforePublish,
             ..FaultPlan::none()
         },
     ));
@@ -556,6 +559,11 @@ async fn an_unresolvable_commit_outcome_blocks_replay_and_is_never_swept() {
     assert_eq!(
         service.latest_completion_state(&upload_id),
         Some(CommitState::Unknown)
+    );
+    assert_eq!(
+        service.pending_completions().len(),
+        1,
+        "an unresolvable attempt is listed as pending"
     );
 
     // The unresolved attempt must not be replayed...
@@ -1973,4 +1981,361 @@ async fn a_zero_part_marker_is_accepted_on_both_routes() {
         assert_eq!(page.parts.len(), 1, "{page:?}");
         assert_eq!(page.parts[0].number, 2);
     }
+}
+
+// --- Durable state across a restart (ADR-0013, ADR-0014) --------------------
+
+/// A fresh directory for the coordinator's durable state.
+///
+/// Unique per call, so two tests cannot share (or clean up) each other's state.
+fn state_dir(tag: &str) -> std::path::PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "allins3-multipart-{tag}-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("state dir");
+    dir
+}
+
+/// A service whose coordinator persists under `dir`.
+///
+/// Building it twice over one directory with fresh driver instances is the
+/// in-process shape of a restart: the driver's state is rebuilt, the
+/// coordinator's is not.
+async fn service_with_state(
+    factory: Arc<dyn DriverFactory>,
+    dir: std::path::PathBuf,
+) -> ObjectService {
+    fixture::service_with_state_dir(
+        vec![(DRIVER, factory)],
+        vec![BucketSpec {
+            bucket: BUCKET,
+            driver: DRIVER,
+            namespace: "ns-a",
+            profile: Profile::CoreWrite,
+        }],
+        fixture::default_limits(),
+        fixture::full_access(),
+        dir,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_acknowledged_part_survives_a_restart_and_can_be_completed() {
+    let dir = state_dir("survive");
+    let factory = Arc::new(ReferenceDriverFactory::new("reference"));
+    let key = object_key("restart/mpu.bin");
+
+    let first = service_with_state(factory.clone(), dir.clone()).await;
+    let upload_id = start_upload(&first, &key).await;
+    let etag = upload_part(&first, &key, &upload_id, 1, b"hello restart").await;
+    drop(first);
+
+    let second = service_with_state(factory, dir.clone()).await;
+    // The upload and the part the client was told about are still there.
+    let page = second
+        .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+        .await
+        .expect("the upload survives the restart");
+    assert_eq!(page.parts.len(), 1, "{page:?}");
+    assert_eq!(page.parts[0].etag, etag);
+
+    let manifest = [(1u16, Some(etag))];
+    let meta = second
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            &key,
+            &upload_id,
+            &manifest,
+            None,
+            Preconditions::none(),
+        )
+        .await
+        .expect("complete after a restart");
+    assert_eq!(meta.size, 13);
+    assert_eq!(read_object(&second, &key).await, b"hello restart");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn an_aborted_upload_is_gone_after_a_restart() {
+    let dir = state_dir("aborted");
+    let factory = Arc::new(ReferenceDriverFactory::new("reference"));
+    let key = object_key("restart/aborted.bin");
+
+    let first = service_with_state(factory.clone(), dir.clone()).await;
+    let upload_id = start_upload(&first, &key).await;
+    upload_part(&first, &key, &upload_id, 1, b"part").await;
+    first
+        .abort_multipart(&ctx(), BUCKET, &key, &upload_id)
+        .await
+        .expect("abort");
+    drop(first);
+
+    let second = service_with_state(factory, dir.clone()).await;
+    assert!(
+        second
+            .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+            .await
+            .is_err(),
+        "an aborted upload must not come back after a restart"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn an_interrupted_completion_is_reconciled_but_never_replayed() {
+    let dir = state_dir("interrupted");
+    let key = object_key("restart/interrupted.bin");
+    // The commit loses its acknowledgement and the namespace cannot answer
+    // recovery queries, so the outcome can never be proven either way — the
+    // window startup reconciliation exists for.
+    let plan = FaultPlan {
+        commit: allins3::testing::fault::CommitFault::LostAck,
+        hide_recovery: true,
+        ..FaultPlan::default()
+    };
+    let factory = Arc::new(FaultDriverFactory::new(
+        Arc::new(ReferenceDriverFactory::new("reference")),
+        plan,
+    ));
+
+    let first = service_with_state(factory.clone(), dir.clone()).await;
+    let upload_id = start_upload(&first, &key).await;
+    let etag = upload_part(&first, &key, &upload_id, 1, b"maybe published").await;
+    assert!(
+        first
+            .complete_multipart(
+                &ctx(),
+                BUCKET,
+                &key,
+                &upload_id,
+                &[(1u16, Some(etag))],
+                None,
+                Preconditions::none()
+            )
+            .await
+            .is_err()
+    );
+    drop(first);
+
+    let second = service_with_state(factory, dir.clone()).await;
+    let report = second.recovery_report().expect("recovery ran at startup");
+    assert_eq!(
+        report.pending, 1,
+        "an unresolved attempt is retained, not replayed: {report:?}"
+    );
+    // The upload is still visible to its client...
+    assert!(
+        second
+            .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+            .await
+            .is_ok()
+    );
+    // ...but a second completion must never publish over it.
+    assert!(
+        second
+            .complete_multipart(
+                &ctx(),
+                BUCKET,
+                &key,
+                &upload_id,
+                &[(1u16, None)],
+                None,
+                Preconditions::none()
+            )
+            .await
+            .is_err(),
+        "an unresolved attempt must never be replayed"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// --- Resolving pending completions online (ADR-0016) -----------------------
+
+/// Completes `upload_id` with the single-part manifest naming `etag`.
+async fn complete(
+    service: &ObjectService,
+    key: &ObjectKey,
+    upload_id: &str,
+    etag: EntityTag,
+) -> Result<allins3::domain::ObjectMetadata, ServiceError> {
+    service
+        .complete_multipart(
+            &ctx(),
+            BUCKET,
+            key,
+            upload_id,
+            &[(1u16, Some(etag))],
+            None,
+            Preconditions::none(),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn a_retry_resolves_a_pending_completion_the_backend_now_proves_published() {
+    let dir = state_dir("resolve-committed");
+    let key = object_key("resolve/committed.bin");
+    // The commit publishes but loses its reply, and the recovery record is not
+    // yet readable — the window startup reconciliation exists for, here applied
+    // while the process keeps running.
+    let plan = FaultPlan {
+        commit: allins3::testing::fault::CommitFault::LostAck,
+        recovery_unknown_once: true,
+        ..FaultPlan::default()
+    };
+    let factory = Arc::new(FaultDriverFactory::new(
+        Arc::new(ReferenceDriverFactory::new("reference")),
+        plan,
+    ));
+    let service = service_with_state(factory, dir.clone()).await;
+
+    let upload_id = start_upload(&service, &key).await;
+    let etag = upload_part(&service, &key, &upload_id, 1, b"published once").await;
+    assert!(
+        complete(&service, &key, &upload_id, etag.clone())
+            .await
+            .is_err(),
+        "the first completion loses its reply"
+    );
+    let pending = service.pending_completions();
+    assert_eq!(pending.len(), 1, "the attempt stays pending: {pending:?}");
+    assert!(
+        pending[0].write_id.is_some(),
+        "a pending attempt holds a claim"
+    );
+
+    // The retry re-reads the record, which now proves publication.
+    let meta = complete(&service, &key, &upload_id, etag)
+        .await
+        .expect("the retry resolves the published attempt");
+    assert_eq!(meta.size, 14);
+    assert_eq!(read_object(&service, &key).await, b"published once");
+    assert!(
+        service.pending_completions().is_empty(),
+        "a resolved attempt is no longer pending"
+    );
+    // The upload is retired; the retry was not a second publish.
+    assert!(
+        service
+            .list_parts(&ctx(), BUCKET, &key, &upload_id, None, 100)
+            .await
+            .is_err()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A retry releases a claim the backend now proves never published, so the
+/// replacement attempt actually runs.
+#[tokio::test]
+async fn a_retry_releases_a_claim_the_backend_now_proves_not_published() {
+    let dir = state_dir("resolve-retryable");
+    let key = object_key("resolve/retryable.bin");
+    let plan = FaultPlan {
+        commit: allins3::testing::fault::CommitFault::FencedBeforePublish,
+        recovery_unknown_once: true,
+        ..FaultPlan::default()
+    };
+    let factory = Arc::new(FaultDriverFactory::new(
+        Arc::new(ReferenceDriverFactory::new("reference")),
+        plan,
+    ));
+    let service = service_with_state(factory, dir.clone()).await;
+
+    let upload_id = start_upload(&service, &key).await;
+    let etag = upload_part(&service, &key, &upload_id, 1, b"retry me").await;
+    assert!(
+        complete(&service, &key, &upload_id, etag.clone())
+            .await
+            .is_err(),
+        "the first attempt is fenced"
+    );
+    assert_eq!(service.pending_completions().len(), 1);
+
+    // The record now proves the attempt never published; the claim is released
+    // and this attempt publishes.
+    let meta = complete(&service, &key, &upload_id, etag)
+        .await
+        .expect("the released claim lets the retry publish");
+    assert_eq!(meta.size, 8);
+    assert_eq!(read_object(&service, &key).await, b"retry me");
+    assert!(service.pending_completions().is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn a_retry_resolves_a_pending_completion_by_matching_the_published_object() {
+    let dir = state_dir("resolve-safe-read");
+    let key = object_key("resolve/safe.bin");
+    // The commit publishes but loses its reply, and the namespace cannot answer
+    // recovery queries at all — so the object's own ETag is the only proof.
+    let plan = FaultPlan {
+        commit: allins3::testing::fault::CommitFault::LostAck,
+        hide_recovery: true,
+        ..FaultPlan::default()
+    };
+    let factory = Arc::new(FaultDriverFactory::new(
+        Arc::new(ReferenceDriverFactory::new("reference")),
+        plan,
+    ));
+    let service = service_with_state(factory, dir.clone()).await;
+
+    let upload_id = start_upload(&service, &key).await;
+    let etag = upload_part(&service, &key, &upload_id, 1, b"safe read").await;
+    assert!(
+        complete(&service, &key, &upload_id, etag.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(service.pending_completions().len(), 1);
+
+    let meta = complete(&service, &key, &upload_id, etag)
+        .await
+        .expect("the published object's ETag proves publication");
+    assert_eq!(meta.size, 9);
+    assert_eq!(read_object(&service, &key).await, b"safe read");
+    assert!(service.pending_completions().is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The staging sweep resolves pending completions too, so an attempt whose
+/// backend record becomes definitive is settled without any client action.
+#[tokio::test]
+async fn the_sweeper_resolves_a_pending_completion_once_the_backend_can_answer() {
+    let dir = state_dir("resolve-sweep");
+    let key = object_key("resolve/sweep.bin");
+    let plan = FaultPlan {
+        commit: allins3::testing::fault::CommitFault::LostAck,
+        recovery_unknown_once: true,
+        ..FaultPlan::default()
+    };
+    let factory = Arc::new(FaultDriverFactory::new(
+        Arc::new(ReferenceDriverFactory::new("reference")),
+        plan,
+    ));
+    let service = service_with_state(factory, dir.clone()).await;
+
+    let upload_id = start_upload(&service, &key).await;
+    let etag = upload_part(&service, &key, &upload_id, 1, b"swept").await;
+    assert!(complete(&service, &key, &upload_id, etag).await.is_err());
+    assert_eq!(service.pending_completions().len(), 1);
+
+    // A sweep re-reads the record, which now proves publication.
+    service
+        .sweep_expired_uploads(&ctx(), Duration::from_secs(3600))
+        .await;
+    assert!(
+        service.pending_completions().is_empty(),
+        "the sweep resolved the attempt"
+    );
+    assert_eq!(read_object(&service, &key).await, b"swept");
+    std::fs::remove_dir_all(&dir).ok();
 }

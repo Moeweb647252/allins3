@@ -264,6 +264,9 @@ struct ServiceInner {
     admission: Admission,
     access: AccessPolicy,
     multipart: multipart::Multipart,
+    /// Set once, by startup recovery. Read by the process that owns the log,
+    /// which is where the report belongs.
+    recovery: std::sync::OnceLock<multipart::RecoveryReport>,
 }
 
 /// The object service.
@@ -279,12 +282,16 @@ impl ObjectService {
     /// (`development = false`). It is a policy the service must apply at the
     /// moment it opens a namespace, because only the opened namespace knows
     /// whether it can back persistent writes (ADR-0006 §4).
-    pub fn new(
+    /// `durable` is the multipart coordinator's store: the deployment supplies
+    /// a durable one when it configured `state_dir`, and the in-memory one
+    /// otherwise (`ADR-0014`).
+    pub(crate) fn new(
         catalog: BucketCatalog,
         drivers: HashMap<String, std::sync::Arc<dyn StorageDriver>>,
         limits: crate::config::Limits,
         access: AccessPolicy,
         production: bool,
+        durable: std::sync::Arc<dyn multipart::MultipartStore>,
     ) -> Self {
         let staging_quota = limits.staging_quota_bytes;
         let token_ttl = limits.list_token_ttl;
@@ -302,9 +309,15 @@ impl ObjectService {
                 tokens: TokenStore::new(token_ttl),
                 admission,
                 access,
-                multipart: multipart::Multipart::new(staging_quota),
+                multipart: multipart::Multipart::new(staging_quota, durable),
+                recovery: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// What startup recovery restored and reconciled, once it has run.
+    pub fn recovery_report(&self) -> Option<multipart::RecoveryReport> {
+        self.inner.recovery.get().copied()
     }
 
     /// The limits.

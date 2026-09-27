@@ -109,21 +109,23 @@ pub async fn two_services_over_shared_drivers(
         region: "us-east-1".into(),
     };
 
-    let first = crate::compose::object_service(
+    let first = crate::compose::object_service_with_state(
         BucketCatalog::from_bindings(vec![binding()]).expect("catalog"),
         drivers.clone(),
         limits.clone(),
         access.clone(),
         false,
+        None,
     )
     .await
     .expect("warmup");
-    let second = crate::compose::object_service(
+    let second = crate::compose::object_service_with_state(
         BucketCatalog::from_bindings(vec![binding()]).expect("catalog"),
         drivers,
         limits,
         access,
         false,
+        None,
     )
     .await
     .expect("warmup");
@@ -170,7 +172,109 @@ pub async fn service(
     let catalog = BucketCatalog::from_bindings(bindings).expect("catalog");
     // Test drivers are volatile and registered only in a development build, so
     // the fixture is always a development deployment.
-    crate::compose::object_service(catalog, drivers, limits, access, false)
+    crate::compose::object_service_with_state(catalog, drivers, limits, access, false, None)
+        .await
+        .expect("warmup")
+}
+
+/// Builds an `ObjectService` whose multipart coordinator persists under
+/// `state_dir`.
+///
+/// Calling this twice with the same directory and fresh driver instances is the
+/// in-process shape of a restart: the drivers' state is rebuilt, the
+/// coordinator's is not. It is not a substitute for a real process crash — the
+/// driver side is still in memory — which is why the operator manual's crash
+/// evidence comes from `scripts/e2e_fs.sh` instead (`ADR-0013`).
+pub async fn service_with_state_dir(
+    factories: Vec<(&str, Arc<dyn DriverFactory>)>,
+    buckets: Vec<BucketSpec<'_>>,
+    limits: Limits,
+    access: AccessPolicy,
+    state_dir: std::path::PathBuf,
+) -> ObjectService {
+    let mut drivers: HashMap<String, Arc<dyn StorageDriver>> = HashMap::new();
+    for (id, factory) in factories {
+        let instance = crate::compose::instance_from_factory(
+            factory,
+            id,
+            toml::Table::new(),
+            &ctx("fixture"),
+            &NoSecrets,
+        )
+        .await
+        .expect("create instance");
+        drivers.insert(id.to_string(), instance);
+    }
+
+    let bindings = buckets
+        .into_iter()
+        .map(|spec| BucketBinding {
+            bucket: BucketId::parse(spec.bucket).expect("bucket id"),
+            driver: DriverInstanceId::parse(spec.driver).expect("instance id"),
+            namespace: NamespaceId::parse(spec.namespace).expect("namespace"),
+            generation: 1,
+            profile: spec.profile,
+            readonly: false,
+            region: "us-east-1".into(),
+        })
+        .collect::<Vec<_>>();
+
+    let catalog = BucketCatalog::from_bindings(bindings).expect("catalog");
+    crate::compose::object_service_with_state(
+        catalog,
+        drivers,
+        limits,
+        access,
+        false,
+        Some(state_dir),
+    )
+    .await
+    .expect("warmup + recovery")
+}
+
+/// Builds an `ObjectService` from drivers that need per-instance private
+/// options (the real filesystem backend, for instance) and an explicit
+/// deployment mode.
+///
+/// `factories` maps a driver instance id to its factory and its opaque options
+/// table, so a test can drive a production-admitted backend through the same
+/// service the server runs.
+pub async fn service_configured(
+    factories: Vec<(&str, Arc<dyn DriverFactory>, toml::Table)>,
+    buckets: Vec<BucketSpec<'_>>,
+    limits: Limits,
+    access: AccessPolicy,
+    production: bool,
+) -> ObjectService {
+    let mut drivers: HashMap<String, Arc<dyn StorageDriver>> = HashMap::new();
+    for (id, factory, options) in factories {
+        let instance = crate::compose::instance_from_factory(
+            factory,
+            id,
+            options,
+            &ctx("fixture"),
+            &NoSecrets,
+        )
+        .await
+        .expect("create instance");
+        drivers.insert(id.to_string(), instance);
+    }
+
+    let bindings = buckets
+        .into_iter()
+        .map(|spec| BucketBinding {
+            bucket: BucketId::parse(spec.bucket).expect("bucket id"),
+            driver: DriverInstanceId::parse(spec.driver).expect("instance id"),
+            namespace: NamespaceId::parse(spec.namespace).expect("namespace"),
+            generation: 1,
+            profile: spec.profile,
+            readonly: false,
+            region: "us-east-1".into(),
+        })
+        .collect::<Vec<_>>();
+
+    let catalog = BucketCatalog::from_bindings(bindings).expect("catalog");
+    crate::compose::object_service_with_state(catalog, drivers, limits, access, production, None)
         .await
         .expect("warmup")
 }

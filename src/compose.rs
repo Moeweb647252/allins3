@@ -189,23 +189,43 @@ pub async fn instance_from_factory(
         .map_err(|e| format!("failed to create driver `{id}`: {e}"))
 }
 
-/// Builds the object service over prepared instances and capability-checks
-/// every namespace before it can serve.
+/// Builds the object service over prepared instances, capability-checks every
+/// namespace and recovers the multipart coordinator's state before it can
+/// serve.
 ///
 /// Readiness is part of composition, not an optional follow-up: a service that
-/// has not been checked must not be handed to a listener, so the check happens
-/// here rather than at each call site. `production` comes from the resolved
-/// configuration and tightens that check for writable bindings, so the caller
-/// cannot forget to pass the deployment mode along with the limits.
-pub async fn object_service(
+/// has not been checked and reconciled must not be handed to a listener, so
+/// both happen here rather than at each call site. `production` comes from the
+/// resolved configuration and tightens the namespace check for writable
+/// bindings, so the caller cannot forget to pass the deployment mode along with
+/// the limits. `state_dir` roots the coordinator's durable store, or leaves it
+/// in memory when `None`.
+///
+/// The startup sequence ends with recovery: opening and capability-checking
+/// every namespace is not enough, because a replica that has not reconciled
+/// what its predecessor left behind must not serve. Recovery runs here — so a
+/// caller holding the returned service already has a recovered one, and
+/// readiness can only ever be granted downstream of it (`ADR-0013`).
+pub async fn object_service_with_state(
     catalog: BucketCatalog,
     instances: HashMap<String, Arc<dyn StorageDriver>>,
     limits: Limits,
     access: AccessPolicy,
     production: bool,
+    state_dir: Option<std::path::PathBuf>,
 ) -> Result<ObjectService, ServiceError> {
-    let service = ObjectService::new(catalog, instances, limits, access, production);
+    let service = ObjectService::new(
+        catalog,
+        instances,
+        limits.clone(),
+        access,
+        production,
+        crate::service::multipart::store_for(state_dir),
+    );
     service.warmup(&startup_ctx()).await?;
+    service
+        .recover(&startup_ctx(), limits.multipart_lease)
+        .await?;
     Ok(service)
 }
 
