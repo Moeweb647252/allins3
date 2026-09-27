@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-状态：生效中。对应任务 P0-06。更新日期：2026-09-25。
+状态：生效中。对应任务 P0-06。更新日期：2026-09-26。
 
 | 编号 | 标题 | 状态 |
 | --- | --- | --- |
@@ -15,5 +15,10 @@
 | [0009](0009-service-decomposition-followups.md) | 对象服务拆分的两项后续：组合根与暂存账本 | Accepted |
 | [0010](0010-capability-plan-drives-routing.md) | 能力规划驱动路由，并接入原生 multipart | Accepted |
 | [0011](0011-driver-registration-and-native-route-coverage.md) | driver 注册以数据表表达，原生路由跨 HTTP 验证，双 feature 构建门 | Accepted |
+| [0012](0012-per-instance-driver-configuration.md) | 每实例 driver 配置与受限阻塞执行器的所有权 | Accepted |
+| [0013](0013-startup-recovery-and-readiness.md) | 启动恢复与 readiness 的顺序 | Accepted |
+| [0014](0014-durable-multipart-coordinator-state.md) | multipart 协调器的 session/staging 持久化 | Accepted（取代 P4-01 偏离） |
+| [0015](0015-local-filesystem-production-driver.md) | 本地文件系统作为第一个生产 driver | Accepted |
+| [0016](0016-online-pending-completion-resolution.md) | 未决完成的在线解决 | Accepted |
 
 格式：每条 ADR 记录背景、决策、后果与替代方案。修改已接受决策需新增 ADR 并在旧条目标注 Superseded。

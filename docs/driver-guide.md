@@ -32,6 +32,24 @@ table.push(Builtin {
 - 构造函数收到配置里的 kind 字符串，不要在同一处再硬写一遍。
 - 若 driver 在独立 feature 下，用 `#[cfg(feature = "...")]` 包住表项；表为空时默认构建仍然干净（ADR-0011）。
 - `test` 标记（不是名字前缀）决定配置校验是否把它当作测试 driver：`test: true` 的 kind 只在 `development = true` 下放行，因此真实后端把 `test` 写 `false` 即可，即便名字碰巧以 `test-` 开头也不会被误判。
+- 真实后端的现成例子见 `src/drivers/fs/`（kind `"fs"`，`test: false`，每个构建均注册）与其配置 `examples/fs-config.toml`。
+
+## 1.6 每实例私有配置（`options`）与 secret 引用
+
+核心不解释你的配置：它把 `[[drivers]]` 里的 `options` 表原样交给工厂（`FactoryConfig::options`），并只证明 `secret_refs` 里的每个引用可解析。因此：
+
+- **私有 schema 由你校验**。在 `DriverFactory::validate` 里解析 `config.options`，对缺失或未知键返回 `DriverError::invalid_argument`。这样 `check-config` 能在启动前拒绝坏配置——它只调 `validate`，不调 `create`，不会创建任何目录或连接。
+- **`validate` 必须无副作用**：不得写用户数据，也不得创建目录（`check-config` 会在只读环境下被调用）。创建连接/目录放到 `create`。
+- **`secret_refs` 是引用，不是值**。用 `config.secret_refs` 与自己 `options` 里的约定决定解析哪个引用（`secrets.resolve(reference)`）；secret 值不得进入日志或错误消息。
+- `src/drivers/fs/mod.rs` 的 `FsOptions::parse` 是一个可参照的最小实现（必填 `root`，拒绝未知键）。
+
+## 1.7 阻塞 I/O
+
+`spec §10` 要求阻塞 I/O 不在异步运行时线程上执行，且必须受限。`FactoryConfig::blocking` 是组合根独占的 `BlockingExecutor`（限额 `limits.max_blocking_operations`，默认 64；`0` 表示不设服务侧上限），按实例交给你：
+
+- 包装**同步 SDK** 的后端，把每次调用放进 `config.blocking.run(|| sdk_call()).await`，不要直接在 async 方法里做阻塞操作。
+- **异步 I/O** 的后端（如 `fs` 使用 `tokio::fs`，其本身即受限阻塞池）可以直接 await；把执行器留给你确实需要同步执行的部分（`fs` 用它做全 namespace 的排序/折叠）。
+- `0` 意味着没有服务侧上限：只在后端自己保证并发受限时才这么配。
 
 ## 2. 能力声明必须与句柄一致
 
@@ -67,6 +85,8 @@ table.push(Builtin {
 
 ## 4. 验证一个 driver
 
+`src/drivers/fs/` 是一个完整、可运行的参照实现（含契约测试 `tests/contract_fs.rs` 与真实进程 E2E `scripts/e2e_fs.sh`），可在写自己的后端前先读一遍。
+
 ```bash
 # 1. 编译期：Arc<dyn Trait> / Box<dyn StagedWrite> / Send future 约束
 cargo check --all-targets --all-features
@@ -89,10 +109,19 @@ python3 scripts/e2e_boto3.py
 
 运行时已就位的部分：生产模式下可写 binding 必须 `is_production_write_capable()`（启动即拒绝）；退出时对每个 driver 实例调用 `StorageDriver::shutdown`（有 bounded deadline，失败只记日志）；`/readyz` 汇总每实例 `health`，任一实例不服务即返回 `503`。
 
-在标记某配置可用于生产前，必须补充：
+本地文件系统 driver（`fs`）已完成的运行时部分：真实（跨重启）对象存储、每实例配置缝、受限阻塞执行器、提交结果记录与围栏、`descriptors()` 暴露每实例身份；证据为 `tests/contract_fs.rs` 与 `scripts/e2e_fs.sh`（含 SIGKILL 重启后读回）。
 
-- [ ] 持久化 metadata / multipart session / staging 的实现，并证明提交与恢复协议在崩溃后仍成立。
-- [ ] 进程崩溃、机器重启、网络分区、空间耗尽、凭据失效、后端限流的实测。
+两个与 driver 直接相关的后端义务：
+
+- **`CommitRecovery` 是可恢复性的前提**：服务层在启动时以及运行期的重试/清扫时用 `query(write_id)` 对账未决的完成尝试（[ADR-0013](adr/0013-startup-recovery-and-readiness.md)、[ADR-0016](adr/0016-online-pending-completion-resolution.md)）。实现了它，一个回复丢失的 `CompleteMultipartUpload` 才能在重启后、或在线上重试时被判定为已发布/可重试；不实现（或对查不到的 id 报错而非 `Unknown`）会让此类 upload 只能靠「对象 ETag 与本次完成一致」这一保守读法判定，否则永远停在「未决」。
+- **`state_dir` 不是 driver 的选项**：协调器的持久状态（session/part/claim/完成记录）属于服务层部署配置（`[server].state_dir`），不由 driver 的私有 `options` 承担，也不应被 driver 读取（[ADR-0014](adr/0014-durable-multipart-coordinator-state.md)）。
+
+在标记某配置可用于生产前，仍必须补充（代码侧已无缺口，以下全部由操作者在真实环境执行并回填证据）：
+
+- [x] 持久化 multipart session / staging，并证明提交与恢复协议在崩溃后成立（[ADR-0014](adr/0014-durable-multipart-coordinator-state.md)；`scripts/e2e_fs.sh` 在收到 `UploadPart` 的 `200` 后 `SIGKILL`，重启后同一 `UploadId` 仍可 `ListParts`/`Complete`）。
+- [x] 启动恢复与 readiness 的顺序：`warmup` 后、监听前按 `CommitRecovery` 对账，失败即拒绝启动（[ADR-0013](adr/0013-startup-recovery-and-readiness.md)）。
+- [x] 未决完成的在线解决：重试 `CompleteMultipartUpload` 与每轮清扫按 `CommitRecovery` 对账未决 claim（[ADR-0016](adr/0016-online-pending-completion-resolution.md)）。
+- [ ] 进程崩溃、机器重启、网络分区、空间耗尽、凭据失效、后端限流的实测（手册见 `docs/operations.md`）。
 - [ ] 索引/元数据与对象内容的备份、恢复与格式升级，不能只备份字节内容。
 - [ ] 真实后端基准（含硬件、网络、并发、对象分布、checksum 与持久性设置）。
 - [ ] 更新兼容矩阵为「已验证」，并写明测得的环境与版本。

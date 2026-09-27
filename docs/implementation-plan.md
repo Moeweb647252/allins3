@@ -1,6 +1,6 @@
 # 多 driver S3 服务器实现计划
 
-状态：P0–P5 已实现（含 P5-05 的性质测试与模糊测试）；P6 由文档自身界定为不在本阶段实施范围，已按下文 P6 一节标记为 not-required。更新日期：2026-09-23。
+状态：P0–P5 已实现（含 P5-05 的性质测试与模糊测试）；P6 进行中——每实例配置缝、受限阻塞执行器、第一个真实后端（`fs`）、持久化协调器状态、启动恢复与未决完成的在线解决均已落地；剩余的是**真实环境准入证据**（崩溃/重启/分区/空间/凭据/限流/备份/基准），由操作者回填（见下文 P6 一节）。更新日期：2026-09-27。
 
 > 进展：服务器可运行（`cargo run --features testing -- examples/dev-config.toml`）。三条真实客户端证据链：
 > ① boto3/botocore **1.42.97** 端到端 **67/67** 项检查（`scripts/e2e_boto3.py`），覆盖 PUT/HEAD/GET/条件/Range/LIST 分页/COPY/批量删除/multipart（含 transfer manager 11 MiB → 3 part 与组合 ETag 独立复算）/UploadPartCopy/abort/预签名 URL 与签名拒绝，以及 multipart 的 FULL_OBJECT、COMPOSITE checksum（用 Python 标库独立复算）与错误 checksum 拒绝；
@@ -116,7 +116,7 @@ P1 模型稳定后，协议适配测试向量与 P2 可独立推进；不应在�
 
 任务：
 
-- [x] P4-01（有意偏离并记录）：`MultipartNamespace` 已作为 driver 扩展契约存在（`src/driver/extensions.rs`），但 `MultipartStore` / `StagingStore` **没有**被引入为 trait。理由：暂存与 multipart session 的状态必须与「单次发布」「竞争仲裁」「完成记录」在同一个临界区内推进，把状态放到 driver 侧会把这些不变量拆到两个进程内；当前由服务层协调器（`src/service/multipart.rs`，`MultipartState` + `std::sync::Mutex`）独占，并通过 `ObjectService` 的公开方法暴露。真实后端的持久化暂存由 P6 的 driver 在其 `StagedWrite`/`MultipartNamespace` 内实现，协调器仍然只通过 driver 接口发布。
+- [x] P4-01（有意偏离并记录；**该偏离已被 [ADR-0014](../docs/adr/0014-durable-multipart-coordinator-state.md) 取代**——生产声明要求 session/staging 持久化，见 P6 剩余工作）：`MultipartNamespace` 已作为 driver 扩展契约存在（`src/driver/extensions.rs`），但 `MultipartStore` / `StagingStore` **没有**被引入为 trait。理由：暂存与 multipart session 的状态必须与「单次发布」「竞争仲裁」「完成记录」在同一个临界区内推进，把状态放到 driver 侧会把这些不变量拆到两个进程内；当前由服务层协调器（`src/service/multipart.rs`，`MultipartState` + `std::sync::Mutex`）独占，并通过 `ObjectService` 的公开方法暴露。真实后端的持久化暂存由 P6 的 driver 在其 `StagedWrite`/`MultipartNamespace` 内实现，协调器仍然只通过 driver 接口发布。
 - [x] P4-02 实现创建、上传、列举 part/upload、完成、终止和 UploadPartCopy。→ 真实 SDK 覆盖全部六个操作。
 - [x] P4-03 实现 CAS 状态机（`claims` 单次完成声明）、上传归属检查（bucket/key/upload id 绑定）、part 原子替换、固定清单与流式合并。→ `tests/service_multipart.rs`。
 - [x] P4-04 part 顺序/大小限制与结果 metadata 已实现（升序、非末 part 至少 5 MiB、part 数上限 10000、完成时发布 `ETag = md5(parts)-N`）；**FULL_OBJECT / COMPOSITE checksum 已实现**：创建时固定 scheme（未指定则按算法族取默认覆盖），每个 part 按其算法计算并存储摘要，完成时 FULL_OBJECT 对装配后字节取摘要、COMPOSITE 对有序 part 原始摘要取摘要（带 `-<partcount>` 线格式），客户端声明的完成 checksum（含 part 清单里的每 part checksum）不匹配一律 `400 BadDigest` 且不发布，非法组合（`CRC64NVME + COMPOSITE`、SHA 族 + FULL_OBJECT）拒绝。→ `src/service/multipart.rs`、`src/protocol/s3/mod.rs`、`tests/service_multipart.rs`（6 个用例）、`scripts/e2e_boto3.py`（FULL_OBJECT 与 COMPOSITE 各用 Python 标库独立复算）。另：完成时只声明 `x-amz-checksum-type`（不带值）是合法请求，按 upload scheme 计算并返回；与 scheme 矛盾（或在无 scheme 的 upload 上单独声明）则 `400 InvalidRequest`，且被拒的完成不消耗 upload。
@@ -150,7 +150,26 @@ P1 模型稳定后，协议适配测试向量与 P2 可独立推进；不应在�
 
 ### P6：真实后端生产准入（后续）
 
-**标记：not-required（不在本实现范围内，不作为待办项）**。依据文档原文：
+**状态：进行中（2026-09-26 起）。** 本节原标为 not-required（不在当时实现范围内）；选定后端并启动 P6 后，其准入项转为待办。
+
+已落地（[ADR-0012](../docs/adr/0012-per-instance-driver-configuration.md)、[ADR-0015](../docs/adr/0015-local-filesystem-production-driver.md)）：
+
+- [x] 每实例 `options`/`secret_refs` 到达工厂；核心不解释私有 schema；`check-config` 在启动前校验（只调 `validate`，无磁盘副作用）。
+- [x] 受限阻塞执行器（`BlockingExecutor`，`limits.max_blocking_operations`），归组合根所有。
+- [x] 选定并实现第一个真实后端：`fs`（本地文件系统），`Persistence::Durable`、`exclusive_writer`、`recovery`，每个构建均注册。
+- [x] `fs` 通过同一契约 harness（`tests/contract_fs.rs`）与真实进程 E2E（`scripts/e2e_fs.sh`，含 SIGKILL 重启后读回）。
+- [x] driver 身份可见：启动日志输出每实例的 kind/name/version（`DriverRegistry::descriptors`）。
+- [x] 持久化 multipart session 与 staging，并证明提交/恢复协议在崩溃后成立（[ADR-0014](../docs/adr/0014-durable-multipart-coordinator-state.md)）：`[server].state_dir` 下的写穿镜像 + 边界 flush，`200` 蕴含已落盘；`scripts/e2e_fs.sh` 在客户端收到 `UploadPart` 的 `200` 后 `SIGKILL`，重启后同一 `UploadId` 仍 `ListParts` 并 `Complete`。
+- [x] 启动恢复与 readiness 的顺序：启动时对未决 `write_id` 按 `CommitRecovery` 对账（`Committed` 不重发、`NotCommittedFinal` 可重试、`InFlight`/`Unknown` 保留不重放），`recover` 在 `warmup` 后、readiness 前执行，失败即拒绝启动（[ADR-0013](../docs/adr/0013-startup-recovery-and-readiness.md)）。
+- [x] 未决完成的在线解决：与启动恢复同源的 `settle_attempt` 挂在重试 `CompleteMultipartUpload` 与每轮清扫上；重试时按后端提交记录把 claim 判定为已发布（`Committed`，或非终态记录下目标对象 ETag 与本次完成一致）或可重试（`NotCommittedFinal`），其余保留且不重放；`ObjectService::pending_completions()` 提供未决只读视图，操作者不再需要手改 `state_dir`（[ADR-0016](../docs/adr/0016-online-pending-completion-resolution.md)）。
+
+仍未完成（不得当作通过）：
+
+- [ ] 进程崩溃、机器重启、网络分区、空间耗尽、凭据失效及后端限流的实测（操作者手册，`docs/operations.md`；仓库提供代码、故障注入与证据回填槽）。
+- [ ] 索引/元数据与对象数据的备份、恢复与格式升级（`state_dir` 自身的备份已入手册，端到端演练未做）。
+- [ ] 真实后端基准与最终兼容报告。
+
+原 not-required 依据（保留以备对照）：
 
 > 本阶段不预先选型，也不是当前文档任务要实施的内容。选择实际后端后，对每个 driver 分别执行：
 
@@ -204,7 +223,7 @@ P1 模型稳定后，协议适配测试向量与 P2 可独立推进；不应在�
 
 P0 与 P1 已按本节的顺序完成（协议风险验证 → 领域类型 / driver API / 能力模型 / 契约测试 → 配置路由 → HTTP），P2–P5 也已落地并以真实 SDK 验证。当前实现顺序与证据：
 
-1. `scripts/check.sh`（唯一入口：fmt、默认与 `--all-features` 两种 feature 的 clippy `-D warnings` 与测试，以及独立的协议 spike `cd spikes/protocol-adapter && cargo test`；CI 调用同一脚本）。当前 132 个单元测试 + 78 个集成测试。
+1. `scripts/check.sh`（唯一入口：fmt、默认与 `--all-features` 两种 feature 的 clippy `-D warnings` 与测试，以及独立的协议 spike `cd spikes/protocol-adapter && cargo test`；CI 调用同一脚本）。当前 165 个单元测试 + 92 个集成测试。
 2. `scripts/fuzz.sh`（P5-05 的三个模糊测试目标，默认每个 20000 轮；`fuzz/` 是独立 workspace，因此根目录的 fmt/clippy/test 不会编译它，必须由本脚本或显式命令执行）。
 3. `cargo run --features testing -- check-config examples/dev-config.toml`（含 kind 注册预检），再启动并用 `scripts/e2e_boto3.py` 跑 67 项真实 SDK 检查。
 4. `scripts/e2e_drain.sh`（P5-03 的排空时序：真实 `SIGINT`/`SIGTERM` × 真实慢速上传，20 项检查；与 `scripts/e2e_cli.sh` 一样自管服务器，因此这两个脚本需串行执行）。

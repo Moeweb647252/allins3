@@ -98,7 +98,7 @@
 - **multipart checksum**：已实现两种模式（见第 3 节）。`ETag` 仍按规范 §5.4 发布 `md5(parts)-N`（与 checksum 是两个独立字段），不随 checksum 模式变化。
 - **checksum trailer 无第三方客户端证据**：CLI/botocore 1.42 对 HTTP endpoint 使用请求头形式的 checksum，不发出 `aws-chunked` trailer，因此该路径只用本仓库手工构造的请求验证（第 2 节）；`mc`/`s3cmd`/`rclone` 未安装、未验证。
 - **排空只在 `SIGINT`/`SIGTERM` 下发生**：其他信号（如 `SIGKILL`）仍由内核直接终止，在途请求不会完成——这与 §7.2 的关闭顺序不矛盾（不可捕获的信号无法排空），但运维上必须以这两个信号停机。
-- **持久性**：`test-reference` / `test-vec` 为内存测试 driver，重启即丢；生产准入（P6）需要真实 driver，见 [driver 接入指南](driver-guide.md)。
+- **持久性**：`test-reference` / `test-vec` / `test-native` 为内存测试 driver，重启即丢。本地文件系统 driver（kind `fs`）是真实后端，对象与提交结果跨进程重启存留。multipart 协调器的 session/part/claim/完成记录也已持久（`[server].state_dir`），且启动时以及运行期的重试/清扫按 `CommitRecovery` 对账未决完成尝试（[ADR-0013](adr/0013-startup-recovery-and-readiness.md)、[ADR-0014](adr/0014-durable-multipart-coordinator-state.md)、[ADR-0016](adr/0016-online-pending-completion-resolution.md)）：`scripts/e2e_fs.sh` 在收到 `UploadPart` 的 `200` 后 `SIGKILL`，重启后用同一 `UploadId` 仍能 `ListParts` 并 `Complete`。**生产声明仍需回填真实环境证据**（崩溃/重启/分区/空间/凭据/限流/基准，见[运维手册](operations.md)），在此之前不得标为可用于生产。`fs` 的声明边界是单节点/磁盘即持久域/唯一写入者（[ADR-0015](adr/0015-local-filesystem-production-driver.md)）。见 [driver 接入指南](driver-guide.md)。
 - 不支持的功能必须明确失败，不得忽略有业务含义的参数后返回成功（`INV-12`）。
 
 ## 6. 验证记录
@@ -123,6 +123,10 @@ bash scripts/e2e_cli.sh                                                        #
 bash scripts/e2e_drain.sh                                                      # 20/20 排空时序（SIGINT/SIGTERM 各两种时序；自行启停服务器）
 .venv/bin/python scripts/e2e_timeouts.py                                       # 21/21 请求边界（§9.3 的 header/body idle/总 deadline；自行启停服务器）
 ALLINS3_BENCH_FULL=1 cargo test --release --all-features --test resource_budget -- --nocapture
+
+# 真实后端（本地文件系统）端到端：生产模式启动，PUT/GET、协调器 multipart，
+# 然后在客户端已被确认的 part 上 SIGKILL 重启，重启后用同一 UploadId 完成（无需 testing feature）
+bash scripts/e2e_fs.sh              # 6/6 checks passed（自行启停服务器）
 
 # 超限对象的状态码（把 max_single_write_size 临时改成 1 MiB 的配置）
 # boto3 put_object 2 MiB → 400 EntityTooLarge「Request body exceeds the configured maximum object size.」；head_object → 404

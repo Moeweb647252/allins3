@@ -427,6 +427,7 @@ listen = "127.0.0.1:9000"
 region = "us-east-1"
 addressing = "path"
 development = true
+state_dir = "/var/lib/allins3-state"
 
 [[drivers]]
 id = "instance-a"
@@ -463,11 +464,17 @@ prefix = ""
 
 `example-b` 未配置授权，默认拒绝。样例不携带真实凭据；生产模式必须拒绝测试 driver/易失状态用于持久写入。
 
-配置还须覆盖每实例 options/secret_refs、每 bucket 扩展、body/metadata/XML 上限、超时、并发、缓冲、暂存配额、日志与指标。未知公共字段、重复 ID、无注册 kind、缺失 secret、无效 bucket 名称、能力不匹配均在启动前失败；`check-config` 以 `server::preflight` 执行同一套启动前校验（含 kind 是否被本构建注册），不打开监听即可失败。配置输出必须脱敏。
+配置还须覆盖每实例 options/secret_refs、每 bucket 扩展、body/metadata/XML 上限、超时、并发、缓冲、暂存配额、日志与指标。未知公共字段、重复 ID、无注册 kind、缺失 secret、无效 bucket 名称、能力不匹配均在启动前失败；`check-config` 以 `server::preflight` 执行同一套启动前校验（含 kind 是否被本构建注册），不打开监听即可失败。
+
+每实例的 `options`（driver 私有 schema）与 `secret_refs` 在启动前到达工厂：核心只证明每个引用可解析并把 `options` 原样传入，私有 schema 的校验由工厂完成（§3.2.5、ADR-0012）。`check-config` 只调用工厂的 `validate`、绝不 `create`，因此校验一个文件不产生任何磁盘副作用（不创建目录、不连接后端）。配置输出必须脱敏。
+
+`state_dir` 是 multipart 协调器的持久状态目录（ADR-0014）：生产模式（`development = false`）且至少一个可写 bucket 时**必填**，缺失即 `ConfigError::StateDirRequired` 在启动前失败；开发模式与全只读部署可省略。它对核心不透明，`check-config` 也不会创建它。
 
 ### 7.2 生命周期
 
 启动顺序：解析配置 → 加载凭据与规则 → 构建 driver 实例 → 打开 namespace → 校验 binding/能力 → 恢复状态与清理任务 → readiness → 接收流量。
+
+前五步与 readiness 由 `compose::object_service_with_state` 一次完成，其中「恢复状态与清理任务」是该函数的最后一步：`warmup` 之后、返回之前执行 `ObjectService::recover`，所以拿到返回值即代表恢复已完成，而 `server::run` 只在它成功返回后才置 readiness 并开始监听——恢复期间根本没有 listener（ADR-0013）。恢复载入协调器的持久 session/part/完成记录/claim 并对每个未决 `write_id` 按 `CommitRecovery` 对账（ADR-0003）：`Committed` 只恢复记录不重发，`NotCommittedFinal` 释放 claim 允许重试，`InFlight`/`Unknown` 保留未决记录且**不重放**；恢复失败或持久记录不可解析均使启动失败（fail closed）。`recover` 结束后跑一次初始清扫，与运行期清扫器共用同一实现。运行期进入未决的完成也可**在线**解决，与启动恢复同源（ADR-0016）：重试 `CompleteMultipartUpload` 会按后端提交记录把 claim 判定为已发布（`Committed`，或非终态记录下目标对象 ETag 与本次完成一致）或可重试（`NotCommittedFinal`），清扫器每轮也先对未决 claim 对账；两者都只读用户对象、从不重放，无法判定则保留。
 
 健康检查分 liveness、进程 readiness、driver/namespace 健康。单个实例故障应隔离其 bucket；readiness 的依赖策略须显式配置，不能把所有 bucket 一律路由到其他 driver。
 
@@ -485,7 +492,9 @@ prefix = ""
 - `StagingStore`：按不透明引用写入/读取/删除 part，声明持久性、配额与可恢复性；暂存内容不在用户 LIST 中出现。
 - 目标 `WriteNamespace`：完整对象的原子发布。
 
-上述接口需要支持清理扫描；具体存储实现不在本次选型范围。生产启用 multipart 时，session 和 part 的持久性必须满足对客户端已确认的 upload/part 可恢复性。
+上述接口需要支持清理扫描。生产启用 multipart 时，session 和 part 的持久性必须满足对客户端已确认的 upload/part 可恢复性。
+
+**已实现的形状**（ADR-0014）：两个接口落为一个 trait `MultipartStore`（单条记录的写穿镜像；CAS 转移、part 清单、marker 列举仍归协调器的临界区），由 `MemoryStore`（开发/测试默认）和 `DiskStore`（`state_dir` 下的文件，`tmp → fsync → rename`）实现。协调器在持锁的同步步骤把变更记入 `PersistOp` 队列，在释放锁之后、写响应之前 `flush_pending()` 落盘，因此 `CreateMultipartUpload`/`UploadPart` 的 `200` 蕴含记录已持久；完成的 `claim` 在提交尝试之前落盘，供启动恢复对账。
 
 session 至少保存 upload_id、owner、bucket、key、binding generation、driver instance、namespace、创建时间、metadata、checksum 方案、状态版本、part 引用与提交尝试的 write_id/CommitState。一次 upload 的每次新提交尝试使用不同的 write_id；旧尝试必须先满足终态要求。upload_id 使用不可预测值，不能是可执行的后端路径；每次操作都检查其绑定和权限。
 
@@ -594,11 +603,11 @@ tests/
 
 测试 driver 放在测试支持模块或显式 development feature 中。后续生产 driver 可以独立 crate，但不得要求核心层反向依赖其 SDK 类型。
 
-公共接口变更必须更新规范、契约测试与所有实现。持久化记录、token、binding 和配置均有 schema/version；不兼容数据必须拒绝启动或执行可验证迁移，不能静默按新格式解释。
+公共接口变更必须更新规范、契约测试与所有实现。持久化记录、token、binding 和配置均有 schema/version；不兼容数据必须拒绝启动或执行可验证迁移，不能静默按新格式解释。`state_dir` 下的持久记录按此要求自带格式：不可解析的记录使启动失败（fail closed），而不是当作缺失。
 
 驱动注册是数据，不是组合根里的 `match`：一个构建能构造哪些 `kind` 由 `driver::builtins` 的表声明，该表同时标记哪些是测试 driver。组合根只查表；配置校验以表的标记判定测试 driver（不再靠 `test-` 名字前缀）；`server::preflight` 让 `check-config` 对未注册 `kind` 在启动前失败。新增一个 driver 即新增一条表项，不改组合根，也不因 feature 组合产生死代码。
 
-面向嵌入者与测试的公共入口保持最小：生产为 `server::run`（前置校验为 `server::preflight`），测试为 `testing::fixture::service` 与 `testing::protocol::ProtocolHarness`（后者提供 `new` 与 `new_native_multipart` 两种 harness），契约 harness 为 `testing::contract::run_contract`。`ReferenceDriverFactory` 提供 `new`、`with_capabilities` 与 `native_multipart` 三种构造，分别对应仅内存、自定义能力与内置 `test-native`。
+面向嵌入者与测试的公共入口保持最小：生产为 `server::run`（前置校验为 `server::preflight`），测试为 `testing::fixture::service`（另有 `service_with_state_dir` 供跨重启用例）与 `testing::protocol::ProtocolHarness`（后者提供 `new` 与 `new_native_multipart` 两种 harness），契约 harness 为 `testing::contract::run_contract`。服务实例暴露 `ObjectService::recovery_report()`，返回启动 `recover` 的 `RecoveryReport`（供进程日志与操作者使用）；协调器状态的持久镜像接口（`MultipartStore` 及其两个实现）保持 `pub(crate)`，不作为嵌入契约。`ReferenceDriverFactory` 提供 `new`、`with_capabilities` 与 `native_multipart` 三种构造，分别对应仅内存、自定义能力与内置 `test-native`。
 
 编码约束：
 

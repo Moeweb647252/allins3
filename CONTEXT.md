@@ -16,6 +16,11 @@
 | commit state | `Committed` / `NotCommittedFinal` / `InFlight` / `Unknown` | ADR-0003 · spec §9.2 |
 | multipart upload / part | 分片上传及其分片；本项目的协调器在服务层 | spec §8 |
 | continuation token | 列举的分页句柄，绑定 bucket、generation、prefix、delimiter、encoding 与鉴权作用域 | spec §4.3 · ADR-0004 |
+| driver config（`options`） | 每实例的 driver 私有配置，核心不解释；工厂自己校验它的 schema | ADR-0012 · spec §3.2.5 |
+| secret reference（`secret_refs`） | 每实例可解析的密钥引用（如 `env:NAME`）；核心只证明可解析，值从不进日志 | ADR-0012 · spec §7.1 |
+| blocking executor | 组合根独占的受限阻塞执行器；同步后端在此跑阻塞 I/O，不占用运行时工作线程 | ADR-0012 · spec §10 |
+| filesystem driver（`fs`） | 第一个真实（跨重启）后端，kind `fs`，在每个构建中注册 | ADR-0015 |
+| single-node persistence claim | `fs` 的持久性声明边界：单节点、磁盘即持久域、本进程为唯一写入者 | ADR-0015 · spec §5.2 |
 
 ## 模块与接缝
 
@@ -61,6 +66,44 @@
 - **接口**：S3 用例（put/get/head/list/copy/delete、multipart 全流程）以及给组合根用的薄委托。
 - **可见性规则**：跨 crate 的集成测试用到的入口保持 `pub`；只被同 crate 的适配层或测试装置调用的入口是 `pub(crate)`。spec §10 要求公共接口变更同步更新规范与契约测试。
 
+### BlockingExecutor（阻塞边界）
+
+- **持有**：一个受限的信号量 + 阻塞池；限额来自 `limits.max_blocking_operations`（`0` 表示不设服务侧上限）。
+- **接口**：`run(closure)`——在阻塞线程上执行并返回结果；`FactoryConfig` 把它交给每个实例。
+- **分享者**：组合根是唯一所有者；driver 与需要 CPU/IO 密集工作的服务路径共享它，而不是各自造线程池（ADR-0012）。
+- **不负责**：异步 I/O 的调度（`tokio::fs` 之类自带受限阻塞池的后端按其声明使用）。
+
+### MultipartStore（协调器状态的持久镜像）
+
+- **持有**：协调器状态（session、已确认 part、claim、完成记录）的持久副本。两个实现：`MemoryStore`（空操作，开发与测试默认）与 `DiskStore`（`state_dir` 下的文件，`tmp → fsync → rename`）。
+- **接口**：单条记录的写穿（`write_session`/`write_part`/`write_claim`/`write_completion` 与对应删除）；CAS 转移、part 清单、marker 列举仍归协调器临界区，不在此接口内。
+- **分享者**：`Multipart` 独占它；协调器在持锁时把变更记为 `PersistOp` 队列，释锁后在 `flush_pending()` 落盘，因此文件 I/O 不在锁内、不在 runtime 线程上无界阻塞。
+- **不负责**：状态机、竞争仲裁（仍归协调器）、driver 的 `CommitRecovery`（那是 driver 的提交记录）。
+- **理由**：生产启用 multipart 时，客户端已确认的 upload/part 必须跨重启可恢复（spec §8.1、`INV-10`），见 [ADR-0014](docs/adr/0014-durable-multipart-coordinator-state.md)。
+
+### 启动恢复（readiness 的前置步骤）
+
+- **持有**：无独立对象；是 `compose::object_service_with_state` 的最后一步（`warmup` 之后、返回之前）调用 `ObjectService::recover`。
+- **接口**：载入持久记录重建协调器状态，并对每个未决 `write_id` 按 driver 的 `CommitRecovery` 对账：`Committed` 只恢复记录、`NotCommittedFinal` 释放 claim 允许重试、`InFlight`/`Unknown` 保留不重放。返回 `RecoveryReport`（存进 `ObjectService::recovery_report`，由 `server::run` 写日志）。
+- **分享者**：`server::run` 只在它成功返回后才置 readiness 并开始监听——恢复期间没有 listener。
+- **不负责**：运行期的清扫与在线对账（由 `server` 拥有的清扫器执行；恢复结束后只跑一次初始清扫）。
+- **理由**：没有它，`INV-09`/`INV-10` 就缺启动侧执行点，见 [ADR-0013](docs/adr/0013-startup-recovery-and-readiness.md)。
+
+### 未决完成的在线解决（运行期对账）
+
+- **持有**：无独立对象；是与启动恢复同源的 `settle_attempt`（`Committed` 退休、`NotCommittedFinal` 释放 claim、其余记录未决），挂在两个运行期入口上：重试 `CompleteMultipartUpload` 时对现有 claim 对账，以及清扫器每轮先对未决 claim 对账。
+- **接口**：`ObjectService::pending_completions()` 只读列出未决；`resolve_pending_claim` 对一条 claim 按 `CommitRecovery`（必要时再比对目标对象 ETag）判定 `Published`/`Retryable`/`Unresolved`。
+- **分享者**：`complete_multipart`（协调器与 native 两路）与 `sweep_expired_uploads`。
+- **不负责**：发布——它只读用户对象，从不重放；无法判定的记录一律保留。
+- **理由**：运行期进入未决的完成不能只等到重启才对账，也不能靠手工改 `state_dir`，见 [ADR-0016](docs/adr/0016-online-pending-completion-resolution.md)。
+
+### Drivers（具体后端）
+
+- **持有**：每个真实后端的状态。当前只有 `drivers::fs`。
+- **接口**：实现 `driver` 的接口，并在 `driver::builtins` 注册一条 `Builtin`（`test: false`）；新增后端不改协议层或服务层（`INV-01`）。
+- **不负责**：S3 语义、能力规划、路由——那些归服务层；后端只声明能力并实现契约。
+- **理由**：真实后端必须能独立演进与单独验证（契约 harness）；放在 `drivers` 而非 `testing` 是为了区分「生产后端」与「测试替身」。
+
 ### Composition（组合根）
 
 - **持有**：启动接线 —— 注册 driver kind、按配置创建实例、建服务并 warmup、把 S3 适配层包在服务外。
@@ -70,7 +113,9 @@
 
 ### 已实现的候选
 
-架构评审提出的三个候选现均已实现：**对象服务拆分**（Admission / NamespaceHandles / TokenStore / Multipart，见 ADR-0008）；ADR-0008 记为“未决”的两项后续 —— **Composition 组合根**（`src/compose.rs`）与 **StagingLedger**（`src/service/staging.rs`）—— 见 [ADR-0009](docs/adr/0009-service-decomposition-followups.md)。能力规划从「只做档位校验」变为**路由的唯一依据**（原生 copy、原生 multipart 或补齐），见 [ADR-0010](docs/adr/0010-capability-plan-drives-routing.md)。driver kind 注册改为数据表、原生 multipart 增加配置入口与 HTTP/SigV4 覆盖、双 feature 构建由 `scripts/check.sh` 与 CI 守住，见 [ADR-0011](docs/adr/0011-driver-registration-and-native-route-coverage.md)。
+架构评审提出的三个候选现均已实现：**对象服务拆分**（Admission / NamespaceHandles / TokenStore / Multipart，见 ADR-0008）；ADR-0008 记为“未决”的两项后续 —— **Composition 组合根**（`src/compose.rs`）与 **StagingLedger**（`src/service/staging.rs`）—— 见 [ADR-0009](docs/adr/0009-service-decomposition-followups.md)。能力规划从「只做档位校验」变为**路由的唯一依据**（原生 copy、原生 multipart 或补齐），见 [ADR-0010](docs/adr/0010-capability-plan-drives-routing.md)。driver kind 注册改为数据表、原生 multipart 增加配置入口与 HTTP/SigV4 覆盖、双 feature 构建由 `scripts/check.sh` 与 CI 守住，见 [ADR-0011](docs/adr/0011-driver-registration-and-native-route-coverage.md)。每实例 driver 配置（`options`/`secret_refs`）到达工厂、受限阻塞执行器归组合根，见 [ADR-0012](docs/adr/0012-per-instance-driver-configuration.md)；本地文件系统成为第一个真实后端，见 [ADR-0015](docs/adr/0015-local-filesystem-production-driver.md)。
+
+multipart 协调器的状态持久化（`state_dir` 下的写穿镜像）与启动恢复/readiness 顺序均已实现，见 [ADR-0014](docs/adr/0014-durable-multipart-coordinator-state.md)（取代 P4-01 的偏离）与 [ADR-0013](docs/adr/0013-startup-recovery-and-readiness.md)。生产准入剩余的是**真实环境证据**（崩溃/重启/分区/空间/凭据/限流/基准），由 [运维手册](docs/operations.md) 的回填槽承担，不是代码侧缺口。
 
 ## 进程级全局状态
 
