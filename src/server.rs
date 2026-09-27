@@ -44,11 +44,13 @@ const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Validation rejects a structurally invalid file, but whether a driver `kind`
 /// exists is a property of the build, not the file: a kind that is not
-/// registered here can never be constructed. `check-config` calls this so an
-/// operator finds that out from the preflight rather than from the listener
-/// failing to bind, which is what spec §7.1 means by failing before startup.
-pub fn preflight(config: &AppConfig) -> Result<(), String> {
-    compose::build_registry(config).map(|_| ())
+/// registered here can never be constructed. Beyond registration, this runs
+/// each factory's `validate`, so a private option a driver rejects is caught
+/// here rather than at `run`. `check-config` calls this so an operator finds
+/// that out from the preflight rather than from the listener failing to bind,
+/// which is what spec §7.1 means by failing before startup.
+pub async fn preflight(config: &AppConfig) -> Result<(), String> {
+    compose::preflight(config, &EnvSecretResolver).await
 }
 
 /// Starts the service and serves until a shutdown signal.
@@ -64,6 +66,26 @@ pub async fn run(config: AppConfig) -> Result<(), String> {
     // through it, and shutdown closes them through the same table, so both see
     // exactly the instances that were created.
     let registry = Arc::new(registry);
+
+    // Make the deployment's identity visible: a driver reports its kind and
+    // version, and this is the one place an operator sees them without reading
+    // the config back. Nothing here is secret.
+    for descriptor in registry.descriptors() {
+        match &descriptor.version {
+            Some(version) => log(&format!(
+                "driver id={} kind={} name=\"{}\" version={version}",
+                descriptor.instance_id.as_str(),
+                descriptor.kind,
+                descriptor.display_name,
+            )),
+            None => log(&format!(
+                "driver id={} kind={} name=\"{}\"",
+                descriptor.instance_id.as_str(),
+                descriptor.kind,
+                descriptor.display_name,
+            )),
+        }
+    }
 
     let service = compose::object_service(
         config.catalog.clone(),

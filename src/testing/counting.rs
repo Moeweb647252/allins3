@@ -19,12 +19,13 @@ use bytes::Bytes;
 
 use crate::domain::{
     BeginWrite, CommitAttributes, DeleteRequest, DeleteResult, DriverContext, DriverError,
-    DriverInstanceId, ListPage, ListRequest, NamespaceId, ObjectKey, ObjectMetadata,
+    ListPage, ListRequest, NamespaceId, ObjectKey, ObjectMetadata,
 };
 use crate::driver::{
     ConditionalSupport, Consistency, DriverDescriptor, DriverFactory, DriverHealth, DriverKind,
-    DriverLimits, NamespaceCapabilities, NamespaceHandle, Persistence, RangeSupport, ReadNamespace,
-    ReadRequest, ReadResult, SecretResolver, StagedWrite, StorageDriver, WriteNamespace,
+    DriverLimits, FactoryConfig, NamespaceCapabilities, NamespaceHandle, Persistence, RangeSupport,
+    ReadNamespace, ReadRequest, ReadResult, SecretResolver, StagedWrite, StorageDriver,
+    WriteNamespace,
 };
 
 use super::reference::{
@@ -95,6 +96,7 @@ impl DriverFactory for CountingDriverFactory {
     async fn validate(
         &self,
         _ctx: &DriverContext,
+        _config: &FactoryConfig,
         _secrets: &dyn SecretResolver,
     ) -> Result<(), DriverError> {
         Ok(())
@@ -103,13 +105,13 @@ impl DriverFactory for CountingDriverFactory {
     async fn create(
         &self,
         _ctx: &DriverContext,
-        instance_id: &DriverInstanceId,
+        config: &FactoryConfig,
         _secrets: &dyn SecretResolver,
     ) -> Result<Arc<dyn StorageDriver>, DriverError> {
         Ok(Arc::new(CountingDriver {
             descriptor: DriverDescriptor {
                 kind: self.kind.clone(),
-                instance_id: instance_id.clone(),
+                instance_id: config.instance_id.clone(),
                 display_name: "counting sink driver".into(),
                 version: Some(env!("CARGO_PKG_VERSION").into()),
             },

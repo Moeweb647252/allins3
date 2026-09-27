@@ -11,8 +11,8 @@ use thiserror::Error;
 
 use crate::domain::{DriverContext, DriverError, DriverInstanceId};
 
-use super::descriptor::{DriverHealth, DriverKind};
-use super::factory::{DriverFactory, SecretResolver};
+use super::descriptor::{DriverDescriptor, DriverHealth, DriverKind};
+use super::factory::{DriverFactory, FactoryConfig, SecretResolver};
 use super::traits::StorageDriver;
 
 /// Registration and creation failures.
@@ -73,14 +73,17 @@ impl DriverRegistry {
     /// Creates and initializes a driver instance for a registered kind.
     ///
     /// The factory's `validate` runs first so a bad configuration fails before
-    /// resources are committed.
+    /// resources are committed, and it receives the same [`FactoryConfig`] the
+    /// create call does — so a factory cannot validate one configuration and be
+    /// created with another.
     pub async fn create_instance(
         &mut self,
         ctx: &DriverContext,
         kind: &DriverKind,
-        instance_id: &DriverInstanceId,
+        config: &FactoryConfig,
         secrets: &dyn SecretResolver,
     ) -> Result<Arc<dyn StorageDriver>, RegistryError> {
+        let instance_id = &config.instance_id;
         if self.instances.contains_key(instance_id) {
             return Err(RegistryError::DuplicateInstance(instance_id.clone()));
         }
@@ -90,15 +93,51 @@ impl DriverRegistry {
             .cloned()
             .ok_or_else(|| RegistryError::UnknownKind(kind.clone()))?;
 
-        factory.validate(ctx, secrets).await?;
-        let driver = factory.create(ctx, instance_id, secrets).await?;
+        factory.validate(ctx, config, secrets).await?;
+        let driver = factory.create(ctx, config, secrets).await?;
         self.instances.insert(instance_id.clone(), driver.clone());
         Ok(driver)
+    }
+
+    /// Runs a factory's `validate` without creating anything.
+    ///
+    /// `check-config` uses this so a private option the driver rejects fails
+    /// the preflight, while nothing is allocated and no directory is created
+    /// as a side effect of checking a file.
+    pub async fn validate_instance(
+        &self,
+        ctx: &DriverContext,
+        kind: &DriverKind,
+        config: &FactoryConfig,
+        secrets: &dyn SecretResolver,
+    ) -> Result<(), RegistryError> {
+        let factory = self
+            .factories
+            .get(kind)
+            .cloned()
+            .ok_or_else(|| RegistryError::UnknownKind(kind.clone()))?;
+        factory.validate(ctx, config, secrets).await?;
+        Ok(())
     }
 
     /// Fetches a live instance.
     pub fn instance(&self, id: &DriverInstanceId) -> Option<Arc<dyn StorageDriver>> {
         self.instances.get(id).cloned()
+    }
+
+    /// The descriptor of every live instance, sorted by instance id.
+    ///
+    /// This is the operator-visible identity of the deployment: which kind and
+    /// version is behind each instance. Drivers have reported it since the
+    /// interface existed; this is what finally reads it.
+    pub fn descriptors(&self) -> Vec<DriverDescriptor> {
+        let mut descriptors: Vec<DriverDescriptor> = self
+            .instances
+            .values()
+            .map(|driver| driver.descriptor())
+            .collect();
+        descriptors.sort_by(|a, b| a.instance_id.as_str().cmp(b.instance_id.as_str()));
+        descriptors
     }
 
     /// The number of live instances.
@@ -194,6 +233,7 @@ mod tests {
         async fn validate(
             &self,
             _ctx: &DriverContext,
+            _config: &FactoryConfig,
             _secrets: &dyn SecretResolver,
         ) -> Result<(), DriverError> {
             Ok(())
@@ -201,7 +241,7 @@ mod tests {
         async fn create(
             &self,
             _ctx: &DriverContext,
-            instance_id: &DriverInstanceId,
+            config: &FactoryConfig,
             _secrets: &dyn SecretResolver,
         ) -> Result<Arc<dyn StorageDriver>, DriverError> {
             if self.fail_create.load(Ordering::Relaxed) {
@@ -209,7 +249,7 @@ mod tests {
             }
             Ok(Arc::new(NoopDriver {
                 kind: self.kind.clone(),
-                instance_id: instance_id.clone(),
+                instance_id: config.instance_id.clone(),
             }))
         }
     }
@@ -223,6 +263,10 @@ mod tests {
 
     fn ctx() -> DriverContext {
         DriverContext::new(crate::domain::RequestId::new("t"))
+    }
+
+    fn config(id: &str) -> FactoryConfig {
+        FactoryConfig::minimal(DriverInstanceId::parse(id).expect("id"))
     }
 
     fn factory(kind: &str, fail: bool) -> Arc<dyn DriverFactory> {
@@ -249,7 +293,7 @@ mod tests {
             .create_instance(
                 &ctx(),
                 &DriverKind::new("missing"),
-                &DriverInstanceId::parse("i1").unwrap(),
+                &config("i1"),
                 &EmptyResolver,
             )
             .await
@@ -262,12 +306,11 @@ mod tests {
     async fn rejects_duplicate_instance() {
         let mut reg = DriverRegistry::new();
         reg.register(factory("a", false)).unwrap();
-        let id = DriverInstanceId::parse("i1").unwrap();
-        reg.create_instance(&ctx(), &DriverKind::new("a"), &id, &EmptyResolver)
+        reg.create_instance(&ctx(), &DriverKind::new("a"), &config("i1"), &EmptyResolver)
             .await
             .unwrap();
         let err = reg
-            .create_instance(&ctx(), &DriverKind::new("a"), &id, &EmptyResolver)
+            .create_instance(&ctx(), &DriverKind::new("a"), &config("i1"), &EmptyResolver)
             .await
             .err()
             .unwrap();
@@ -280,7 +323,7 @@ mod tests {
         reg.register(factory("a", true)).unwrap();
         let id = DriverInstanceId::parse("i1").unwrap();
         assert!(
-            reg.create_instance(&ctx(), &DriverKind::new("a"), &id, &EmptyResolver)
+            reg.create_instance(&ctx(), &DriverKind::new("a"), &config("i1"), &EmptyResolver)
                 .await
                 .is_err()
         );
@@ -293,17 +336,103 @@ mod tests {
         let mut reg = DriverRegistry::new();
         reg.register(factory("a", false)).unwrap();
         for name in ["a-1", "a-2"] {
-            let id = DriverInstanceId::parse(name).unwrap();
-            reg.create_instance(&ctx(), &DriverKind::new("a"), &id, &EmptyResolver)
+            reg.create_instance(&ctx(), &DriverKind::new("a"), &config(name), &EmptyResolver)
                 .await
                 .unwrap();
         }
         assert_eq!(reg.instance_count(), 2);
     }
 
+    #[tokio::test]
+    async fn descriptors_expose_each_instance_identity() {
+        let mut reg = DriverRegistry::new();
+        reg.register(factory("a", false)).unwrap();
+        for name in ["a-2", "a-1"] {
+            reg.create_instance(&ctx(), &DriverKind::new("a"), &config(name), &EmptyResolver)
+                .await
+                .unwrap();
+        }
+        let descriptors = reg.descriptors();
+        assert_eq!(descriptors.len(), 2);
+        // Sorted by instance id, so the log order is deterministic.
+        assert_eq!(descriptors[0].instance_id.as_str(), "a-1");
+        assert_eq!(descriptors[0].kind.as_str(), "a");
+        assert_eq!(descriptors[0].display_name, "noop");
+    }
+
+    /// A factory that rejects any configuration without a private `root`
+    /// option, so the test can prove `validate` sees the configuration.
+    struct ConfigCheckingFactory;
+
+    #[async_trait]
+    impl DriverFactory for ConfigCheckingFactory {
+        fn kind(&self) -> DriverKind {
+            DriverKind::new("configured")
+        }
+
+        async fn validate(
+            &self,
+            _ctx: &DriverContext,
+            config: &FactoryConfig,
+            _secrets: &dyn SecretResolver,
+        ) -> Result<(), DriverError> {
+            if config.options.contains_key("root") {
+                Ok(())
+            } else {
+                Err(DriverError::invalid_argument("missing `root` option"))
+            }
+        }
+
+        async fn create(
+            &self,
+            _ctx: &DriverContext,
+            config: &FactoryConfig,
+            _secrets: &dyn SecretResolver,
+        ) -> Result<Arc<dyn StorageDriver>, DriverError> {
+            Ok(Arc::new(NoopDriver {
+                kind: self.kind(),
+                instance_id: config.instance_id.clone(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_receives_the_same_configuration_create_would() {
+        let mut reg = DriverRegistry::new();
+        reg.register(Arc::new(ConfigCheckingFactory)).unwrap();
+        let kind = DriverKind::new("configured");
+        let id = DriverInstanceId::parse("i1").unwrap();
+
+        // The private option the factory requires is missing: validation fails
+        // and no instance is registered.
+        assert!(
+            reg.create_instance(
+                &ctx(),
+                &kind,
+                &FactoryConfig::minimal(id.clone()),
+                &EmptyResolver
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(reg.instance_count(), 0);
+
+        // With the option present, the same factory validates and builds.
+        let mut options = toml::Table::new();
+        options.insert("root".into(), toml::Value::String("/tmp/allins3".into()));
+        let configured = FactoryConfig::new(
+            id.clone(),
+            options,
+            Vec::new(),
+            crate::driver::BlockingExecutor::unbounded(),
+        );
+        reg.create_instance(&ctx(), &kind, &configured, &EmptyResolver)
+            .await
+            .expect("valid configuration creates");
+        assert_eq!(reg.instance_count(), 1);
+    }
+
     // Silence unused-import warning for capability type used nowhere else here.
     #[allow(dead_code)]
     fn _cap(_: NamespaceCapabilities) {}
-    #[allow(dead_code)]
-    fn _cfg(_: FactoryConfig) {}
 }

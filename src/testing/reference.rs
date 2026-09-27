@@ -21,15 +21,15 @@ use bytes::Bytes;
 use crate::domain::{
     BeginWrite, Checksum, ChecksumAlgorithm, ChecksumType, CommitAttributes, CommitState,
     ContentProperties, DeleteRequest, DeleteResult, DriverContext, DriverError, DriverErrorKind,
-    DriverInstanceId, EntityTag, ListCursor, ListPage, ListRequest, NamespaceId, ObjectKey,
-    ObjectMetadata, ObjectRevision, PartNumber, Preconditions, UserMetadata, WriteId,
+    EntityTag, ListCursor, ListPage, ListRequest, NamespaceId, ObjectKey, ObjectMetadata,
+    ObjectRevision, PartNumber, Preconditions, UserMetadata, WriteId,
 };
 use crate::driver::{
     CommitRecovery, CompletedPart, CopyRequest, CreateUploadRequest, DriverDescriptor,
-    DriverFactory, DriverHealth, DriverKind, MultipartChecksumScheme, MultipartNamespace,
-    MultipartUpload, NamespaceCapabilities, NamespaceHandle, NativeCopy, PartInfo, PartPage,
-    ReadNamespace, ReadRequest, ReadResult, SecretResolver, StagedWrite, StorageDriver,
-    UploadHandle, UploadId, UploadPage, WriteNamespace,
+    DriverFactory, DriverHealth, DriverKind, FactoryConfig, MultipartChecksumScheme,
+    MultipartNamespace, MultipartUpload, NamespaceCapabilities, NamespaceHandle, NativeCopy,
+    PartInfo, PartPage, ReadNamespace, ReadRequest, ReadResult, SecretResolver, StagedWrite,
+    StorageDriver, UploadHandle, UploadId, UploadPage, WriteNamespace,
 };
 
 use super::support::one_shot_stream;
@@ -153,6 +153,7 @@ impl DriverFactory for ReferenceDriverFactory {
     async fn validate(
         &self,
         _ctx: &DriverContext,
+        _config: &FactoryConfig,
         _secrets: &dyn SecretResolver,
     ) -> Result<(), DriverError> {
         Ok(())
@@ -161,13 +162,13 @@ impl DriverFactory for ReferenceDriverFactory {
     async fn create(
         &self,
         _ctx: &DriverContext,
-        instance_id: &DriverInstanceId,
+        config: &FactoryConfig,
         _secrets: &dyn SecretResolver,
     ) -> Result<Arc<dyn StorageDriver>, DriverError> {
         Ok(Arc::new(ReferenceDriver {
             descriptor: DriverDescriptor {
                 kind: self.kind.clone(),
-                instance_id: instance_id.clone(),
+                instance_id: config.instance_id.clone(),
                 display_name: "in-memory reference driver".into(),
                 version: Some(env!("CARGO_PKG_VERSION").into()),
             },

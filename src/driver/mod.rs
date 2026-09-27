@@ -6,6 +6,7 @@
 //!
 //! See `docs/implementation-spec.md` §2, §3.
 
+mod blocking;
 pub(crate) mod builtins;
 mod capabilities;
 mod descriptor;
@@ -14,6 +15,7 @@ mod factory;
 mod registry;
 mod traits;
 
+pub use blocking::BlockingExecutor;
 pub use capabilities::{
     CapabilityError, CapabilityPlan, ConditionalSupport, Consistency, DriverLimits, FeatureSupport,
     NamespaceCapabilities, Persistence, PlannedFeature, Profile, ProfileError, RangeSupport,

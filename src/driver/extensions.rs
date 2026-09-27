@@ -116,7 +116,7 @@ impl UploadId {
 }
 
 /// An opaque handle bound to a namespace and target key.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadHandle {
     /// The upload identifier.
     pub upload_id: UploadId,

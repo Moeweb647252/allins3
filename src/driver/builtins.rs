@@ -35,10 +35,17 @@ pub(crate) struct Builtin {
 
 /// Every kind this build registers, in registration order.
 pub(crate) fn builtins() -> Vec<Builtin> {
-    // With no features enabled the table stays empty; the `allow` keeps that
-    // from reading as a mistake.
+    // Always registered, in every build: the local filesystem backend is the
+    // first production driver, not a test double. `test: false` is what keeps
+    // production configuration validation from refusing it.
+    // Without the `testing` feature nothing else is pushed, so the binding
+    // stays `mut` only in that configuration.
     #[allow(unused_mut)]
-    let mut table: Vec<Builtin> = Vec::new();
+    let mut table: Vec<Builtin> = vec![Builtin {
+        name: crate::drivers::fs::KIND,
+        test: false,
+        ctor: |kind| Arc::new(crate::drivers::fs::FsDriverFactory::new(kind)),
+    }];
 
     #[cfg(feature = "testing")]
     {

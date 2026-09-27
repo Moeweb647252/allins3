@@ -16,6 +16,7 @@ pub mod catalog;
 pub mod config;
 pub mod domain;
 pub mod driver;
+pub mod drivers;
 pub mod integrity;
 pub mod protocol;
 pub mod server;

@@ -5,8 +5,12 @@
 //! and lost-acknowledgement windows described in `docs/implementation-spec.md`
 //! §5.1 and §9.2 without the wrapped driver knowing.
 //!
-//! Commit recovery is deliberately **not** wrapped: tests must observe the real
-//! underlying [`CommitState`](crate::domain::CommitState).
+//! Commit recovery is, with one deliberate exception, **not** wrapped: tests
+//! must observe the real underlying [`CommitState`](crate::domain::CommitState).
+//! The exception is [`FaultPlan::recovery_unknown_once`], which answers the
+//! first query `Unknown` and delegates afterwards — the window an online
+//! reconciliation exists for, where a backend record is not yet definitive and
+//! becomes so later.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -17,12 +21,12 @@ use bytes::Bytes;
 
 use crate::domain::{
     BeginWrite, CommitAttributes, DeleteRequest, DeleteResult, DriverContext, DriverError,
-    DriverInstanceId, ListPage, ListRequest, NamespaceId, ObjectKey, ObjectMetadata,
+    ListPage, ListRequest, NamespaceId, ObjectKey, ObjectMetadata,
 };
 use crate::driver::{
-    CommitRecovery, DriverDescriptor, DriverFactory, DriverHealth, DriverKind, MultipartNamespace,
-    NamespaceHandle, NativeCopy, ReadNamespace, ReadRequest, ReadResult, SecretResolver,
-    StagedWrite, StorageDriver, WriteNamespace,
+    CommitRecovery, DriverDescriptor, DriverFactory, DriverHealth, DriverKind, FactoryConfig,
+    MultipartNamespace, NamespaceHandle, NativeCopy, ReadNamespace, ReadRequest, ReadResult,
+    SecretResolver, StagedWrite, StorageDriver, WriteNamespace,
 };
 
 /// How a commit should misbehave.
@@ -63,6 +67,10 @@ pub struct FaultPlan {
     /// The namespace answers no commit-recovery queries, so an unresolved
     /// commit outcome stays unknown instead of being reconcilable.
     pub hide_recovery: bool,
+    /// The first commit-recovery query answers `Unknown` and later ones
+    /// delegate to the real record, modelling a record that is not yet
+    /// definitive and becomes so while the process keeps running.
+    pub recovery_unknown_once: bool,
 }
 
 impl FaultPlan {
@@ -114,24 +122,26 @@ impl DriverFactory for FaultDriverFactory {
     async fn validate(
         &self,
         ctx: &DriverContext,
+        config: &FactoryConfig,
         secrets: &dyn SecretResolver,
     ) -> Result<(), DriverError> {
-        self.inner.validate(ctx, secrets).await
+        self.inner.validate(ctx, config, secrets).await
     }
 
     async fn create(
         &self,
         ctx: &DriverContext,
-        instance_id: &DriverInstanceId,
+        config: &FactoryConfig,
         secrets: &dyn SecretResolver,
     ) -> Result<Arc<dyn StorageDriver>, DriverError> {
-        let inner = self.inner.create(ctx, instance_id, secrets).await?;
+        let inner = self.inner.create(ctx, config, secrets).await?;
         Ok(Arc::new(FaultDriver {
             inner,
             plan: self.plan,
             fenced_once: Arc::new(AtomicBool::new(false)),
             begin_write_once: Arc::new(AtomicBool::new(false)),
             write_chunk_once: Arc::new(AtomicBool::new(false)),
+            recovery_unknown_once: Arc::new(AtomicBool::new(false)),
         }))
     }
 }
@@ -145,6 +155,8 @@ struct FaultDriver {
     begin_write_once: Arc<AtomicBool>,
     /// Whether the one-shot `write_chunk` fault has already been consumed.
     write_chunk_once: Arc<AtomicBool>,
+    /// Whether the one-shot recovery fault has already been consumed.
+    recovery_unknown_once: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -182,13 +194,24 @@ impl StorageDriver for FaultDriver {
         });
         // Recovery is observed unwrapped so tests see the real state, except
         // when the plan asks for a driver that cannot answer recovery queries at
-        // all — then the capability declaration must agree with the handle.
+        // all — then the capability declaration must agree with the handle — or
+        // for the one-shot "not yet definitive" fault, which only wraps the
+        // query and leaves the capability intact.
         let mut capabilities = inner.capabilities.clone();
-        let recovery = if self.plan.hide_recovery {
+        let recovery: Option<Arc<dyn CommitRecovery>> = if self.plan.hide_recovery {
             capabilities.recovery = false;
             None
+        } else if let Some(inner_recovery) = inner.recovery.clone() {
+            if self.plan.recovery_unknown_once {
+                Some(Arc::new(FaultRecovery {
+                    inner: inner_recovery,
+                    unknown_once: self.recovery_unknown_once.clone(),
+                }))
+            } else {
+                Some(inner_recovery)
+            }
         } else {
-            inner.recovery.clone()
+            None
         };
         Ok(NamespaceHandle {
             capabilities,
@@ -198,6 +221,30 @@ impl StorageDriver for FaultDriver {
             native_copy: inner.native_copy.clone(),
             recovery,
         })
+    }
+}
+
+/// A recovery handle that answers `Unknown` once, then delegates.
+///
+/// It models a commit record that is not yet definitive and becomes so while
+/// the process keeps running, so the online reconciliation path can be driven
+/// without a restart.
+struct FaultRecovery {
+    inner: Arc<dyn CommitRecovery>,
+    unknown_once: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl CommitRecovery for FaultRecovery {
+    async fn query(
+        &self,
+        ctx: &DriverContext,
+        write_id: &crate::domain::WriteId,
+    ) -> Result<crate::domain::CommitState, DriverError> {
+        if !self.unknown_once.swap(true, Ordering::SeqCst) {
+            return Ok(crate::domain::CommitState::Unknown);
+        }
+        self.inner.query(ctx, write_id).await
     }
 }
 

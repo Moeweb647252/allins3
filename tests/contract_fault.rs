@@ -14,8 +14,8 @@ use allins3::domain::{
     NamespaceId, ObjectKey, Preconditions, RequestId, UserMetadata, WriteId,
 };
 use allins3::driver::{
-    DriverFactory, DriverKind, DriverRegistry, NamespaceHandle, Secret, SecretResolver,
-    StorageDriver,
+    DriverFactory, DriverKind, DriverRegistry, FactoryConfig, NamespaceHandle, Secret,
+    SecretResolver, StorageDriver,
 };
 use allins3::testing::contract::{ContractNamespaces, run_contract};
 use allins3::testing::fault::{FaultDriverFactory, FaultPlan};
@@ -39,13 +39,9 @@ async fn build(plan: FaultPlan, instance: &str) -> Arc<dyn StorageDriver> {
     let kind: DriverKind = factory.kind();
     let mut registry = DriverRegistry::new();
     registry.register(factory).expect("register");
+    let config = FactoryConfig::minimal(DriverInstanceId::parse(instance).expect("id"));
     registry
-        .create_instance(
-            &ctx(),
-            &kind,
-            &DriverInstanceId::parse(instance).expect("id"),
-            &NoSecrets,
-        )
+        .create_instance(&ctx(), &kind, &config, &NoSecrets)
         .await
         .expect("create")
 }

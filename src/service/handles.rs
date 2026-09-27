@@ -261,9 +261,15 @@ mod production_admission_tests {
         let factory: Arc<dyn DriverFactory> = Arc::new(
             crate::testing::reference::ReferenceDriverFactory::with_capabilities("reference", caps),
         );
-        let driver = crate::compose::instance_from_factory(factory, "ref-a", &ctx(), &NoSecrets)
-            .await
-            .expect("instance");
+        let driver = crate::compose::instance_from_factory(
+            factory,
+            "ref-a",
+            toml::Table::new(),
+            &ctx(),
+            &NoSecrets,
+        )
+        .await
+        .expect("instance");
         let mut drivers = HashMap::new();
         drivers.insert("ref-a".to_string(), driver);
         NamespaceHandles::new(drivers, production)

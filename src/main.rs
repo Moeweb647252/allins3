@@ -42,7 +42,7 @@ async fn main() {
     // opening a listener. The kind check is part of the preflight so a config
     // that can never start fails here, not at `run`.
     if check_only {
-        if let Err(e) = allins3::server::preflight(&config) {
+        if let Err(e) = allins3::server::preflight(&config).await {
             eprintln!("allins3: configuration error: {e}");
             std::process::exit(2);
         }

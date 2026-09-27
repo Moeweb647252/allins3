@@ -1,0 +1,67 @@
+# Production-mode configuration backed by the local filesystem driver.
+#
+# Unlike `dev-config.toml`, `development = false` here: the filesystem backend
+# is a real driver, not a test double, so it is admissible for durable writes.
+# The production claim is deliberately narrow — one node, its disk as the
+# durability domain, and this process as the sole writer
+# (`docs/adr/0015-local-filesystem-production-driver.md`).
+#
+# `root` is the driver's private option; the core never interprets it. Point it
+# at a directory this process owns and can fsync. Its contents:
+#
+#   <root>/ns-<hex namespace>/objects/   published objects
+#   <root>/ns-<hex namespace>/staging/   in-progress staged writes
+#   <root>/ns-<hex namespace>/recovery/  commit-outcome records
+#
+# The secret is read from the environment (`env:NAME`); nothing secret is
+# written here. Run `allins3 check-config examples/fs-config.toml` first — it
+# proves the driver kind is registered, the private options parse and every
+# secret reference resolves, without opening a listener.
+
+[server]
+listen = "127.0.0.1:9000"
+region = "us-east-1"
+addressing = "path"
+development = false
+health_endpoints = true
+# The multipart coordinator's durable state. Required in a production
+# deployment with a writable bucket (`ADR-0014`): it is where a session and the
+# parts a client was told were staged survive a restart.
+state_dir = "/var/lib/allins3-state"
+
+[[drivers]]
+id = "instance-fs"
+kind = "fs"
+options = { root = "/var/lib/allins3" }
+
+[[buckets]]
+name = "example-fs"
+driver = "instance-fs"
+namespace = "namespace-fs"
+profile = "multipart"
+
+[[credentials]]
+access_key_id = "EXAMPLEACCESSKEY"
+secret_ref = "env:ALLINS3_FS_SECRET"
+principal = "example-user"
+
+[[grants]]
+principal = "example-user"
+bucket = "example-fs"
+actions = ["list", "read", "write", "delete"]
+prefix = ""
+
+[limits]
+max_single_write_size = 5368709120
+max_list_keys = 1000
+max_concurrent_requests = 256
+max_concurrent_requests_per_driver = 64
+# Bound on blocking backend work across every driver (spec §10). `0` would
+# leave the ceiling to the driver.
+max_blocking_operations = 64
+staging_quota_bytes = 268435456
+multipart_lease_secs = 3600
+multipart_sweep_interval_secs = 60
+header_timeout_secs = 30
+body_idle_timeout_secs = 60
+request_timeout_secs = 0

@@ -31,8 +31,10 @@ tokio = { version = "=1.53.1", features = [
     "sync",
     "macros",
     "signal",
+    # The always-compiled filesystem driver (`src/drivers/fs`).
+    "fs",
 ] }
-tokio-util = { version = "=0.7.19", features = ["rt"] }
+tokio-util = { version = "=0.7.19", features = ["rt", "io"] }
 toml = "=0.9.12"
 
 [dev-dependencies]
@@ -49,6 +51,10 @@ testing = ["dep:s3s-sigv4"]
 
 [[test]]
 name = "contract_reference"
+required-features = ["testing"]
+
+[[test]]
+name = "contract_fs"
 required-features = ["testing"]
 
 [[test]]

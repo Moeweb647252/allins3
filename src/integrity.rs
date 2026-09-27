@@ -255,6 +255,24 @@ pub fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Decodes a lowercase or uppercase hex string; `None` on an odd length or a
+/// non-hex character.
+///
+/// The inverse of [`hex`], used by the durable records that store digests this
+/// way.
+pub fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().as_chunks::<2>().0 {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
 /// Base64-encodes bytes (standard alphabet, padded) as used by S3 checksum
 /// headers.
 pub fn base64(bytes: &[u8]) -> String {

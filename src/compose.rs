@@ -24,7 +24,9 @@ use crate::config::{AppConfig, Limits};
 use crate::domain::{DriverContext, DriverInstanceId, RequestId};
 #[cfg(feature = "testing")]
 use crate::driver::DriverFactory;
-use crate::driver::{DriverKind, DriverRegistry, SecretResolver, StorageDriver};
+use crate::driver::{
+    BlockingExecutor, DriverKind, DriverRegistry, FactoryConfig, SecretResolver, StorageDriver,
+};
 use crate::protocol::s3::{PrincipalLimiter, S3Handler, S3Service, adapter_config, build_service};
 use crate::service::{ObjectService, ServiceError};
 
@@ -82,13 +84,39 @@ fn unregistered_kind(kind: &str) -> String {
     }
 }
 
+/// Builds the [`FactoryConfig`] for every configured driver, keyed by id.
+///
+/// This is the one place the core hands a driver its own configuration: the
+/// opaque `options` table and the secret references, together with the shared,
+/// bounded blocking executor. The core does not interpret `options`; validating
+/// the private schema is the factory's job (spec §3.2.5).
+pub fn factory_configs(config: &AppConfig) -> Result<Vec<FactoryConfig>, String> {
+    let blocking = BlockingExecutor::new(config.limits.max_blocking_operations);
+    config
+        .drivers
+        .iter()
+        .map(|driver| {
+            let instance_id = DriverInstanceId::parse(driver.id.clone())
+                .map_err(|e| format!("invalid driver id `{}`: {e}", driver.id))?;
+            Ok(FactoryConfig::new(
+                instance_id,
+                driver.options.clone(),
+                driver.secret_refs.clone(),
+                blocking.clone(),
+            ))
+        })
+        .collect()
+}
+
 /// Creates every driver instance the config names, keyed by instance id.
 ///
 /// The secret resolver is a parameter, not a hard-wired environment read: the
 /// production entry passes [`crate::config::EnvSecretResolver`], and a test can
 /// pass a resolver it controls. Config validation already guaranteed the ids
-/// are unique and the kinds registered, so a failure here is an instance-level
-/// fault (bad secret, unwritable backend), not a configuration mistake.
+/// are unique, the kinds registered and every secret reference resolvable, so a
+/// failure here is an instance-level fault (unwritable backend, a private
+/// option the factory rejects when it is actually built), not a configuration
+/// mistake.
 pub async fn instances_from_config(
     registry: &mut DriverRegistry,
     config: &AppConfig,
@@ -96,17 +124,35 @@ pub async fn instances_from_config(
 ) -> Result<HashMap<String, Arc<dyn StorageDriver>>, String> {
     let ctx = startup_ctx();
     let mut instances: HashMap<String, Arc<dyn StorageDriver>> = HashMap::new();
-    for driver in &config.drivers {
+    for (driver, factory_config) in config.drivers.iter().zip(factory_configs(config)?) {
         let kind = DriverKind::new(driver.kind.clone());
-        let instance_id = DriverInstanceId::parse(driver.id.clone())
-            .map_err(|e| format!("invalid driver id `{}`: {e}", driver.id))?;
         let instance = registry
-            .create_instance(&ctx, &kind, &instance_id, secrets)
+            .create_instance(&ctx, &kind, &factory_config, secrets)
             .await
             .map_err(|e| format!("failed to create driver `{}`: {e}", driver.id))?;
         instances.insert(driver.id.clone(), instance);
     }
     Ok(instances)
+}
+
+/// Proves a configuration can actually build its driver instances, without
+/// opening a namespace, touching user data or creating anything on disk.
+///
+/// `preflight` composes the registry *and* runs each factory's `validate`, so a
+/// private option a driver rejects fails here rather than at `run`. It calls
+/// `validate` only — never `create` — so checking a file has no side effects,
+/// which is what lets `check-config` run anywhere.
+pub async fn preflight(config: &AppConfig, secrets: &dyn SecretResolver) -> Result<(), String> {
+    let registry = build_registry(config)?;
+    let ctx = startup_ctx();
+    for (driver, factory_config) in config.drivers.iter().zip(factory_configs(config)?) {
+        let kind = DriverKind::new(driver.kind.clone());
+        registry
+            .validate_instance(&ctx, &kind, &factory_config, secrets)
+            .await
+            .map_err(|e| format!("driver `{}` rejected its configuration: {e}", driver.id))?;
+    }
+    Ok(())
 }
 
 /// Creates one driver instance from a factory the caller already holds.
@@ -121,6 +167,7 @@ pub async fn instances_from_config(
 pub async fn instance_from_factory(
     factory: Arc<dyn DriverFactory>,
     id: &str,
+    options: toml::Table,
     ctx: &DriverContext,
     secrets: &dyn SecretResolver,
 ) -> Result<Arc<dyn StorageDriver>, String> {
@@ -130,8 +177,14 @@ pub async fn instance_from_factory(
         .map_err(|e| format!("failed to register driver instance `{id}`: {e}"))?;
     let instance_id =
         DriverInstanceId::parse(id).map_err(|e| format!("invalid driver id `{id}`: {e}"))?;
+    let config = FactoryConfig::new(
+        instance_id,
+        options,
+        Vec::new(),
+        BlockingExecutor::unbounded(),
+    );
     registry
-        .create_instance(ctx, &factory.kind(), &instance_id, secrets)
+        .create_instance(ctx, &factory.kind(), &config, secrets)
         .await
         .map_err(|e| format!("failed to create driver `{id}`: {e}"))
 }

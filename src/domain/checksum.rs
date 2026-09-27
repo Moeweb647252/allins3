@@ -39,6 +39,22 @@ impl ChecksumAlgorithm {
         }
     }
 
+    /// Parses the canonical lowercase name.
+    ///
+    /// The inverse of [`ChecksumAlgorithm::as_str`], so a durable record can
+    /// name an algorithm without every writer inventing its own spelling.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "md5" => Some(Self::Md5),
+            "crc32" => Some(Self::Crc32),
+            "crc32c" => Some(Self::Crc32c),
+            "crc64nvme" => Some(Self::Crc64Nvme),
+            "sha1" => Some(Self::Sha1),
+            "sha256" => Some(Self::Sha256),
+            _ => None,
+        }
+    }
+
     /// Whether `Content-MD5` semantics apply (not a general checksum).
     pub fn is_content_md5(self) -> bool {
         matches!(self, Self::Md5)
@@ -98,6 +114,15 @@ impl ChecksumType {
         match self {
             Self::FullObject => "FULL_OBJECT",
             Self::Composite => "COMPOSITE",
+        }
+    }
+
+    /// Parses the wire name; the inverse of [`ChecksumType::as_str`].
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "FULL_OBJECT" => Some(Self::FullObject),
+            "COMPOSITE" => Some(Self::Composite),
+            _ => None,
         }
     }
 }

@@ -42,6 +42,7 @@ pub fn default_limits() -> Limits {
         max_concurrent_requests: 64,
         max_concurrent_requests_per_principal: 16,
         max_concurrent_requests_per_driver: 64,
+        max_blocking_operations: 8,
         header_timeout: Duration::from_secs(30),
         body_idle_timeout: Duration::from_secs(60),
         request_timeout: None,
@@ -86,10 +87,15 @@ pub async fn two_services_over_shared_drivers(
     limits: Limits,
     access: AccessPolicy,
 ) -> (ObjectService, ObjectService, Arc<dyn StorageDriver>) {
-    let instance =
-        crate::compose::instance_from_factory(factory, spec.driver, &ctx("fixture"), &NoSecrets)
-            .await
-            .expect("create instance");
+    let instance = crate::compose::instance_from_factory(
+        factory,
+        spec.driver,
+        toml::Table::new(),
+        &ctx("fixture"),
+        &NoSecrets,
+    )
+    .await
+    .expect("create instance");
     let mut drivers: HashMap<String, Arc<dyn StorageDriver>> = HashMap::new();
     drivers.insert(spec.driver.to_string(), instance.clone());
 
@@ -136,10 +142,15 @@ pub async fn service(
 ) -> ObjectService {
     let mut drivers: HashMap<String, Arc<dyn StorageDriver>> = HashMap::new();
     for (id, factory) in factories {
-        let instance =
-            crate::compose::instance_from_factory(factory, id, &ctx("fixture"), &NoSecrets)
-                .await
-                .expect("create instance");
+        let instance = crate::compose::instance_from_factory(
+            factory,
+            id,
+            toml::Table::new(),
+            &ctx("fixture"),
+            &NoSecrets,
+        )
+        .await
+        .expect("create instance");
         drivers.insert(id.to_string(), instance);
     }
 

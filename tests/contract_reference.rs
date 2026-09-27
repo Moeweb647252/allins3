@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use allins3::domain::{DriverContext, DriverError, DriverInstanceId, NamespaceId, RequestId};
 use allins3::driver::{
-    CapabilityError, DriverFactory, DriverKind, DriverRegistry, FeatureSupport,
+    CapabilityError, DriverFactory, DriverKind, DriverRegistry, FactoryConfig, FeatureSupport,
     NamespaceCapabilities, PlannedFeature, Profile, Secret, SecretResolver, StorageDriver,
     support_for, validate_profile,
 };
@@ -36,13 +36,9 @@ async fn build(
     let kind = factory.kind();
     let mut registry = DriverRegistry::new();
     registry.register(factory).expect("register");
+    let config = FactoryConfig::minimal(DriverInstanceId::parse(instance).expect("instance id"));
     let driver = registry
-        .create_instance(
-            &ctx(),
-            &kind,
-            &DriverInstanceId::parse(instance).expect("instance id"),
-            &NoSecrets,
-        )
+        .create_instance(&ctx(), &kind, &config, &NoSecrets)
         .await
         .expect("create instance");
     (driver, kind)

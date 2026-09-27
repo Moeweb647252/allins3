@@ -18,11 +18,11 @@ use bytes::Bytes;
 
 use crate::domain::{
     BeginWrite, CommitAttributes, CommitState, DeleteRequest, DeleteResult, DriverContext,
-    DriverError, DriverErrorKind, DriverInstanceId, ListCursor, ListPage, ListRequest, NamespaceId,
-    ObjectKey, ObjectMetadata, ObjectRevision, WriteId,
+    DriverError, DriverErrorKind, ListCursor, ListPage, ListRequest, NamespaceId, ObjectKey,
+    ObjectMetadata, ObjectRevision, WriteId,
 };
 use crate::driver::{
-    CommitRecovery, DriverDescriptor, DriverFactory, DriverHealth, DriverKind,
+    CommitRecovery, DriverDescriptor, DriverFactory, DriverHealth, DriverKind, FactoryConfig,
     NamespaceCapabilities, NamespaceHandle, NativeCopy, ReadNamespace, ReadRequest, ReadResult,
     SecretResolver, StagedWrite, StorageDriver, WriteNamespace,
 };
@@ -81,6 +81,7 @@ impl DriverFactory for VecDriverFactory {
     async fn validate(
         &self,
         _ctx: &DriverContext,
+        _config: &FactoryConfig,
         _secrets: &dyn SecretResolver,
     ) -> Result<(), DriverError> {
         Ok(())
@@ -89,13 +90,13 @@ impl DriverFactory for VecDriverFactory {
     async fn create(
         &self,
         _ctx: &DriverContext,
-        instance_id: &DriverInstanceId,
+        config: &FactoryConfig,
         _secrets: &dyn SecretResolver,
     ) -> Result<Arc<dyn StorageDriver>, DriverError> {
         Ok(Arc::new(VecDriver {
             descriptor: DriverDescriptor {
                 kind: self.kind.clone(),
-                instance_id: instance_id.clone(),
+                instance_id: config.instance_id.clone(),
                 display_name: "sorted-vec test driver".into(),
                 version: Some(env!("CARGO_PKG_VERSION").into()),
             },

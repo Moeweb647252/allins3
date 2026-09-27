@@ -56,6 +56,13 @@ pub struct RawServer {
     /// Whether to expose unauthenticated liveness/readiness endpoints.
     #[serde(default = "default_true")]
     pub health_endpoints: bool,
+    /// Directory holding the multipart coordinator's durable state.
+    ///
+    /// Required in a production deployment with at least one writable bucket:
+    /// without it, a part the service acknowledged could not survive a restart
+    /// (`ADR-0014`, spec §8.1). A development deployment may omit it.
+    #[serde(default)]
+    pub state_dir: Option<String>,
 }
 
 /// One `[[drivers]]` entry.
@@ -69,6 +76,13 @@ pub struct RawDriver {
     /// Driver-private options (opaque to the core).
     #[serde(default)]
     pub options: toml::Table,
+    /// Secret references this instance may resolve, e.g. `env:NAME`.
+    ///
+    /// The core only proves each reference resolves before startup; which
+    /// reference maps to which private option is the driver's decision
+    /// (spec §3.2.5). Secret values are never logged or echoed.
+    #[serde(default)]
+    pub secret_refs: Vec<String>,
 }
 
 /// One `[[buckets]]` entry.
@@ -147,6 +161,11 @@ pub struct RawLimits {
     /// disable the per-driver limit.
     #[serde(default = "default_per_driver")]
     pub max_concurrent_requests_per_driver: Option<usize>,
+    /// Ceiling on blocking backend operations across all drivers (`0` leaves the
+    /// bound to each driver). A synchronous backend runs its work here rather
+    /// than on a runtime worker thread (spec §10).
+    #[serde(default = "default_blocking_operations")]
+    pub max_blocking_operations: usize,
     /// Header timeout in seconds.
     #[serde(default = "default_header_timeout")]
     pub header_timeout_secs: u64,
@@ -218,6 +237,9 @@ fn default_per_principal() -> Option<usize> {
 fn default_per_driver() -> Option<usize> {
     Some(256)
 }
+fn default_blocking_operations() -> usize {
+    64
+}
 fn default_header_timeout() -> u64 {
     30
 }
@@ -235,6 +257,7 @@ impl Default for RawLimits {
             max_concurrent_requests: default_concurrency(),
             max_concurrent_requests_per_principal: default_per_principal(),
             max_concurrent_requests_per_driver: default_per_driver(),
+            max_blocking_operations: default_blocking_operations(),
             header_timeout_secs: default_header_timeout(),
             body_idle_timeout_secs: default_body_timeout(),
             request_timeout_secs: 0,
@@ -274,6 +297,10 @@ pub struct Limits {
     /// limit. Bounds what one backend can be asked to do at once, so a slow or
     /// saturated driver cannot consume every connection the server has.
     pub max_concurrent_requests_per_driver: usize,
+    /// Ceiling on blocking backend operations; `0` leaves the bound to each
+    /// driver. Shared by every driver through one executor owned by the
+    /// composition root (spec §10).
+    pub max_blocking_operations: usize,
     /// Header timeout.
     pub header_timeout: std::time::Duration,
     /// Body idle timeout.
@@ -303,6 +330,7 @@ impl Limits {
                 .max_concurrent_requests_per_principal
                 .unwrap_or(0),
             max_concurrent_requests_per_driver: raw.max_concurrent_requests_per_driver.unwrap_or(0),
+            max_blocking_operations: raw.max_blocking_operations,
             header_timeout: std::time::Duration::from_secs(raw.header_timeout_secs),
             body_idle_timeout: std::time::Duration::from_secs(raw.body_idle_timeout_secs),
             request_timeout: (raw.request_timeout_secs > 0)
@@ -331,6 +359,9 @@ pub struct AppConfig {
     pub development: bool,
     /// Whether health endpoints are exposed.
     pub health_endpoints: bool,
+    /// Directory holding the multipart coordinator's durable state, absent in a
+    /// deployment that did not configure one.
+    pub state_dir: Option<std::path::PathBuf>,
     /// Driver instances.
     pub drivers: Vec<RawDriver>,
     /// Bucket catalog.
@@ -383,6 +414,23 @@ impl AppConfig {
             }
             if !driver_ids.insert(driver.id.clone()) {
                 return Err(ConfigError::DuplicateDriverId(driver.id.clone()));
+            }
+            // Every reference a driver may resolve is proved resolvable now, so
+            // a missing driver secret fails startup rather than the first
+            // backend call (spec §7.1). The value is never held here.
+            for reference in &driver.secret_refs {
+                if !reference.contains(':') {
+                    return Err(ConfigError::InvalidDriverSecretReference {
+                        driver: driver.id.clone(),
+                        reference: reference.clone(),
+                    });
+                }
+                if secrets.resolve(reference).is_err() {
+                    return Err(ConfigError::MissingDriverSecret {
+                        driver: driver.id.clone(),
+                        reference: reference.clone(),
+                    });
+                }
             }
         }
 
@@ -480,12 +528,27 @@ impl AppConfig {
             }
         }
 
+        // A production deployment that can write objects must be able to
+        // persist the multipart coordinator's state: without a `state_dir`, a
+        // part it acknowledged could not survive a restart (`ADR-0014`,
+        // spec §8.1). A deployment with no writable bucket never holds any, so
+        // it needs none.
+        let writable = raw.buckets.iter().any(|bucket| !bucket.readonly);
+        let state_dir = match raw.server.state_dir.as_deref() {
+            Some(dir) if !dir.trim().is_empty() => Some(std::path::PathBuf::from(dir)),
+            _ if !raw.server.development && writable => {
+                return Err(ConfigError::StateDirRequired);
+            }
+            _ => None,
+        };
+
         Ok(Self {
             listen: raw.server.listen,
             region: raw.server.region,
             addressing,
             development: raw.server.development,
             health_endpoints: raw.server.health_endpoints,
+            state_dir,
             drivers: raw.drivers,
             catalog,
             credentials: store,
@@ -675,9 +738,31 @@ pub enum ConfigError {
     /// A test driver was configured for production.
     #[error("test driver `{0}` requires `development = true`")]
     TestDriverInProduction(String),
+    /// A driver secret reference is malformed.
+    #[error("driver `{driver}` has an invalid secret reference `{reference}`")]
+    InvalidDriverSecretReference {
+        /// Driver instance id.
+        driver: String,
+        /// The malformed reference.
+        reference: String,
+    },
+    /// A driver secret reference could not be resolved.
+    #[error("missing secret for driver `{driver}` (reference `{reference}`)")]
+    MissingDriverSecret {
+        /// Driver instance id.
+        driver: String,
+        /// Secret reference.
+        reference: String,
+    },
     /// A recognised but unimplemented addressing style was configured.
     #[error("addressing style `{0}` is not implemented")]
     UnsupportedAddressing(String),
+    /// A production deployment can write objects but has nowhere to persist the
+    /// multipart coordinator's state.
+    #[error(
+        "`server.state_dir` is required: a production deployment with a writable bucket must be able to persist multipart state (`ADR-0014`)"
+    )]
+    StateDirRequired,
     /// Catalog construction failed.
     #[error(transparent)]
     Catalog(#[from] CatalogError),
@@ -897,6 +982,56 @@ prefix = ""
     }
 
     #[test]
+    fn driver_secret_refs_are_validated_and_kept() {
+        let toml = base_toml().replace(
+            "kind = \"test-reference\"",
+            "kind = \"test-reference\"\nsecret_refs = [\"env:ALLINS3_TEST_SECRET\"]",
+        );
+        let cfg = AppConfig::from_toml(&toml, &resolver()).expect("valid");
+        assert_eq!(cfg.drivers[0].secret_refs, vec!["env:ALLINS3_TEST_SECRET"]);
+    }
+
+    #[test]
+    fn rejects_unresolvable_driver_secret() {
+        // A reference a driver may resolve must be proved resolvable before
+        // startup, not on the first backend call (spec §7.1).
+        let toml = base_toml().replace(
+            "kind = \"test-reference\"",
+            "kind = \"test-reference\"\nsecret_refs = [\"env:ALLINS3_DRIVER_SECRET\"]",
+        );
+        assert!(matches!(
+            AppConfig::from_toml(&toml, &resolver()),
+            Err(ConfigError::MissingDriverSecret { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_driver_secret_reference() {
+        let toml = base_toml().replace(
+            "kind = \"test-reference\"",
+            "kind = \"test-reference\"\nsecret_refs = [\"just-a-name\"]",
+        );
+        assert!(matches!(
+            AppConfig::from_toml(&toml, &resolver()),
+            Err(ConfigError::InvalidDriverSecretReference { .. })
+        ));
+    }
+
+    #[test]
+    fn driver_options_survive_validation_unparsed() {
+        // `options` is opaque to the core: it is carried through, not validated.
+        let toml = base_toml().replace(
+            "kind = \"test-reference\"",
+            "kind = \"test-reference\"\noptions = { root = \"/tmp/allins3\", depth = 3 }",
+        );
+        let cfg = AppConfig::from_toml(&toml, &resolver()).expect("valid");
+        assert_eq!(
+            cfg.drivers[0].options.get("root").and_then(|v| v.as_str()),
+            Some("/tmp/allins3")
+        );
+    }
+
+    #[test]
     fn rejects_missing_secret() {
         let toml = base_toml().replace("env:ALLINS3_TEST_SECRET", "env:ALLINS3_MISSING_SECRET");
         assert!(matches!(
@@ -915,6 +1050,47 @@ prefix = ""
             AppConfig::from_toml(&toml, &resolver()),
             Err(ConfigError::TestDriverInProduction(_))
         ));
+    }
+
+    /// A production config with a real (non-test) kind, so the request reaches
+    /// the `state_dir` rule instead of the test-driver guard.
+    fn production_toml() -> String {
+        base_toml()
+            .replace("development = true", "development = false")
+            .replace("kind = \"test-reference\"", "kind = \"fs\"")
+    }
+
+    #[test]
+    fn a_production_deployment_with_a_writable_bucket_requires_a_state_dir() {
+        // Without one, an acknowledged multipart part could not survive a
+        // restart, so the deployment is refused before it starts (ADR-0014).
+        assert!(matches!(
+            AppConfig::from_toml(&production_toml(), &resolver()),
+            Err(ConfigError::StateDirRequired)
+        ));
+
+        // With one, it is accepted and resolved.
+        let toml = production_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\nstate_dir = \"/var/lib/allins3-state\"",
+        );
+        let cfg = AppConfig::from_toml(&toml, &resolver()).expect("valid");
+        assert_eq!(
+            cfg.state_dir.as_deref(),
+            Some(std::path::Path::new("/var/lib/allins3-state"))
+        );
+    }
+
+    #[test]
+    fn a_readonly_production_deployment_needs_no_state_dir() {
+        // Nothing writable means the coordinator never holds a multipart part,
+        // so requiring a directory would be friction with nothing behind it.
+        let toml = production_toml().replace(
+            "namespace = \"namespace-a\"",
+            "namespace = \"namespace-a\"\nreadonly = true",
+        );
+        let cfg = AppConfig::from_toml(&toml, &resolver()).expect("valid");
+        assert!(cfg.state_dir.is_none());
     }
 
     #[test]

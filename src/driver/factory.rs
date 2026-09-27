@@ -7,6 +7,7 @@ use async_trait::async_trait;
 
 use crate::domain::{DriverContext, DriverError, DriverInstanceId};
 
+use super::blocking::BlockingExecutor;
 use super::descriptor::DriverKind;
 use super::traits::StorageDriver;
 
@@ -51,13 +52,57 @@ pub trait SecretResolver: Send + Sync {
 
 /// Per-instance driver configuration.
 ///
-/// The concrete private schema is intentionally not fixed here; the core layer
-/// only understands the public fields, the kind, the instance id and the
-/// capabilities. Configuration parsing lands in P2.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The core layer understands only the public fields: which instance is being
+/// configured, the opaque `options` table and the secret references the driver
+/// may resolve. The concrete private schema of `options` is the driver's own —
+/// the core never parses it (spec §3.2.5: *"the factory validates the driver's
+/// private configuration"*). `secret_refs` are validated as resolvable before
+/// startup, but which reference maps to which option is again the driver's
+/// decision.
+///
+/// The blocking executor travels with the config because it is owned by the
+/// composition root, not by each driver: a synchronous backend runs its work on
+/// this shared, bounded executor rather than parking a runtime thread.
+#[derive(Debug, Clone)]
 pub struct FactoryConfig {
     /// The instance being configured.
     pub instance_id: DriverInstanceId,
+    /// Driver-private options, opaque to the core.
+    pub options: toml::Table,
+    /// Secret references this instance may resolve, e.g. `env:NAME`.
+    pub secret_refs: Vec<String>,
+    /// The shared, bounded executor for blocking backend work.
+    pub blocking: BlockingExecutor,
+}
+
+impl FactoryConfig {
+    /// Builds a config for one instance.
+    pub fn new(
+        instance_id: DriverInstanceId,
+        options: toml::Table,
+        secret_refs: Vec<String>,
+        blocking: BlockingExecutor,
+    ) -> Self {
+        Self {
+            instance_id,
+            options,
+            secret_refs,
+            blocking,
+        }
+    }
+
+    /// A config with no options, no secrets and an unbounded executor.
+    ///
+    /// Used by test harnesses that build an instance directly from a factory
+    /// and have nothing private to configure.
+    pub fn minimal(instance_id: DriverInstanceId) -> Self {
+        Self::new(
+            instance_id,
+            toml::Table::new(),
+            Vec::new(),
+            BlockingExecutor::unbounded(),
+        )
+    }
 }
 
 /// Creates and validates driver instances.
@@ -73,6 +118,7 @@ pub trait DriverFactory: Send + Sync {
     async fn validate(
         &self,
         ctx: &DriverContext,
+        config: &FactoryConfig,
         secrets: &dyn SecretResolver,
     ) -> Result<(), DriverError>;
 
@@ -80,7 +126,7 @@ pub trait DriverFactory: Send + Sync {
     async fn create(
         &self,
         ctx: &DriverContext,
-        instance_id: &DriverInstanceId,
+        config: &FactoryConfig,
         secrets: &dyn SecretResolver,
     ) -> Result<Arc<dyn StorageDriver>, DriverError>;
 }
