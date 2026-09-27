@@ -589,35 +589,15 @@ impl ObjectService {
         // Reconcile every interrupted attempt against the driver's commit
         // record. A claim whose session is gone is dropped: there is nothing
         // left for it to describe.
-        let claims: Vec<(String, WriteId)> = {
-            let state = self.multipart();
-            state
-                .claims
-                .iter()
-                .map(|(upload_id, write_id)| (upload_id.clone(), write_id.clone()))
-                .collect()
-        };
-        for (upload_id, write_id) in claims {
-            let session = {
-                let state = self.multipart();
-                state.uploads.get(&upload_id).cloned()
-            };
-            let Some(session) = session else {
-                let mut state = self.multipart();
-                state.claims.remove(&upload_id);
-                state
-                    .pending
-                    .push(PersistOp::ForgetClaim(upload_id.clone()));
-                continue;
-            };
-            let observed = self.reconcile_attempt(ctx, &session, &write_id).await;
-            match self.settle_attempt(&upload_id, &session, &write_id, observed) {
-                CommitState::Committed => report.committed += 1,
-                CommitState::NotCommittedFinal => report.retryable += 1,
+        for (upload_id, write_id) in self.claim_snapshot() {
+            match self.reconcile_claim(ctx, &upload_id, &write_id).await {
+                Some(CommitState::Committed) => report.committed += 1,
+                Some(CommitState::NotCommittedFinal) => report.retryable += 1,
                 // Never replayed, and never reclaimed: an unresolved attempt
                 // may still publish, so the upload is retained for an operator
                 // rather than silently overwritten.
-                CommitState::InFlight | CommitState::Unknown => report.pending += 1,
+                Some(_) => report.pending += 1,
+                None => {}
             }
         }
         self.flush_pending().await?;
@@ -667,6 +647,49 @@ impl ObjectService {
         }
     }
 
+    /// Snapshots the outstanding completion claims.
+    ///
+    /// Taken under the lock and returned owned, so the reconciliation loops can
+    /// await the backend without holding it.
+    fn claim_snapshot(&self) -> Vec<(String, WriteId)> {
+        let state = self.multipart();
+        state
+            .claims
+            .iter()
+            .map(|(upload_id, write_id)| (upload_id.clone(), write_id.clone()))
+            .collect()
+    }
+
+    /// Reconciles one persisted claim against the backend's commit record and
+    /// applies the result, without counting it.
+    ///
+    /// This is the single path shared by startup recovery and the running
+    /// sweeper, so the two can never disagree about what a given state implies
+    /// (`ADR-0016`). Returns the applied state, or `None` when the claim's
+    /// session is already gone — a claim with no session describes nothing, so
+    /// it is dropped and there is no outcome to count.
+    async fn reconcile_claim(
+        &self,
+        ctx: &DriverContext,
+        upload_id: &str,
+        write_id: &WriteId,
+    ) -> Option<CommitState> {
+        let session = {
+            let state = self.multipart();
+            state.uploads.get(upload_id).cloned()
+        };
+        let Some(session) = session else {
+            let mut state = self.multipart();
+            state.claims.remove(upload_id);
+            state
+                .pending
+                .push(PersistOp::ForgetClaim(upload_id.to_string()));
+            return None;
+        };
+        let observed = self.reconcile_attempt(ctx, &session, write_id).await;
+        Some(self.settle_attempt(upload_id, &session, write_id, observed))
+    }
+
     /// Reconciles every unresolved completion attempt against the backend's
     /// commit record, applying whatever is now provable (`ADR-0016`).
     ///
@@ -677,30 +700,8 @@ impl ObjectService {
     /// It is read-only toward user objects: it never publishes, and a record it
     /// cannot read keeps the attempt pending.
     async fn reconcile_pending_completions(&self, ctx: &DriverContext) {
-        let claims: Vec<(String, WriteId)> = {
-            let state = self.multipart();
-            state
-                .claims
-                .iter()
-                .map(|(upload_id, write_id)| (upload_id.clone(), write_id.clone()))
-                .collect()
-        };
-        for (upload_id, write_id) in claims {
-            let session = {
-                let state = self.multipart();
-                state.uploads.get(&upload_id).cloned()
-            };
-            let Some(session) = session else {
-                // A claim whose session is gone describes nothing; drop it.
-                let mut state = self.multipart();
-                state.claims.remove(&upload_id);
-                state
-                    .pending
-                    .push(PersistOp::ForgetClaim(upload_id.clone()));
-                continue;
-            };
-            let observed = self.reconcile_attempt(ctx, &session, &write_id).await;
-            self.settle_attempt(&upload_id, &session, &write_id, observed);
+        for (upload_id, write_id) in self.claim_snapshot() {
+            self.reconcile_claim(ctx, &upload_id, &write_id).await;
         }
         // A released claim or a retired upload must be durable before the
         // sweeper treats the upload as resolvable.
